@@ -820,7 +820,7 @@ export function workbenchApiPlugin({
     directory: projectDirectory || path.join(appDataRoot, "PersonalAIWorkbench", vaultId, "projects"),
     resolveDocument: async (documentId) => {
       const document = getDocument(await currentIndex(), documentId);
-      return document ? { id: document.id, path: document.path, kind: document.collection || document.kind || "document" } : null;
+      return document ? { id: document.id, path: document.path, title: document.title, kind: document.collection || document.kind || "document" } : null;
     },
   });
   const projectRoutes = createProjectRoutes({ repository: projects, readOnly });

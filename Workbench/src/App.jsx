@@ -12,6 +12,8 @@ import { BooksPage } from "./pages/BooksPage";
 import { OverviewPage } from "./pages/OverviewPage";
 import { SystemPage } from "./pages/SystemPage";
 import { TopicsPage } from "./pages/TopicsPage";
+import { ProjectsPage } from "./pages/ProjectsPage";
+import { ProjectPage } from "./pages/ProjectPage";
 import { SocialInsightsPage, SocialTrendDetailPage } from "./pages/SocialInsightsPage";
 import { useVaultSync } from "./hooks/useVaultSync";
 import { KnowledgeAssistant } from "./components/KnowledgeAssistant";
@@ -148,6 +150,8 @@ export function App() {
           />
           <Route path="/douyin" element={<DouyinPage />} />
           <Route path="/system" element={<SystemPage />} />
+          {localWorkbench ? <Route path="/projects" element={<ProjectsPage />} /> : null}
+          {localWorkbench ? <Route path="/projects/:projectId" element={<ProjectPage onOpenDocument={openDocument} />} /> : null}
           <Route path="*" element={<Navigate replace to="/" />} />
         </Routes>
       </AppShell>

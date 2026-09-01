@@ -4,6 +4,7 @@ import {
   IconBrandTiktok,
   IconBooks,
   IconBulb,
+  IconBriefcase,
   IconClipboardList,
   IconCommand,
   IconHome,
@@ -32,6 +33,7 @@ const primaryNavigation = [
   ...(localWorkbench
     ? [{ to: "/social-insights", label: "社媒洞察", icon: IconSocial }]
     : []),
+  ...(localWorkbench ? [{ to: "/projects", label: "项目", icon: IconBriefcase }] : []),
   { to: "/topics", label: "灵感库", icon: IconBulb },
   { to: "/content", label: "内容中心", icon: IconClipboardList },
   { to: "/douyin", label: "抖音数据", icon: IconBrandTiktok },

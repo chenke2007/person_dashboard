@@ -161,13 +161,15 @@ test("validates dates and project ownership before changing a task", async (t) =
 });
 
 test("persists labels, safe Vault links, archives, and auditable activities", async (t) => {
+  let documentAvailable = true;
   const document = {
     id: "wiki/project-management.md",
     path: "wiki/project-management.md",
     kind: "wiki",
+    title: "项目管理",
   };
   const { repository, created } = await projectFixture(t, {
-    resolveDocument: async (id) => id === document.id ? document : null,
+    resolveDocument: async (id) => documentAvailable && id === document.id ? document : null,
   });
   const taskResult = await repository.createTask({ projectId: created.project.id, title: "关联知识" });
   const labelResult = await repository.createLabel({ name: " 重要 ", color: "#e05252" });
@@ -186,7 +188,12 @@ test("persists labels, safe Vault links, archives, and auditable activities", as
 
   const archived = await repository.archiveTask(taskResult.task.id);
   assert.ok(archived.task.archivedAt);
-  const snapshot = await repository.getProject(created.project.id);
+  let snapshot = await repository.getProject(created.project.id);
+  assert.equal(snapshot.taskLinks[0].title, "项目管理");
+  assert.equal(snapshot.taskLinks[0].missing, false);
+  documentAvailable = false;
+  snapshot = await repository.getProject(created.project.id);
+  assert.equal(snapshot.taskLinks[0].missing, true);
   assert.deepEqual(
     snapshot.activities.map((activity) => activity.type).slice(0, 4),
     ["task.archived", "task.linked", "task.labels_changed", "task.created"],

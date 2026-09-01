@@ -223,7 +223,18 @@ export function createProjectRepository({
       });
     },
     async getProject(projectId) {
-      return serialized(async () => projectProjection(await readStore(), projectId));
+      return serialized(async () => {
+        const snapshot = projectProjection(await readStore(), projectId);
+        snapshot.taskLinks = await Promise.all(snapshot.taskLinks.map(async (link) => {
+          const document = await resolveDocument(link.documentId);
+          return {
+            ...link,
+            missing: !document,
+            ...(document?.title ? { title: String(document.title).slice(0, 240) } : {}),
+          };
+        }));
+        return snapshot;
+      });
     },
     createProject(input) {
       return mutate((store) => {

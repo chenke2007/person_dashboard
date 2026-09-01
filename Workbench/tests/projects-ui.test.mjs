@@ -130,6 +130,7 @@ test("project navigation and routes stay behind the local Workbench gate", async
   assert.match(app, /localWorkbench\s*\?\s*<Route path="\/projects"/);
   assert.match(app, /localWorkbench\s*\?\s*<Route path="\/projects\/:projectId"/);
   assert.match(shell, /\.\.\.\(localWorkbench\s*\?\s*\[\{\s*to:\s*"\/projects"/);
+  assert.match(shell, /\["\/", "\/graph", "\/wiki", "\/materials", "\/projects"\]\.includes/);
 });
 
 test("project settings expose project and workflow column management", async () => {

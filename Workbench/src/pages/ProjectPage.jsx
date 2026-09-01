@@ -3,10 +3,11 @@ import { Link, useParams } from "react-router-dom";
 import { DndContext, KeyboardSensor, PointerSensor, closestCorners, useDroppable, useSensor, useSensors } from "@dnd-kit/core";
 import { SortableContext, sortableKeyboardCoordinates, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import { IconArrowLeft, IconPlus, IconSearch } from "@tabler/icons-react";
-import { addTaskLink, archiveTask, createTask, loadProject, moveTask, removeTaskLink, setTaskLabels, updateTask } from "../lib/project-api.js";
+import { IconArrowLeft, IconPlus, IconSearch, IconSettings } from "@tabler/icons-react";
+import { addTaskLink, archiveTask, createColumn, createTask, loadProject, moveTask, removeTaskLink, reorderColumns, setTaskLabels, updateColumn, updateProject, updateTask } from "../lib/project-api.js";
 import { backlogTasks, filterTasks } from "../lib/project-model.js";
 import { TaskDrawer } from "../components/projects/TaskDrawer.jsx";
+import { ProjectSettings } from "../components/projects/ProjectSettings.jsx";
 import "../components/projects/projects.css";
 
 function TaskCard({ task, projectKey, columns, onOpenTask, onMoveTask }) {
@@ -45,12 +46,12 @@ function List({ snapshot, tasks, onOpenTask, onMoveTask }) {
   })}</div>;
 }
 
-export function ProjectView({ snapshot, view, filters, onChangeView, onChangeFilters, onCreateTask, onOpenTask, onMoveTask }) {
+export function ProjectView({ snapshot, view, filters, onChangeView, onChangeFilters, onCreateTask, onOpenTask, onMoveTask, onOpenSettings }) {
   const visible = filterTasks(snapshot.tasks, filters, snapshot);
   const projected = view === "backlog" ? backlogTasks({ tasks: visible }) : visible;
   const change = (field) => (event) => onChangeFilters({ ...filters, [field]: event.target.value ? [event.target.value] : [] });
   const changeMany = (field) => (event) => onChangeFilters({ ...filters, [field]: [...event.target.selectedOptions].map((option) => option.value) });
-  return <section className="project-page page-shell"><Link className="project-back" to="/projects"><IconArrowLeft />所有项目</Link><header className="project-heading"><div><span>{snapshot.project.key}</span><h1>{snapshot.project.name}</h1><p>{snapshot.project.description || "尚未填写项目说明"}</p></div><button className="project-button project-button--primary" onClick={onCreateTask} type="button"><IconPlus />新建任务</button></header>
+  return <section className="project-page page-shell"><Link className="project-back" to="/projects"><IconArrowLeft />所有项目</Link><header className="project-heading"><div><span>{snapshot.project.key}</span><h1>{snapshot.project.name}</h1><p>{snapshot.project.description || "尚未填写项目说明"}</p></div><div className="project-heading__actions"><button className="project-button" onClick={onOpenSettings} type="button"><IconSettings />项目设置</button><button className="project-button project-button--primary" onClick={onCreateTask} type="button"><IconPlus />新建任务</button></div></header>
     <div className="project-toolbar"><div className="project-tabs" role="tablist">{[["board", "看板"], ["list", "列表"], ["backlog", "Backlog"]].map(([id, label]) => <button aria-selected={view === id} key={id} onClick={() => onChangeView(id)} role="tab" type="button">{label}</button>)}</div><label className="project-search"><IconSearch /><span className="sr-only">筛选任务</span><input onChange={(event) => onChangeFilters({ ...filters, query: event.target.value })} placeholder="筛选任务" value={filters.query || ""} /></label></div>
     <div className="project-filters"><label>状态<select onChange={change("columnIds")} value={filters.columnIds?.[0] || ""}><option value="">全部</option><option value="backlog">Backlog</option>{snapshot.columns.map((column) => <option key={column.id} value={column.id}>{column.name}</option>)}</select></label><label>优先级<select onChange={change("priorities")} value={filters.priorities?.[0] || ""}><option value="">全部</option><option value="urgent">紧急</option><option value="high">高</option><option value="medium">中</option><option value="low">低</option></select></label><label>标签（可多选）<select aria-label="标签筛选" multiple onChange={changeMany("labelIds")} value={filters.labelIds || []}>{snapshot.labels.map((label) => <option key={label.id} value={label.id}>{label.name}</option>)}</select></label><label>截止从<input onChange={(event) => onChangeFilters({ ...filters, dueAfter: event.target.value })} type="date" value={filters.dueAfter || ""} /></label><label>截止至<input onChange={(event) => onChangeFilters({ ...filters, dueBefore: event.target.value })} type="date" value={filters.dueBefore || ""} /></label></div>
     {view === "board" ? <Board onMoveTask={onMoveTask} onOpenTask={onOpenTask} snapshot={snapshot} tasks={visible} /> : <List onMoveTask={onMoveTask} onOpenTask={onOpenTask} snapshot={snapshot} tasks={projected} />}
@@ -59,7 +60,7 @@ export function ProjectView({ snapshot, view, filters, onChangeView, onChangeFil
 
 export function ProjectPage({ onOpenDocument }) {
   const { projectId } = useParams();
-  const [snapshot, setSnapshot] = useState(null); const [error, setError] = useState(null); const [selectedTask, setSelectedTask] = useState(null);
+  const [snapshot, setSnapshot] = useState(null); const [error, setError] = useState(null); const [selectedTask, setSelectedTask] = useState(null); const [settingsOpen, setSettingsOpen] = useState(false);
   const [view, setView] = useState(() => localStorage.getItem("workbench-project-view") || "board"); const [filters, setFilters] = useState({});
   const refresh = useCallback(async () => { const next = await loadProject(projectId); setSnapshot(next); setSelectedTask((current) => current?.id ? next.tasks.find((task) => task.id === current.id) || null : current); return next; }, [projectId]);
   useEffect(() => { refresh().catch(setError); }, [refresh]);
@@ -69,7 +70,8 @@ export function ProjectPage({ onOpenDocument }) {
   const mutateAndRefresh = async (operation) => { setError(null); try { const result = await operation(); await refresh(); return result; } catch (mutationError) { setError(mutationError); throw mutationError; } };
   if (error && !snapshot) return <section className="project-page page-shell"><div className="project-error">{error.message}</div></section>;
   if (!snapshot) return <section className="project-page page-shell"><div className="project-loading">正在读取项目…</div></section>;
-  return <><ProjectView filters={filters} onChangeFilters={setFilters} onChangeView={changeView} onCreateTask={() => setSelectedTask({ id: null, title: "", description: "", priority: "medium", startDate: "", dueDate: "" })} onMoveTask={move} onOpenTask={setSelectedTask} snapshot={snapshot} view={view} />
+  return <><ProjectView filters={filters} onChangeFilters={setFilters} onChangeView={changeView} onCreateTask={() => setSelectedTask({ id: null, title: "", description: "", priority: "medium", startDate: "", dueDate: "" })} onMoveTask={move} onOpenSettings={() => setSettingsOpen(true)} onOpenTask={setSelectedTask} snapshot={snapshot} view={view} />
+    {settingsOpen ? <ProjectSettings columns={snapshot.columns} onClose={() => setSettingsOpen(false)} onCreateColumn={(input) => mutateAndRefresh(() => createColumn(projectId, input))} onReorderColumns={(orderedIds) => mutateAndRefresh(() => reorderColumns(projectId, orderedIds))} onUpdateColumn={(columnId, patch) => mutateAndRefresh(() => updateColumn(projectId, columnId, patch))} onUpdateProject={(patch) => mutateAndRefresh(() => updateProject(projectId, patch))} project={snapshot.project} /> : null}
     <TaskDrawer activities={snapshot.activities} labels={snapshot.labels} links={snapshot.taskLinks} onAddLink={(documentId) => mutateAndRefresh(() => addTaskLink(selectedTask.id, documentId))} onArchive={() => mutateAndRefresh(() => archiveTask(selectedTask.id)).then(() => setSelectedTask(null))} onClose={() => setSelectedTask(null)} onOpenDocument={onOpenDocument} onRemoveLink={(linkId) => mutateAndRefresh(() => removeTaskLink(linkId))} onSave={save} onSetLabels={(taskId, labelIds) => mutateAndRefresh(() => setTaskLabels(taskId, labelIds))} projectKey={snapshot.project.key} task={selectedTask} taskLabels={snapshot.taskLabels} />
     {error ? <div className="project-toast" role="alert">{error.message}</div> : null}</>;
 }

@@ -328,7 +328,13 @@ export function createProjectRepository({
         if (!column) fail("PROJECT_COLUMN_NOT_FOUND", "状态列不存在。", 404);
         if (patch?.name !== undefined) column.name = normalizedText(patch.name, "状态列名称", 80);
         if (patch?.color !== undefined) column.color = patch.color == null ? null : normalizedText(patch.color, "状态列颜色", 32);
-        if (patch?.isFinal !== undefined) column.isFinal = Boolean(patch.isFinal);
+        if (patch?.isFinal !== undefined) {
+          const isFinal = Boolean(patch.isFinal);
+          if (isFinal && !column.isFinal && !store.columns.some((item) => item.projectId === column.projectId && item.id !== column.id && !item.isFinal)) {
+            fail("PROJECT_WORKFLOW_REQUIRES_ACTIVE_COLUMN", "项目至少需要一个非最终状态列。", 409);
+          }
+          column.isFinal = isFinal;
+        }
         column.updatedAt = now().toISOString();
         return (saved) => ({ revision: saved.revision, column: structuredClone(column) });
       });

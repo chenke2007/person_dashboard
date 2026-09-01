@@ -131,3 +131,18 @@ test("project navigation and routes stay behind the local Workbench gate", async
   assert.match(app, /localWorkbench\s*\?\s*<Route path="\/projects\/:projectId"/);
   assert.match(shell, /\.\.\.\(localWorkbench\s*\?\s*\[\{\s*to:\s*"\/projects"/);
 });
+
+test("project settings expose project and workflow column management", async () => {
+  const [page, settings] = await Promise.all([
+    readFile(new URL("../src/pages/ProjectPage.jsx", import.meta.url), "utf8"),
+    readFile(new URL("../src/components/projects/ProjectSettings.jsx", import.meta.url), "utf8"),
+  ]);
+  assert.match(page, /ProjectSettings/);
+  assert.match(page, /createColumn/);
+  assert.match(page, /reorderColumns/);
+  assert.match(settings, /保存项目信息/);
+  assert.match(settings, /新增状态列/);
+  assert.match(settings, /最终状态/);
+  assert.match(settings, /上移/);
+  assert.match(settings, /下移/);
+});

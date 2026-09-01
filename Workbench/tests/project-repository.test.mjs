@@ -161,6 +161,11 @@ test("validates dates and project ownership before changing a task", async (t) =
     }),
     (error) => error.code === "PROJECT_DATE_RANGE_INVALID",
   );
+  await repository.updateColumn(created.columns[0].id, { isFinal: true });
+  await assert.rejects(
+    repository.updateColumn(created.columns[1].id, { isFinal: true }),
+    (error) => error.code === "PROJECT_WORKFLOW_REQUIRES_ACTIVE_COLUMN",
+  );
 });
 
 test("persists labels, safe Vault links, archives, and auditable activities", async (t) => {

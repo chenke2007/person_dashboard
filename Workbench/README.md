@@ -92,7 +92,7 @@ Windows 启动：在本目录运行 `npm run dev`。构建脚本包含 POSIX 环
 
 本地服务的“项目”模块提供项目总览、看板、列表、Backlog、任务筛选、拖拽排序、任务详情、标签、截止日期和活动记录。任务可以关联 Vault 中已索引的文档；关联只保存文档标识和 Vault 相对路径，不复制正文。文档被移动或删除后，任务详情会把关联标为失效并允许移除。
 
-项目数据保存在系统用户应用数据目录 `PersonalAIWorkbench/<vault-id>/projects/projects.json`，不写入 Vault，也不进入 Git 仓库。写入采用修订号冲突保护和原子替换。项目 API 只接受同源、回环地址的本地请求；只读模式会拒绝修改。静态托管构建不显示项目导航和项目路由。
+项目数据保存在系统用户应用数据目录 `PersonalAIWorkbench/<vault-id>/projects/projects.json`，不写入 Vault，也不进入 Git 仓库。写入采用修订号冲突保护和原子替换。项目 API 只接受同源、回环地址的本地请求。Vault 只读模式不会阻止外部项目数据编辑；如需同时锁定项目数据，可设置 `WORKBENCH_PROJECTS_READ_ONLY=true`。静态托管构建不显示项目导航和项目路由。
 
 不要把真实项目、客户名称、内部任务、私人 Vault 路径或导出的项目数据加入这个公开仓库。测试和文档只能使用明确标记的虚构数据。
 

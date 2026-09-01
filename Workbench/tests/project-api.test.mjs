@@ -30,7 +30,7 @@ async function listenOnFetchSafePort(server) {
   }
 }
 
-async function startFixture(t, { readOnly = false } = {}) {
+async function startFixture(t, { readOnly = false, projectReadOnly } = {}) {
   const root = await mkdtemp(path.join(os.tmpdir(), "workbench-project-api-"));
   const vaultRoot = path.join(root, "vault");
   const projectDirectory = path.join(root, "state", "projects");
@@ -40,7 +40,7 @@ async function startFixture(t, { readOnly = false } = {}) {
     configFile: false,
     logLevel: "silent",
     server: { middlewareMode: true },
-    plugins: [workbenchApiPlugin({ vaultRoot, projectDirectory, readOnly })],
+    plugins: [workbenchApiPlugin({ vaultRoot, projectDirectory, readOnly, projectReadOnly })],
   });
   const server = http.createServer(vite.middlewares);
   await listenOnFetchSafePort(server);
@@ -175,4 +175,14 @@ test("rejects unsafe, read-only, stale, and malformed mutations", async (t) => {
   });
   assert.equal(denied.response.status, 403);
   assert.equal(denied.body.error.code, "VAULT_READ_ONLY");
+});
+
+test("keeps external project state writable while the Vault remains read-only", async (t) => {
+  const fixture = await startFixture(t, { readOnly: true, projectReadOnly: false });
+  const created = await request(fixture.origin, "/api/projects", {
+    method: "POST",
+    body: { key: "PAW", name: "Workbench" },
+  });
+  assert.equal(created.response.status, 201);
+  assert.equal(created.body.project.key, "PAW");
 });

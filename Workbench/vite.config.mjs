@@ -7,6 +7,7 @@ export default defineConfig(({ mode }) => {
   const env = { ...loadEnv(mode, fileURLToPath(new URL(".", import.meta.url)), ""), ...process.env };
   const profile = env.PERSONAL_DASHBOARD_PROFILE || "default";
   const readOnly = env.PERSONAL_DASHBOARD_READ_ONLY === "true" || (profile === "obsidian" && env.PERSONAL_DASHBOARD_READ_ONLY !== "false");
+  const projectReadOnly = env.WORKBENCH_PROJECTS_READ_ONLY === "true";
   return {
   define: {
     "import.meta.env.VITE_WORKBENCH_PROFILE": JSON.stringify(profile),
@@ -29,6 +30,6 @@ export default defineConfig(({ mode }) => {
       clientFiles: ["./src/main.jsx"],
     },
   },
-  plugins: [react(), workbenchApiPlugin({ vaultRoot: env.PERSONAL_DASHBOARD_VAULT_ROOT || undefined, profile, readOnly, knowledgeOptions: { env } })],
+  plugins: [react(), workbenchApiPlugin({ vaultRoot: env.PERSONAL_DASHBOARD_VAULT_ROOT || undefined, profile, readOnly, projectReadOnly, knowledgeOptions: { env } })],
   };
 });

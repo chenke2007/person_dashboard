@@ -14,9 +14,11 @@ const result = await build({
       import { MemoryRouter } from "react-router-dom";
       import { ProjectsView } from "../src/pages/ProjectsPage.jsx";
       import { ProjectView } from "../src/pages/ProjectPage.jsx";
+      import { TaskDrawer } from "../src/components/projects/TaskDrawer.jsx";
       const render = (Component, props) => renderToStaticMarkup(<MemoryRouter><Component {...props} /></MemoryRouter>);
       exports.renderProjects = (props) => render(ProjectsView, props);
       exports.renderProject = (props) => render(ProjectView, props);
+      exports.renderTaskDrawer = (props) => render(TaskDrawer, props);
     `,
     resolveDir: fileURLToPath(new URL(".", import.meta.url)),
     loader: "jsx",
@@ -146,4 +148,22 @@ test("project settings expose project and workflow column management", async () 
   assert.match(settings, /最终状态/);
   assert.match(settings, /上移/);
   assert.match(settings, /下移/);
+});
+
+test("task editing always exposes label creation and compact multi-label filtering", () => {
+  const drawer = compiled.exports.renderTaskDrawer({
+    task: { id: "task-1", number: 1, title: "整理需求", description: "", priority: "medium" },
+    projectKey: "PAW", labels: [], taskLabels: [], links: [], activities: [],
+    onClose() {}, onSave() {}, onArchive() {}, onSetLabels() {}, onCreateLabel() {}, onAddLink() {}, onRemoveLink() {}, onOpenDocument() {},
+  });
+  assert.match(drawer, /暂无标签/);
+  assert.match(drawer, /新建标签/);
+
+  const project = compiled.exports.renderProject({
+    snapshot: { project: { id: "p", key: "PAW", name: "Workbench" }, columns: [], tasks: [], labels: [{ id: "label-1", name: "前端", color: "#4a8c78" }], taskLabels: [], taskLinks: [], activities: [] },
+    view: "list", filters: {}, onChangeView() {}, onChangeFilters() {}, onCreateTask() {}, onOpenTask() {}, onMoveTask() {}, onOpenSettings() {},
+  });
+  assert.match(project, /<summary>标签：全部<\/summary>/);
+  assert.match(project, /type="checkbox"/);
+  assert.doesNotMatch(project, /<select[^>]*multiple/);
 });

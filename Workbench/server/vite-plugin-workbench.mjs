@@ -795,6 +795,7 @@ export function workbenchApiPlugin({
   readerExplanationService = null,
   profile = "default",
   readOnly = profile === "obsidian",
+  projectReadOnly = readOnly,
   knowledgeOptions = {},
   projectDirectory = null,
 } = {}) {
@@ -823,7 +824,7 @@ export function workbenchApiPlugin({
       return document ? { id: document.id, path: document.path, title: document.title, kind: document.collection || document.kind || "document" } : null;
     },
   });
-  const projectRoutes = createProjectRoutes({ repository: projects, readOnly });
+  const projectRoutes = createProjectRoutes({ repository: projects, readOnly: projectReadOnly });
   const knowledge = createKnowledgeRoutes({ vaultRoot, getIndex: currentIndex, notifyPaths: (paths) => vaultSync.refresh({ reason: "knowledge-create", paths }), ...knowledgeOptions });
   const refreshIndex = (options = {}) => vaultSync.refresh({
     reason: "manual",

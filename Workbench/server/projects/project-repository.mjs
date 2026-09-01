@@ -77,16 +77,21 @@ function normalizeTaskPositions(store, projectId, columnId) {
     .forEach((item, position) => { item.position = position; });
 }
 
-function metricsFor(store, project) {
+function metricsFor(store, project, today) {
   const columns = new Map(store.columns.filter((item) => item.projectId === project.id).map((item) => [item.id, item]));
   const tasks = store.tasks.filter((item) => item.projectId === project.id && !item.archivedAt);
   const completed = tasks.filter((item) => columns.get(item.columnId)?.isFinal).length;
-  const today = new Date().toISOString().slice(0, 10);
+  const inProgress = tasks.filter((item) => item.columnId && !columns.get(item.columnId)?.isFinal).length;
+  const latestActivity = store.activities
+    .filter((item) => item.projectId === project.id)
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0] || null;
   return {
     activeTasks: tasks.length,
     completedTasks: completed,
+    inProgressTasks: inProgress,
     completion: tasks.length ? completed / tasks.length : 0,
     overdueTasks: tasks.filter((item) => item.dueDate && item.dueDate < today && !columns.get(item.columnId)?.isFinal).length,
+    latestActivity,
   };
 }
 
@@ -210,15 +215,16 @@ export function createProjectRepository({
   }
 
   return Object.freeze({
-    async getWorkspace() {
+    async getWorkspace({ includeArchived = false } = {}) {
       return serialized(async () => {
         const store = await readStore();
+        const today = now().toISOString().slice(0, 10);
         return structuredClone({
           version: store.version,
           revision: store.revision,
           updatedAt: store.updatedAt,
-          projects: store.projects.filter((item) => !item.archivedAt).sort((a, b) => a.position - b.position),
-          metrics: Object.fromEntries(store.projects.map((project) => [project.id, metricsFor(store, project)])),
+          projects: store.projects.filter((item) => includeArchived || !item.archivedAt).sort((a, b) => a.position - b.position),
+          metrics: Object.fromEntries(store.projects.map((project) => [project.id, metricsFor(store, project, today)])),
         });
       });
     },
@@ -288,6 +294,15 @@ export function createProjectRepository({
         const project = requireProject(store, projectId);
         const timestamp = now().toISOString();
         project.archivedAt = project.archivedAt ?? timestamp;
+        project.updatedAt = timestamp;
+        return (saved) => ({ revision: saved.revision, project: structuredClone(project) });
+      });
+    },
+    restoreProject(projectId) {
+      return mutate((store) => {
+        const project = requireProject(store, projectId);
+        const timestamp = now().toISOString();
+        project.archivedAt = null;
         project.updatedAt = timestamp;
         return (saved) => ({ revision: saved.revision, project: structuredClone(project) });
       });

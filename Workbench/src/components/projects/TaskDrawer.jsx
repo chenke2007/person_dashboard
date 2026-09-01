@@ -23,7 +23,7 @@ export function TaskDrawer({ task, projectKey, labels = [], taskLabels = [], lin
     let active = true;
     const timer = setTimeout(async () => {
       setSearching(true);
-      try { const response = await searchVault(query.trim()); if (active) setResults((response.items || []).slice(0, 20)); }
+      try { const response = await searchVault(query.trim()); if (response.error) throw response.error; if (active) setResults((response.data?.items || []).slice(0, 20)); }
       catch (searchError) { if (active) setError(searchError.message); }
       finally { if (active) setSearching(false); }
     }, 250);
@@ -43,7 +43,7 @@ export function TaskDrawer({ task, projectKey, labels = [], taskLabels = [], lin
   };
   return <div className="task-drawer__backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><aside aria-label={task.id ? `任务 ${projectKey}-${task.number}` : "新建任务"} className="task-drawer" role="dialog" aria-modal="true">
     <header><div><span>{task.id ? `${projectKey}-${task.number}` : "新任务"}</span><h2>{task.id ? task.title : "新建任务"}</h2></div><button aria-label="关闭任务" onClick={onClose} type="button"><IconX /></button></header>
-    <form onSubmit={submit}><label>标题<input autoFocus maxLength={240} onChange={set("title")} value={form.title} /></label><label>描述<textarea onChange={set("description")} rows="6" value={form.description} /></label><div className="task-form__row"><label>优先级<select onChange={set("priority")} value={form.priority}><option value="urgent">紧急</option><option value="high">高</option><option value="medium">中</option><option value="low">低</option></select></label><label>开始日期<input onChange={set("startDate")} type="date" value={form.startDate} /></label><label>截止日期<input onChange={set("dueDate")} type="date" value={form.dueDate} /></label></div>
+    <form onSubmit={submit}><label>标题<input autoFocus maxLength={240} onChange={set("title")} value={form.title} /></label><label>描述<textarea onChange={set("description")} rows="6" value={form.description} /></label><div className="task-form__row"><label>优先级<select onChange={set("priority")} value={form.priority}><option value="urgent">紧急</option><option value="high">高</option><option value="medium">中</option><option value="low">低</option><option value="none">无</option></select></label><label>开始日期<input onChange={set("startDate")} type="date" value={form.startDate} /></label><label>截止日期<input onChange={set("dueDate")} type="date" value={form.dueDate} /></label></div>
       {task.id && labels.length ? <fieldset><legend>标签</legend><div className="task-labels">{labels.map((label) => <label key={label.id}><input checked={selectedLabels.includes(label.id)} onChange={() => setSelectedLabels((current) => current.includes(label.id) ? current.filter((id) => id !== label.id) : [...current, label.id])} type="checkbox" /><span style={{ "--label-color": label.color }}>{label.name}</span></label>)}</div></fieldset> : null}
       {error ? <div className="project-error" role="alert">{error}</div> : null}<div className="task-form__actions"><button className="project-button project-button--primary" disabled={saving} type="submit">{saving ? "正在保存" : "保存任务"}</button>{task.id ? <button className="project-button project-button--danger" onClick={() => { if (window.confirm("确定归档这个任务吗？")) onArchive(); }} type="button"><IconArchive />归档任务</button> : null}</div>
     </form>

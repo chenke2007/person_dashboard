@@ -2,10 +2,10 @@ import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { IconArrowRight, IconBriefcase, IconPlus } from "@tabler/icons-react";
 import { PageHeader } from "../components/PageHeader";
-import { createProject, loadProjects } from "../lib/project-api.js";
+import { archiveProject, createProject, loadProjects, restoreProject } from "../lib/project-api.js";
 import "../components/projects/projects.css";
 
-export function ProjectsView({ snapshot, onCreate, creating = false }) {
+export function ProjectsView({ snapshot, onCreate, onArchive, onRestore, showArchived = false, onToggleArchived, creating = false }) {
   const [showForm, setShowForm] = useState(false);
   const [name, setName] = useState("");
   const [key, setKey] = useState("");
@@ -23,6 +23,7 @@ export function ProjectsView({ snapshot, onCreate, creating = false }) {
     <section className="projects-page page-shell">
       <PageHeader eyebrow="EXECUTION LAYER" title="项目" description="把知识库里的资料连接到可以推进、检查和完成的任务。" />
       <div className="projects-page__actions">
+        <button className="project-button" onClick={onToggleArchived} type="button">{showArchived ? "隐藏归档" : "查看归档"}</button>
         <button className="project-button project-button--primary" onClick={() => setShowForm(true)} type="button"><IconPlus />创建项目</button>
       </div>
       {showForm ? (
@@ -38,12 +39,16 @@ export function ProjectsView({ snapshot, onCreate, creating = false }) {
             const metrics = snapshot.metrics?.[project.id] || {};
             const percent = Math.round((metrics.completion || 0) * 100);
             return (
-              <Link className="project-card" key={project.id} to={`/projects/${project.id}`}>
+              <article className={`project-card${project.archivedAt ? " is-archived" : ""}`} key={project.id}>
+                <Link className="project-card__link" to={`/projects/${project.id}`}>
                 <div className="project-card__key"><IconBriefcase /><span>{project.key}</span></div>
                 <h2>{project.name}</h2><p>{project.description || "尚未填写项目说明"}</p>
                 <div className="project-card__progress"><span style={{ width: `${percent}%` }} /></div>
-                <footer><span>{percent}% 完成</span><span>{metrics.activeTasks || 0} 项任务</span><span className={metrics.overdueTasks ? "is-danger" : ""}>{metrics.overdueTasks || 0} 项逾期</span><IconArrowRight /></footer>
-              </Link>
+                <footer><span>{percent}% 完成</span><span>{metrics.inProgressTasks || 0} 项进行中</span><span className={metrics.overdueTasks ? "is-danger" : ""}>{metrics.overdueTasks || 0} 项逾期</span><IconArrowRight /></footer>
+                <div className="project-card__activity">{metrics.latestActivity ? `最近活动 ${new Date(metrics.latestActivity.createdAt).toLocaleString("zh-CN")}` : "暂无活动"}</div>
+                </Link>
+                <button className="project-card__archive" onClick={() => project.archivedAt ? onRestore(project.id) : onArchive(project.id)} type="button">{project.archivedAt ? "恢复项目" : "归档项目"}</button>
+              </article>
             );
           })}
         </div>
@@ -58,9 +63,10 @@ export function ProjectsPage() {
   const [snapshot, setSnapshot] = useState(null);
   const [error, setError] = useState(null);
   const [creating, setCreating] = useState(false);
-  const refresh = () => loadProjects().then(setSnapshot).catch(setError);
-  useEffect(() => { void refresh(); }, []);
+  const [showArchived, setShowArchived] = useState(false);
+  const refresh = () => loadProjects({ includeArchived: showArchived }).then(setSnapshot).catch(setError);
+  useEffect(() => { void refresh(); }, [showArchived]);
   if (error) return <section className="projects-page page-shell"><PageHeader eyebrow="EXECUTION LAYER" title="项目" /><div className="project-error">{error.message}</div></section>;
   if (!snapshot) return <section className="projects-page page-shell"><PageHeader eyebrow="EXECUTION LAYER" title="项目" /><div className="project-loading">正在读取项目…</div></section>;
-  return <ProjectsView creating={creating} onCreate={async (input) => { setCreating(true); try { await createProject(input); await refresh(); } finally { setCreating(false); } }} snapshot={snapshot} />;
+  return <ProjectsView creating={creating} onArchive={async (projectId) => { await archiveProject(projectId); await refresh(); }} onCreate={async (input) => { setCreating(true); try { await createProject(input); await refresh(); } finally { setCreating(false); } }} onRestore={async (projectId) => { await restoreProject(projectId); await refresh(); }} onToggleArchived={() => setShowArchived((value) => !value)} showArchived={showArchived} snapshot={snapshot} />;
 }

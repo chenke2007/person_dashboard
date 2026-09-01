@@ -127,6 +127,9 @@ test("mutates the complete first-phase project model through command endpoints",
 
   assert.equal((await request(origin, `/api/tasks/${taskId}/archive`, { method: "POST", body: {} })).response.status, 200);
   assert.equal((await request(origin, `/api/projects/${projectId}/archive`, { method: "POST", body: {} })).response.status, 200);
+  assert.equal((await request(origin, "/api/projects")).body.projects.length, 0);
+  assert.equal((await request(origin, "/api/projects?archived=include")).body.projects[0].archivedAt != null, true);
+  assert.equal((await request(origin, `/api/projects/${projectId}/restore`, { method: "POST", body: {} })).body.project.archivedAt, null);
 });
 
 test("rejects unsafe, read-only, stale, and malformed mutations", async (t) => {

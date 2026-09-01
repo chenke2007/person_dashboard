@@ -2,7 +2,7 @@ import { ProjectRepositoryError } from "./project-repository.mjs";
 
 const ROOT = "/api/projects";
 const PROJECT = /^\/([0-9a-f-]{36})$/i;
-const PROJECT_ACTION = /^\/([0-9a-f-]{36})\/(archive|columns|tasks)$/i;
+const PROJECT_ACTION = /^\/([0-9a-f-]{36})\/(archive|restore|columns|tasks)$/i;
 const PROJECT_COLUMN = /^\/([0-9a-f-]{36})\/columns\/([0-9a-f-]{36})$/i;
 const PROJECT_COLUMN_ORDER = /^\/([0-9a-f-]{36})\/columns\/order$/i;
 const TASK = /^\/api\/tasks\/([0-9a-f-]{36})(?:\/(move|archive|labels|links))?$/i;
@@ -51,7 +51,7 @@ export function createProjectRoutes({ repository, readOnly = false } = {}) {
           throw new ProjectRepositoryError("VAULT_READ_ONLY", "当前知识库为只读接入，不允许修改项目。", 403);
         }
         const route = url.pathname.slice(ROOT.length);
-        if (req.method === "GET" && route === "") return sendJson(res, 200, await repository.getWorkspace());
+        if (req.method === "GET" && route === "") return sendJson(res, 200, await repository.getWorkspace({ includeArchived: url.searchParams.get("archived") === "include" }));
         if (req.method === "POST" && route === "") return sendJson(res, 201, await repository.createProject(await bodyJson(req)));
         if (req.method === "POST" && route === "/labels") return sendJson(res, 201, await repository.createLabel(await bodyJson(req)));
         const projectMatch = PROJECT.exec(route);
@@ -68,6 +68,9 @@ export function createProjectRoutes({ repository, readOnly = false } = {}) {
         const actionMatch = PROJECT_ACTION.exec(route);
         if (req.method === "POST" && actionMatch?.[2] === "archive") {
           return sendJson(res, 200, await repository.archiveProject(actionMatch[1]));
+        }
+        if (req.method === "POST" && actionMatch?.[2] === "restore") {
+          return sendJson(res, 200, await repository.restoreProject(actionMatch[1]));
         }
         if (req.method === "POST" && actionMatch?.[2] === "columns") {
           return sendJson(res, 201, await repository.createColumn({ projectId: actionMatch[1], ...(await bodyJson(req)) }));

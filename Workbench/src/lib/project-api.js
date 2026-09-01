@@ -4,11 +4,12 @@ function command(path, method, body = {}) {
   return request(path, { method, body: JSON.stringify(body) });
 }
 
-export const loadProjects = () => request("/api/projects");
+export const loadProjects = ({ includeArchived = false } = {}) => request(includeArchived ? "/api/projects?archived=include" : "/api/projects");
 export const createProject = (input) => command("/api/projects", "POST", input);
 export const loadProject = (projectId) => request(`/api/projects/${encodeURIComponent(projectId)}`);
 export const updateProject = (projectId, patch) => command(`/api/projects/${encodeURIComponent(projectId)}`, "PATCH", patch);
 export const archiveProject = (projectId) => command(`/api/projects/${encodeURIComponent(projectId)}/archive`, "POST");
+export const restoreProject = (projectId) => command(`/api/projects/${encodeURIComponent(projectId)}/restore`, "POST");
 export const createColumn = (projectId, input) => command(`/api/projects/${encodeURIComponent(projectId)}/columns`, "POST", input);
 export const updateColumn = (projectId, columnId, patch) => command(`/api/projects/${encodeURIComponent(projectId)}/columns/${encodeURIComponent(columnId)}`, "PATCH", patch);
 export const reorderColumns = (projectId, orderedIds) => command(`/api/projects/${encodeURIComponent(projectId)}/columns/order`, "PUT", { orderedIds });

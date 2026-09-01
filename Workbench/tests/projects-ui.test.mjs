@@ -101,10 +101,25 @@ test("project planning keeps drag, drawer, filters and view preference wired", a
   assert.match(page, /TaskDrawer/);
   assert.match(page, /priority/);
   assert.match(page, /labelIds/);
+  assert.match(page, /dueAfter/);
   assert.match(drawer, /保存任务/);
   assert.match(drawer, /归档任务/);
   assert.match(drawer, /关联文档/);
   assert.match(drawer, /文档已移动或删除/);
+  assert.match(drawer, /response\.data\?\.items/);
+  assert.match(page, /await refresh\(\)\.catch/);
+});
+
+test("Backlog keeps an accessible path for moving tasks into execution", () => {
+  const snapshot = {
+    project: { id: "project-1", key: "PAW", name: "Workbench" },
+    columns: [{ id: "todo", name: "待办", position: 0, isFinal: false }],
+    tasks: [{ id: "task-1", number: 1, title: "整理需求", columnId: null, priority: "medium", position: 0, archivedAt: null }],
+    labels: [], taskLabels: [], taskLinks: [], activities: [],
+  };
+  const html = compiled.exports.renderProject({ snapshot, view: "backlog", filters: {}, onChangeView() {}, onChangeFilters() {}, onCreateTask() {}, onOpenTask() {}, onMoveTask() {} });
+  assert.match(html, /移动任务“整理需求”/);
+  assert.match(html, /开始日期/);
 });
 
 test("project navigation and routes stay behind the local Workbench gate", async () => {

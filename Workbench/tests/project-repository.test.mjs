@@ -135,6 +135,9 @@ test("numbers tasks monotonically and moves them with revision protection", asyn
   const snapshot = await repository.getProject(created.project.id);
   assert.equal(snapshot.tasks.find((task) => task.id === first.task.id).columnId, null);
   assert.equal(snapshot.tasks.find((task) => task.id === second.task.id).columnId, doing.id);
+  const metrics = (await repository.getWorkspace()).metrics[created.project.id];
+  assert.equal(metrics.latestActivity.type, "task.moved");
+  assert.equal(metrics.inProgressTasks, 1);
 });
 
 test("validates dates and project ownership before changing a task", async (t) => {
@@ -245,10 +248,14 @@ test("updates projects, columns, tasks, links, and project archive state", async
   const archived = await repository.archiveProject(created.project.id);
   assert.ok(archived.project.archivedAt);
   assert.equal((await repository.getWorkspace()).projects.length, 0);
+  assert.equal((await repository.getWorkspace({ includeArchived: true })).projects.length, 1);
   await assert.rejects(
     repository.createTask({ projectId: created.project.id, title: "不允许" }),
     (error) => error.code === "PROJECT_ARCHIVED",
   );
+  const restored = await repository.restoreProject(created.project.id);
+  assert.equal(restored.project.archivedAt, null);
+  assert.equal((await repository.getWorkspace()).projects.length, 1);
 });
 
 test("refuses an unknown storage version without overwriting its bytes", async (t) => {

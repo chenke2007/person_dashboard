@@ -167,3 +167,11 @@ test("task editing always exposes label creation and compact multi-label filteri
   assert.match(project, /type="checkbox"/);
   assert.doesNotMatch(project, /<select[^>]*multiple/);
 });
+
+test("label filter has an explicit close action and dismisses outside or with Escape", async () => {
+  const page = await readFile(new URL("../src/pages/ProjectPage.jsx", import.meta.url), "utf8");
+  assert.match(page, />完成<\/button>/);
+  assert.match(page, /setLabelFilterOpen\(false\)/);
+  assert.match(page, /event\.key === "Escape"/);
+  assert.match(page, /pointerdown/);
+});

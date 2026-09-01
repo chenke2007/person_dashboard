@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -49,6 +50,8 @@ import { createVaultSyncService } from "./vault-sync.mjs";
 import { loadAttentionStrategy } from "./public-config.mjs";
 import { readIndexedFile } from "./obsidian-vault.mjs";
 import { createKnowledgeRoutes } from "./knowledge-chat/routes.mjs";
+import { createProjectRepository } from "./projects/project-repository.mjs";
+import { createProjectRoutes } from "./projects/project-routes.mjs";
 
 const workbenchRoot = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const defaultVaultRoot = path.resolve(
@@ -793,6 +796,7 @@ export function workbenchApiPlugin({
   profile = "default",
   readOnly = profile === "obsidian",
   knowledgeOptions = {},
+  projectDirectory = null,
 } = {}) {
   let readerNoteApiMutationQueue = Promise.resolve();
   const readerNotes = readOnly ? { get: async () => null } : createReaderNotesRepository({ vaultRoot });
@@ -807,6 +811,19 @@ export function workbenchApiPlugin({
     return index;
   } });
   const currentIndex = () => vaultSync.currentIndex();
+  const vaultId = createHash("sha256")
+    .update(path.resolve(vaultRoot).toLowerCase())
+    .digest("hex")
+    .slice(0, 24);
+  const appDataRoot = process.env.LOCALAPPDATA || path.join(os.homedir(), ".local", "share");
+  const projects = createProjectRepository({
+    directory: projectDirectory || path.join(appDataRoot, "PersonalAIWorkbench", vaultId, "projects"),
+    resolveDocument: async (documentId) => {
+      const document = getDocument(await currentIndex(), documentId);
+      return document ? { id: document.id, path: document.path, kind: document.collection || document.kind || "document" } : null;
+    },
+  });
+  const projectRoutes = createProjectRoutes({ repository: projects, readOnly });
   const knowledge = createKnowledgeRoutes({ vaultRoot, getIndex: currentIndex, notifyPaths: (paths) => vaultSync.refresh({ reason: "knowledge-create", paths }), ...knowledgeOptions });
   const refreshIndex = (options = {}) => vaultSync.refresh({
     reason: "manual",
@@ -984,6 +1001,7 @@ export function workbenchApiPlugin({
         try {
           if (knowledge.matches(req, url)) return await knowledge.handle(req, res, url);
           assertLocalMutationRequest(req);
+          if (projectRoutes.matches(req, url)) return await projectRoutes.handle(req, res, url);
           if (readOnly && (!['GET', 'HEAD'].includes(req.method) || /^\/api\/(?:wiki-ingest|workflows|reader-explanations)(?:\/|$)/.test(url.pathname))) {
             return json(res, 403, { error: { code: "VAULT_READ_ONLY", message: "当前知识库为只读接入，不允许写入、执行脚本或启动 AI 工作流。" } });
           }

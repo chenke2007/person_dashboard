@@ -163,7 +163,8 @@ test("task editing always exposes label creation and compact multi-label filteri
     snapshot: { project: { id: "p", key: "PAW", name: "Workbench" }, columns: [], tasks: [], labels: [{ id: "label-1", name: "前端", color: "#4a8c78" }], taskLabels: [], taskLinks: [], activities: [] },
     view: "list", filters: {}, onChangeView() {}, onChangeFilters() {}, onCreateTask() {}, onOpenTask() {}, onMoveTask() {}, onOpenSettings() {},
   });
-  assert.match(project, /<summary>标签：全部<\/summary>/);
+  assert.match(project, /<summary aria-label="标签筛选">全部<\/summary>/);
+  assert.doesNotMatch(project, /标签：全部/);
   assert.match(project, /type="checkbox"/);
   assert.doesNotMatch(project, /<select[^>]*multiple/);
 });

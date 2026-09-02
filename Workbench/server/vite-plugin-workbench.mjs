@@ -52,6 +52,7 @@ import { readIndexedFile } from "./obsidian-vault.mjs";
 import { createKnowledgeRoutes } from "./knowledge-chat/routes.mjs";
 import { createProjectRepository } from "./projects/project-repository.mjs";
 import { createProjectRoutes } from "./projects/project-routes.mjs";
+import { createWorkspaceRegistry } from "./workspace-state/workspace-registry.mjs";
 
 const workbenchRoot = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const defaultVaultRoot = path.resolve(
@@ -798,6 +799,7 @@ export function workbenchApiPlugin({
   projectReadOnly = readOnly,
   knowledgeOptions = {},
   projectDirectory = null,
+  appDataRoot = process.env.LOCALAPPDATA || path.join(os.homedir(), ".local", "share"),
 } = {}) {
   let readerNoteApiMutationQueue = Promise.resolve();
   const readerNotes = readOnly ? { get: async () => null } : createReaderNotesRepository({ vaultRoot });
@@ -812,16 +814,38 @@ export function workbenchApiPlugin({
     return index;
   } });
   const currentIndex = () => vaultSync.currentIndex();
-  const vaultId = createHash("sha256")
+  const vaultFingerprint = createHash("sha256")
     .update(path.resolve(vaultRoot).toLowerCase())
-    .digest("hex")
-    .slice(0, 24);
-  const appDataRoot = process.env.LOCALAPPDATA || path.join(os.homedir(), ".local", "share");
-  const projects = createProjectRepository({
-    directory: projectDirectory || path.join(appDataRoot, "PersonalAIWorkbench", vaultId, "projects"),
-    resolveDocument: async (documentId) => {
-      const document = getDocument(await currentIndex(), documentId);
-      return document ? { id: document.id, path: document.path, title: document.title, kind: document.collection || document.kind || "document" } : null;
+    .digest("hex");
+  const workspaceRegistryDirectory = path.join(appDataRoot, "PersonalAIWorkbench");
+  const registry = projectDirectory ? null : createWorkspaceRegistry({ directory: workspaceRegistryDirectory });
+  let projectRepositoryPromise = null;
+  function projectRepository() {
+    projectRepositoryPromise ??= (async () => {
+      let resolvedProjectDirectory = projectDirectory;
+      if (!resolvedProjectDirectory) {
+        const workspace = await registry.resolveVault({
+          fingerprint: vaultFingerprint,
+          label: path.basename(vaultRoot),
+        });
+        const stateRoot = workspace.storageLayout === "legacy"
+          ? path.join(workspaceRegistryDirectory, workspace.workspaceId)
+          : path.join(workspaceRegistryDirectory, "workspaces", workspace.workspaceId);
+        resolvedProjectDirectory = path.join(stateRoot, "projects");
+      }
+      return createProjectRepository({
+        directory: resolvedProjectDirectory,
+        resolveDocument: async (documentId) => {
+          const document = getDocument(await currentIndex(), documentId);
+          return document ? { id: document.id, path: document.path, title: document.title, kind: document.collection || document.kind || "document" } : null;
+        },
+      });
+    })();
+    return projectRepositoryPromise;
+  }
+  const projects = new Proxy({}, {
+    get(_target, property) {
+      return async (...args) => (await projectRepository())[property](...args);
     },
   });
   const projectRoutes = createProjectRoutes({ repository: projects, readOnly: projectReadOnly });

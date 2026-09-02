@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
 import { createServer as createViteServer } from "vite";
+import { createProjectRepository } from "../server/projects/project-repository.mjs";
 import { workbenchApiPlugin } from "../server/vite-plugin-workbench.mjs";
 
 const fetchForbiddenPorts = new Set([
@@ -30,17 +32,19 @@ async function listenOnFetchSafePort(server) {
   }
 }
 
-async function startFixture(t, { readOnly = false, projectReadOnly } = {}) {
+async function startFixture(t, { readOnly = false, projectReadOnly, useWorkspaceRegistry = false, beforeStart } = {}) {
   const root = await mkdtemp(path.join(os.tmpdir(), "workbench-project-api-"));
   const vaultRoot = path.join(root, "vault");
-  const projectDirectory = path.join(root, "state", "projects");
+  const appDataRoot = path.join(root, "app-data");
+  const projectDirectory = useWorkspaceRegistry ? null : path.join(root, "state", "projects");
   await mkdir(path.join(vaultRoot, "wiki"), { recursive: true });
   await writeFile(path.join(vaultRoot, "wiki", "plan.md"), "# Project plan\n", "utf8");
+  await beforeStart?.({ root, vaultRoot, appDataRoot });
   const vite = await createViteServer({
     configFile: false,
     logLevel: "silent",
     server: { middlewareMode: true },
-    plugins: [workbenchApiPlugin({ vaultRoot, projectDirectory, readOnly, projectReadOnly })],
+    plugins: [workbenchApiPlugin({ vaultRoot, projectDirectory, appDataRoot, readOnly, projectReadOnly })],
   });
   const server = http.createServer(vite.middlewares);
   await listenOnFetchSafePort(server);
@@ -50,7 +54,7 @@ async function startFixture(t, { readOnly = false, projectReadOnly } = {}) {
     await vite.close();
     await rm(root, { recursive: true, force: true });
   });
-  return { origin };
+  return { origin, root, vaultRoot, appDataRoot };
 }
 
 async function request(origin, route, { method = "GET", body, headers } = {}) {
@@ -206,4 +210,32 @@ test("keeps external project state writable while the Vault remains read-only", 
   });
   assert.equal(created.response.status, 201);
   assert.equal(created.body.project.key, "PAW");
+});
+
+test("adopts legacy hashed project state without moving or losing projects", async (t) => {
+  let legacyDirectory;
+  const fixture = await startFixture(t, {
+    useWorkspaceRegistry: true,
+    async beforeStart({ vaultRoot, appDataRoot }) {
+      const legacyId = createHash("sha256")
+        .update(path.resolve(vaultRoot).toLowerCase())
+        .digest("hex")
+        .slice(0, 24);
+      legacyDirectory = path.join(appDataRoot, "PersonalAIWorkbench", legacyId, "projects");
+      const legacy = createProjectRepository({ directory: legacyDirectory });
+      await legacy.createProject({ key: "OLD", name: "Synthetic legacy project" });
+    },
+  });
+
+  const listed = await request(fixture.origin, "/api/projects");
+  assert.equal(listed.response.status, 200);
+  assert.equal(listed.body.projects[0].name, "Synthetic legacy project");
+  assert.equal((await readFile(path.join(legacyDirectory, "projects.json"), "utf8")).includes("Synthetic legacy project"), true);
+
+  const registry = JSON.parse(await readFile(
+    path.join(fixture.appDataRoot, "PersonalAIWorkbench", "workspace-registry.json"),
+    "utf8",
+  ));
+  assert.equal(registry.workspaces[0].workspaceId, path.basename(path.dirname(legacyDirectory)));
+  assert.equal(JSON.stringify(registry).includes(fixture.vaultRoot), false);
 });

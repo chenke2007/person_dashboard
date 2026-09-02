@@ -41,22 +41,27 @@ async function readRegistry(directory) {
 }
 
 async function startLockOwner(t, directory, { exitAfterLock = false } = {}) {
-  const lockPath = path.join(directory, "workspace-registry.lock");
+  const lockDirectory = path.join(directory, "workspace-registry.lock");
   const childSource = `
-    import { open } from "node:fs/promises";
+    import { mkdir, open } from "node:fs/promises";
     import { once } from "node:events";
     import { randomBytes } from "node:crypto";
-    const lockPath = process.argv.at(-2);
+    import path from "node:path";
+    const lockDirectory = process.argv.at(-2);
     const exitAfterLock = process.argv.at(-1) === "exit";
-    const handle = await open(lockPath, "wx", 0o600);
+    await mkdir(lockDirectory, { mode: 0o700 });
+    const token = randomBytes(32).toString("hex");
+    const ticketPath = path.join(lockDirectory, token + ".ticket");
+    const handle = await open(ticketPath, "wx", 0o600);
     await handle.writeFile(JSON.stringify({
       version: 1,
       pid: process.pid,
-      token: randomBytes(32).toString("hex"),
+      token,
+      order: process.hrtime.bigint().toString(),
       status: "held",
     }) + "\\n", "utf8");
     await handle.sync();
-    process.stdout.write("locked\\n");
+    process.stdout.write(JSON.stringify({ ticketPath }) + "\\n");
     if (exitAfterLock) {
       await handle.close();
     } else {
@@ -66,7 +71,7 @@ async function startLockOwner(t, directory, { exitAfterLock = false } = {}) {
   `;
   const holder = spawn(
     process.execPath,
-    ["--input-type=module", "-e", childSource, lockPath, exitAfterLock ? "exit" : "hold"],
+    ["--input-type=module", "-e", childSource, lockDirectory, exitAfterLock ? "exit" : "hold"],
     { stdio: ["pipe", "pipe", "pipe"] },
   );
   const exited = once(holder, "exit");
@@ -74,8 +79,8 @@ async function startLockOwner(t, directory, { exitAfterLock = false } = {}) {
     if (holder.exitCode == null) holder.kill();
   });
   const [ready] = await once(holder.stdout, "data");
-  assert.equal(ready.toString("utf8"), "locked\n");
-  return { holder, lockPath, exited };
+  const { ticketPath } = JSON.parse(ready.toString("utf8"));
+  return { holder, lockDirectory, ticketPath, exited };
 }
 
 test("keeps a stable workspace id and requires confirmation to rebind", async (t) => {
@@ -185,25 +190,7 @@ test("removes pending previews owned by a provisional workspace removed during c
 
 test("waits for a cross-process lock and re-reads before writing", async (t) => {
   const directory = await makeStore(t);
-  const lockPath = path.join(directory, "workspace-registry.lock");
-  const childSource = `
-    import { open, unlink } from "node:fs/promises";
-    import { once } from "node:events";
-    const lockPath = process.argv.at(-1);
-    const handle = await open(lockPath, "wx", 0o600);
-    process.stdout.write("locked\\n");
-    await once(process.stdin, "data");
-    await handle.close();
-    await unlink(lockPath);
-  `;
-  const holder = spawn(process.execPath, ["--input-type=module", "-e", childSource, lockPath], {
-    stdio: ["pipe", "pipe", "pipe"],
-  });
-  t.after(() => {
-    if (!holder.killed) holder.kill();
-  });
-  const [ready] = await once(holder.stdout, "data");
-  assert.equal(ready.toString("utf8"), "locked\n");
+  const { holder, exited } = await startLockOwner(t, directory);
 
   const registry = createWorkspaceRegistry({ directory, makeId: sequenceIds("workspace-1") });
   const pending = registry.resolveVault({ fingerprint: FINGERPRINT_A, label: "Synthetic Vault" });
@@ -212,7 +199,7 @@ test("waits for a cross-process lock and re-reads before writing", async (t) => 
   const newer = `${JSON.stringify({ version: 99, sentinel: "newer-state" })}\n`;
   await writeFile(target, newer, "utf8");
   holder.stdin.end("release\n");
-  await once(holder, "exit");
+  await exited;
 
   await assert.rejects(
     pending,
@@ -223,7 +210,7 @@ test("waits for a cross-process lock and re-reads before writing", async (t) => 
 
 test("reclaims a lock after its child-process owner exits abruptly", async (t) => {
   const directory = await makeStore(t);
-  const { lockPath, exited } = await startLockOwner(t, directory, { exitAfterLock: true });
+  const { ticketPath, exited } = await startLockOwner(t, directory, { exitAfterLock: true });
   await exited;
   const registry = createWorkspaceRegistry({
     directory,
@@ -234,12 +221,12 @@ test("reclaims a lock after its child-process owner exits abruptly", async (t) =
   const workspace = await registry.resolveVault({ fingerprint: FINGERPRINT_A, label: "Synthetic Vault" });
 
   assert.equal(workspace.workspaceId, "workspace-1");
-  await assert.rejects(access(lockPath), (error) => error?.code === "ENOENT");
+  await assert.rejects(access(ticketPath), (error) => error?.code === "ENOENT");
 });
 
 test("never steals a lock from a live child-process owner", async (t) => {
   const directory = await makeStore(t);
-  const { holder, lockPath, exited } = await startLockOwner(t, directory);
+  const { holder, ticketPath, exited } = await startLockOwner(t, directory);
   const registry = createWorkspaceRegistry({
     directory,
     makeId: sequenceIds("workspace-1"),
@@ -250,20 +237,21 @@ test("never steals a lock from a live child-process owner", async (t) => {
     registry.resolveVault({ fingerprint: FINGERPRINT_A, label: "Synthetic Vault" }),
     (error) => error instanceof WorkspaceRegistryError && error.code === "WORKSPACE_REGISTRY_BUSY",
   );
-  assert.equal(JSON.parse(await readFile(lockPath, "utf8")).pid, holder.pid);
+  assert.equal(JSON.parse(await readFile(ticketPath, "utf8")).pid, holder.pid);
   holder.stdin.end("release\n");
   await exited;
-  await unlink(lockPath);
+  await unlink(ticketPath);
 });
 
 test("does not replace a committed result when lock cleanup fails and recovers later", async (t) => {
   const directory = await makeStore(t);
-  const lockPath = path.join(directory, "workspace-registry.lock");
+  let failedTicketPath;
   let failCleanup = true;
   const registry = createWorkspaceRegistry({
     directory,
     makeId: sequenceIds("workspace-1", "workspace-2"),
     async removeLock(candidate) {
+      failedTicketPath = candidate;
       if (failCleanup) {
         failCleanup = false;
         const error = new Error("synthetic cleanup denial");
@@ -277,11 +265,154 @@ test("does not replace a committed result when lock cleanup fails and recovers l
   const first = await registry.resolveVault({ fingerprint: FINGERPRINT_A, label: "Synthetic Vault A" });
 
   assert.equal(first.workspaceId, "workspace-1");
-  assert.equal(JSON.parse(await readFile(lockPath, "utf8")).status, "released");
+  assert.equal(JSON.parse(await readFile(failedTicketPath, "utf8")).status, "released");
   const second = await registry.resolveVault({ fingerprint: FINGERPRINT_B, label: "Synthetic Vault B" });
   assert.equal(second.workspaceId, "workspace-2");
   assert.equal((await registry.listWorkspaces()).length, 2);
-  await assert.rejects(access(lockPath), (error) => error?.code === "ENOENT");
+  await assert.rejects(access(failedTicketPath), (error) => error?.code === "ENOENT");
+});
+
+test("serializes two contenders reclaiming the same stale ticket without losing updates", async (t) => {
+  const directory = await makeStore(t);
+  const { ticketPath: staleTicketPath, exited } = await startLockOwner(t, directory, { exitAfterLock: true });
+  await exited;
+  let reclaimAttempts = 0;
+  let bothReclaimersReady;
+  const bothReclaimers = new Promise((resolve) => { bothReclaimersReady = resolve; });
+  async function removeLock(candidate) {
+    if (candidate === staleTicketPath) {
+      reclaimAttempts += 1;
+      if (reclaimAttempts === 2) bothReclaimersReady();
+      await Promise.race([
+        bothReclaimers,
+        delay(1_000).then(() => assert.fail("both contenders did not attempt stale-ticket reclamation")),
+      ]);
+    }
+    await unlink(candidate);
+  }
+  let inside = 0;
+  let maximumInside = 0;
+  const lifecycle = {
+    async acquired() {
+      inside += 1;
+      maximumInside = Math.max(maximumInside, inside);
+      await delay(60);
+    },
+    released() {
+      inside -= 1;
+    },
+  };
+  const firstRegistry = createWorkspaceRegistry({
+    directory,
+    makeId: () => "workspace-a",
+    lockTimeoutMs: 2_000,
+    removeLock,
+    lockLifecycle: lifecycle,
+  });
+  const secondRegistry = createWorkspaceRegistry({
+    directory,
+    makeId: () => "workspace-b",
+    lockTimeoutMs: 2_000,
+    removeLock,
+    lockLifecycle: lifecycle,
+  });
+
+  await Promise.all([
+    firstRegistry.resolveVault({ fingerprint: FINGERPRINT_A, label: "Synthetic Vault A" }),
+    secondRegistry.resolveVault({ fingerprint: FINGERPRINT_B, label: "Synthetic Vault B" }),
+  ]);
+
+  assert.equal(reclaimAttempts, 2);
+  assert.equal(maximumInside, 1);
+  assert.equal(inside, 0);
+  assert.deepEqual(
+    (await firstRegistry.listWorkspaces()).map((item) => item.workspaceId).sort(),
+    ["workspace-a", "workspace-b"],
+  );
+});
+
+test("delayed release removes only its unique ticket while a successor owns the lock", async (t) => {
+  const directory = await makeStore(t);
+  let cleanupStarted;
+  const cleanupReached = new Promise((resolve) => { cleanupStarted = resolve; });
+  let allowCleanup;
+  const cleanupGate = new Promise((resolve) => { allowCleanup = resolve; });
+  t.after(() => allowCleanup());
+  let firstCleanup = true;
+  const firstRegistry = createWorkspaceRegistry({
+    directory,
+    makeId: () => "workspace-a",
+    async removeLock(candidate) {
+      if (firstCleanup) {
+        firstCleanup = false;
+        cleanupStarted(candidate);
+        await cleanupGate;
+      }
+      await unlink(candidate);
+    },
+  });
+  const firstResult = firstRegistry.resolveVault({ fingerprint: FINGERPRINT_A, label: "Synthetic Vault A" });
+  const oldTicketPath = await cleanupReached;
+
+  let successorEntered;
+  const successorIsInside = new Promise((resolve) => { successorEntered = resolve; });
+  let releaseSuccessor;
+  const successorGate = new Promise((resolve) => { releaseSuccessor = resolve; });
+  t.after(() => releaseSuccessor());
+  let inside = 0;
+  let maximumInside = 0;
+  const secondRegistry = createWorkspaceRegistry({
+    directory,
+    makeId: () => "workspace-b",
+    lockLifecycle: {
+      async acquired() {
+        inside += 1;
+        maximumInside = Math.max(maximumInside, inside);
+        successorEntered();
+        await successorGate;
+      },
+      released() {
+        inside -= 1;
+      },
+    },
+  });
+  const secondResult = secondRegistry.resolveVault({ fingerprint: FINGERPRINT_B, label: "Synthetic Vault B" });
+  await Promise.race([
+    successorIsInside,
+    delay(1_000).then(() => assert.fail("successor did not enter the lock lifecycle")),
+  ]);
+  allowCleanup();
+  await firstResult;
+  await assert.rejects(access(oldTicketPath), (error) => error?.code === "ENOENT");
+
+  let thirdEntered = false;
+  const thirdRegistry = createWorkspaceRegistry({
+    directory,
+    makeId: () => "workspace-c",
+    lockLifecycle: {
+      acquired() {
+        thirdEntered = true;
+        inside += 1;
+        maximumInside = Math.max(maximumInside, inside);
+      },
+      released() {
+        inside -= 1;
+      },
+    },
+  });
+  const thirdResult = thirdRegistry.resolveVault({ fingerprint: "c".repeat(64), label: "Synthetic Vault C" });
+  await delay(100);
+  assert.equal(thirdEntered, false);
+  assert.equal(maximumInside, 1);
+
+  releaseSuccessor();
+  await Promise.all([secondResult, thirdResult]);
+  assert.equal(maximumInside, 1);
+  assert.equal(inside, 0);
+  assert.deepEqual(
+    (await firstRegistry.listWorkspaces()).map((item) => item.workspaceId).sort(),
+    ["workspace-a", "workspace-b", "workspace-c"],
+  );
 });
 
 test("refuses unknown and corrupt schema versions without overwriting them", async (t) => {

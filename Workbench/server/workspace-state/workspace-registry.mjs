@@ -7,8 +7,8 @@ import { setTimeout as delay } from "node:timers/promises";
 import { emptyWorkspaceRegistry, workspaceRegistrySchema } from "./workspace-schema.mjs";
 
 const FILE_NAME = "workspace-registry.json";
-const LOCK_FILE_NAME = "workspace-registry.lock";
-const LOCK_MAX_BYTES = 4 * 1024;
+const LOCK_DIRECTORY_NAME = "workspace-registry.lock";
+const TICKET_MAX_BYTES = 4 * 1024;
 const MAX_BYTES = 2 * 1024 * 1024;
 const LOCK_RETRY_MS = 20;
 const LOCK_TIMEOUT_MS = 5_000;
@@ -91,7 +91,9 @@ function validLockPayload(value) {
     value.pid > 0 &&
     typeof value.token === "string" &&
     /^[a-f0-9]{64}$/.test(value.token) &&
-    ["held", "released"].includes(value.status),
+    typeof value.order === "string" &&
+    /^[0-9]{1,32}$/.test(value.order) &&
+    ["waiting", "held", "released"].includes(value.status),
   );
 }
 
@@ -104,26 +106,30 @@ function processIsProvenDead(pid) {
   }
 }
 
-function sameFileIdentity(left, right) {
-  return left.dev === right.dev && left.ino === right.ino;
-}
-
 export function createWorkspaceRegistry({
   directory,
   now = () => new Date(),
   makeId = randomUUID,
   lockTimeoutMs = LOCK_TIMEOUT_MS,
   removeLock = unlink,
+  lockLifecycle = {},
 } = {}) {
   if (typeof directory !== "string" || !path.isAbsolute(directory)) {
     fail("WORKSPACE_REGISTRY_PATH_INVALID", "工作区注册表目录无效。");
   }
-  if (!Number.isFinite(lockTimeoutMs) || lockTimeoutMs < 10 || typeof removeLock !== "function") {
+  if (
+    !Number.isFinite(lockTimeoutMs) ||
+    lockTimeoutMs < 10 ||
+    typeof removeLock !== "function" ||
+    typeof lockLifecycle !== "object" ||
+    (lockLifecycle.acquired != null && typeof lockLifecycle.acquired !== "function") ||
+    (lockLifecycle.released != null && typeof lockLifecycle.released !== "function")
+  ) {
     fail("WORKSPACE_REGISTRY_LOCK_OPTIONS_INVALID", "工作区注册表锁配置无效。");
   }
   const root = path.resolve(directory);
   const target = path.join(root, FILE_NAME);
-  const lockTarget = path.join(root, LOCK_FILE_NAME);
+  const lockDirectory = path.join(root, LOCK_DIRECTORY_NAME);
   let canonicalRoot = null;
   let queue = Promise.resolve();
 
@@ -200,59 +206,84 @@ export function createWorkspaceRegistry({
   }
 
   async function withRegistryLock(operation) {
-    await ensureDirectory();
-    const deadline = Date.now() + lockTimeoutMs;
-    let handle;
-    let identity;
-    let token;
+    const actualRoot = await ensureDirectory();
+    try {
+      await mkdir(lockDirectory, { mode: 0o700 });
+    } catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+    }
+    const lockDetails = await lstat(lockDirectory);
+    if (!lockDetails.isDirectory() || lockDetails.isSymbolicLink()) {
+      fail("WORKSPACE_REGISTRY_PATH_UNSAFE", "工作区注册表锁目录不安全。");
+    }
+    const actualLockDirectory = comparable(await realpath(lockDirectory));
+    if (!isPathInside(actualRoot, actualLockDirectory)) {
+      fail("WORKSPACE_REGISTRY_PATH_UNSAFE", "工作区注册表锁目录越出了应用数据目录。");
+    }
 
-    async function writeLockPayload(status) {
-      const body = Buffer.from(`${JSON.stringify({ version: 1, pid: process.pid, token, status })}\n`, "utf8");
+    const deadline = Date.now() + lockTimeoutMs;
+    const token = randomBytes(32).toString("hex");
+    const order = process.hrtime.bigint().toString();
+    const ticketPath = path.join(lockDirectory, `${token}.ticket`);
+    let handle = await open(ticketPath, constants.O_CREAT | constants.O_EXCL | constants.O_RDWR, 0o600);
+    let status = "waiting";
+    let enteredLifecycle = false;
+
+    async function writeTicket(nextStatus) {
+      const body = Buffer.from(`${JSON.stringify({ version: 1, pid: process.pid, token, order, status: nextStatus })}\n`, "utf8");
       await handle.truncate(0);
       await handle.write(body, 0, body.length, 0);
       await handle.sync();
+      status = nextStatus;
     }
 
-    async function inspectLock() {
-      let details;
-      try {
-        details = await lstat(lockTarget);
-      } catch (error) {
-        if (error?.code === "ENOENT") return null;
-        throw error;
+    async function inspectTickets() {
+      const currentLockDetails = await lstat(lockDirectory);
+      if (!currentLockDetails.isDirectory() || currentLockDetails.isSymbolicLink()) {
+        fail("WORKSPACE_REGISTRY_PATH_UNSAFE", "工作区注册表锁目录不安全。");
       }
-      if (!details.isFile() || details.isSymbolicLink() || details.size > LOCK_MAX_BYTES) {
-        fail("WORKSPACE_REGISTRY_PATH_UNSAFE", "工作区注册表锁文件不安全。");
+      if (comparable(await realpath(lockDirectory)) !== actualLockDirectory) {
+        fail("WORKSPACE_REGISTRY_PATH_UNSAFE", "工作区注册表锁目录在使用期间发生了变化。");
       }
-      let payload = null;
-      try {
-        const parsed = JSON.parse(await readFile(lockTarget, "utf8"));
-        if (validLockPayload(parsed)) payload = parsed;
-      } catch (error) {
-        if (error?.code === "ENOENT") return null;
+      const tickets = [];
+      for (const entry of await readdir(lockDirectory, { withFileTypes: true })) {
+        const match = /^([a-f0-9]{64})\.ticket$/.exec(entry.name);
+        if (!match || !entry.isFile() || entry.isSymbolicLink()) {
+          fail("WORKSPACE_REGISTRY_PATH_UNSAFE", "工作区注册表锁目录包含不安全的条目。");
+        }
+        const candidate = path.join(lockDirectory, entry.name);
+        let details;
+        try {
+          details = await lstat(candidate);
+        } catch (error) {
+          if (error?.code === "ENOENT") continue;
+          throw error;
+        }
+        if (!details.isFile() || details.isSymbolicLink() || details.size > TICKET_MAX_BYTES) {
+          fail("WORKSPACE_REGISTRY_PATH_UNSAFE", "工作区注册表票据不安全。");
+        }
+        let payload = null;
+        try {
+          const parsed = JSON.parse(await readFile(candidate, "utf8"));
+          if (validLockPayload(parsed) && parsed.token === match[1]) payload = parsed;
+        } catch (error) {
+          if (error?.code === "ENOENT") continue;
+        }
+        tickets.push({ path: candidate, payload });
       }
-      return { details, payload };
+      return tickets;
     }
 
-    function reclaimable(snapshot) {
-      const payload = snapshot?.payload;
+    function reclaimable(payload) {
       if (!payload) return false;
       if (payload.status === "released") return true;
       if (payload.pid === process.pid) return !activeLockTokens.has(payload.token);
       return processIsProvenDead(payload.pid);
     }
 
-    async function reclaim(snapshot) {
-      let current;
+    async function removeTicket(candidate) {
       try {
-        current = await lstat(lockTarget);
-      } catch (error) {
-        if (error?.code === "ENOENT") return true;
-        throw error;
-      }
-      if (!sameFileIdentity(snapshot.details, current)) return false;
-      try {
-        await removeLock(lockTarget);
+        await removeLock(candidate);
         return true;
       } catch (error) {
         if (error?.code === "ENOENT") return true;
@@ -260,43 +291,85 @@ export function createWorkspaceRegistry({
       }
     }
 
-    for (;;) {
-      try {
-        handle = await open(lockTarget, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600);
-        identity = await handle.stat();
-        token = randomBytes(32).toString("hex");
-        await writeLockPayload("held");
-        activeLockTokens.add(token);
-        break;
-      } catch (error) {
-        if (handle) {
-          await handle.close().catch(() => {});
-          await removeLock(lockTarget).catch(() => {});
-        }
-        handle = null;
-        if (error?.code !== "EEXIST") throw error;
-        const snapshot = await inspectLock();
-        if (!snapshot) continue;
-        if (reclaimable(snapshot) && await reclaim(snapshot)) continue;
-        if (Date.now() >= deadline) {
-          fail("WORKSPACE_REGISTRY_BUSY", "工作区注册表正被另一个进程使用。", 503);
-        }
-        await delay(LOCK_RETRY_MS);
+    function ordered(tickets) {
+      return [...tickets].sort((left, right) => {
+        const orderDifference = BigInt(left.payload.order) - BigInt(right.payload.order);
+        if (orderDifference !== 0n) return orderDifference < 0n ? -1 : 1;
+        return left.payload.token.localeCompare(right.payload.token);
+      });
+    }
+
+    async function waitOrFail() {
+      if (Date.now() >= deadline) {
+        fail("WORKSPACE_REGISTRY_BUSY", "工作区注册表正被另一个进程使用。", 503);
       }
+      await delay(LOCK_RETRY_MS);
     }
 
     try {
+      await writeTicket("waiting");
+      activeLockTokens.add(token);
+      await delay(LOCK_RETRY_MS);
+
+      for (;;) {
+        const inspected = await inspectTickets();
+        let removed = false;
+        for (const ticket of inspected) {
+          if (ticket.payload?.token !== token && reclaimable(ticket.payload)) {
+            removed = await removeTicket(ticket.path) || removed;
+          }
+        }
+        if (removed) continue;
+        if (inspected.some((ticket) => !ticket.payload)) {
+          await waitOrFail();
+          continue;
+        }
+
+        const liveTickets = inspected.filter((ticket) => ticket.payload);
+        const ownTicket = liveTickets.find((ticket) => ticket.payload.token === token);
+        if (!ownTicket) fail("WORKSPACE_REGISTRY_LOCK_LOST", "工作区注册表锁票据丢失。");
+        const heldByOther = liveTickets.some(
+          (ticket) => ticket.payload.token !== token && ticket.payload.status === "held",
+        );
+        if (heldByOther) {
+          if (status === "held") await writeTicket("waiting");
+          await waitOrFail();
+          continue;
+        }
+
+        const waiters = ordered(liveTickets.filter((ticket) => ticket.payload.status === "waiting"));
+        if (waiters[0]?.payload.token !== token) {
+          await waitOrFail();
+          continue;
+        }
+
+        await writeTicket("held");
+        await delay(LOCK_RETRY_MS);
+        const verification = await inspectTickets();
+        if (verification.some((ticket) => !ticket.payload)) {
+          await writeTicket("waiting");
+          await waitOrFail();
+          continue;
+        }
+        const heldTickets = ordered(verification.filter((ticket) => ticket.payload.status === "held"));
+        if (heldTickets[0]?.payload.token === token && heldTickets.length === 1) break;
+        await writeTicket("waiting");
+        await waitOrFail();
+      }
+
+      await lockLifecycle.acquired?.();
+      enteredLifecycle = true;
       return await operation();
     } finally {
-      await writeLockPayload("released").catch(() => {});
+      if (enteredLifecycle) {
+        await Promise.resolve()
+          .then(() => lockLifecycle.released?.())
+          .catch(() => {});
+      }
+      if (handle && status !== "released") await writeTicket("released").catch(() => {});
       activeLockTokens.delete(token);
-      await handle.close().catch(() => {});
-      try {
-        const current = await lstat(lockTarget);
-        if (sameFileIdentity(current, identity)) {
-          await removeLock(lockTarget);
-        }
-      } catch {}
+      await handle?.close().catch(() => {});
+      await removeTicket(ticketPath).catch(() => {});
     }
   }
 

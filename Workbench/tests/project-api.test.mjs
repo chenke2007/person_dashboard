@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -9,6 +9,7 @@ import test from "node:test";
 import { createServer as createViteServer } from "vite";
 import { createProjectRepository } from "../server/projects/project-repository.mjs";
 import { workbenchApiPlugin } from "../server/vite-plugin-workbench.mjs";
+import { createWorkspaceRegistry } from "../server/workspace-state/workspace-registry.mjs";
 
 const fetchForbiddenPorts = new Set([
   1, 7, 9, 11, 13, 15, 17, 19, 20, 21, 22, 23, 25, 37, 42, 43, 53, 69, 77, 79, 87, 95,
@@ -238,4 +239,47 @@ test("adopts legacy hashed project state without moving or losing projects", asy
   ));
   assert.equal(registry.workspaces[0].workspaceId, path.basename(path.dirname(legacyDirectory)));
   assert.equal(JSON.stringify(registry).includes(fixture.vaultRoot), false);
+});
+
+test("read-only project listing does not create registry or workspace state", async (t) => {
+  const fixture = await startFixture(t, { readOnly: true, useWorkspaceRegistry: true });
+
+  const listed = await request(fixture.origin, "/api/projects");
+
+  assert.equal(listed.response.status, 200);
+  assert.deepEqual(listed.body.projects, []);
+  await assert.rejects(
+    access(path.join(fixture.appDataRoot, "PersonalAIWorkbench")),
+    (error) => error?.code === "ENOENT",
+  );
+});
+
+test("rejects a versioned projects junction at the API integration seam", async (t) => {
+  let outside;
+  const fixture = await startFixture(t, {
+    useWorkspaceRegistry: true,
+    async beforeStart({ root, vaultRoot, appDataRoot }) {
+      outside = path.join(root, "outside-project-state");
+      await mkdir(outside);
+      const fingerprint = createHash("sha256")
+        .update(path.resolve(vaultRoot).toLowerCase())
+        .digest("hex");
+      const registry = createWorkspaceRegistry({
+        directory: path.join(appDataRoot, "PersonalAIWorkbench"),
+        makeId: () => "workspace-versioned",
+      });
+      const workspace = await registry.resolveVault({ fingerprint, label: "Synthetic Vault" });
+      await symlink(
+        outside,
+        path.join(appDataRoot, "PersonalAIWorkbench", "workspaces", workspace.workspaceId, "projects"),
+        process.platform === "win32" ? "junction" : "dir",
+      );
+    },
+  });
+
+  const listed = await request(fixture.origin, "/api/projects");
+
+  assert.equal(listed.response.status, 500);
+  assert.equal(listed.body.error.code, "PROJECT_STORAGE_PATH_UNSAFE");
+  assert.deepEqual(await readdir(outside), []);
 });

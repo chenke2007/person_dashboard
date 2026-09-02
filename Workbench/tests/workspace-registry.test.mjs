@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
 import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { once } from "node:events";
+import { spawn } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 
 import {
   WorkspaceRegistryError,
@@ -112,6 +115,72 @@ test("does not discard unrelated state created after a rebind preview", async (t
   const workspaces = await registry.listWorkspaces();
   assert.equal(workspaces.find((item) => item.fingerprint === FINGERPRINT_A).workspaceId, first.workspaceId);
   assert.equal(workspaces.find((item) => item.fingerprint === FINGERPRINT_B).workspaceId, second.workspaceId);
+});
+
+test("removes pending previews owned by a provisional workspace removed during confirmation", async (t) => {
+  const directory = await makeStore(t);
+  const registry = createWorkspaceRegistry({
+    directory,
+    makeId: sequenceIds("workspace-1", "workspace-2"),
+  });
+  const first = await registry.resolveVault({ fingerprint: FINGERPRINT_A, label: "Synthetic Vault A" });
+  const firstPreview = await registry.previewRebind({
+    currentFingerprint: FINGERPRINT_B,
+    workspaceId: first.workspaceId,
+  });
+  const provisional = await registry.resolveVault({ fingerprint: FINGERPRINT_B, label: "Synthetic Vault B" });
+  const overlappingPreview = await registry.previewRebind({
+    currentFingerprint: "c".repeat(64),
+    workspaceId: provisional.workspaceId,
+  });
+
+  await registry.confirmRebind({ token: firstPreview.token });
+
+  await assert.rejects(
+    registry.confirmRebind({ token: overlappingPreview.token }),
+    (error) => error instanceof WorkspaceRegistryError && error.code === "WORKSPACE_REBIND_PREVIEW_INVALID",
+  );
+  const stored = await readRegistry(directory);
+  assert.equal(stored.pendingRebinds.length, 0);
+  assert.equal(stored.workspaces.some((item) => item.workspaceId === provisional.workspaceId), false);
+});
+
+test("waits for a cross-process lock and re-reads before writing", async (t) => {
+  const directory = await makeStore(t);
+  const lockPath = path.join(directory, "workspace-registry.lock");
+  const childSource = `
+    import { open, unlink } from "node:fs/promises";
+    import { once } from "node:events";
+    const lockPath = process.argv.at(-1);
+    const handle = await open(lockPath, "wx", 0o600);
+    process.stdout.write("locked\\n");
+    await once(process.stdin, "data");
+    await handle.close();
+    await unlink(lockPath);
+  `;
+  const holder = spawn(process.execPath, ["--input-type=module", "-e", childSource, lockPath], {
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  t.after(() => {
+    if (!holder.killed) holder.kill();
+  });
+  const [ready] = await once(holder.stdout, "data");
+  assert.equal(ready.toString("utf8"), "locked\n");
+
+  const registry = createWorkspaceRegistry({ directory, makeId: sequenceIds("workspace-1") });
+  const pending = registry.resolveVault({ fingerprint: FINGERPRINT_A, label: "Synthetic Vault" });
+  await delay(75);
+  const target = path.join(directory, "workspace-registry.json");
+  const newer = `${JSON.stringify({ version: 99, sentinel: "newer-state" })}\n`;
+  await writeFile(target, newer, "utf8");
+  holder.stdin.end("release\n");
+  await once(holder, "exit");
+
+  await assert.rejects(
+    pending,
+    (error) => error instanceof WorkspaceRegistryError && error.code === "WORKSPACE_REGISTRY_VERSION_UNSUPPORTED",
+  );
+  assert.equal(await readFile(target, "utf8"), newer);
 });
 
 test("refuses unknown and corrupt schema versions without overwriting them", async (t) => {

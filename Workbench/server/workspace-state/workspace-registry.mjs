@@ -2,11 +2,15 @@ import { constants } from "node:fs";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { lstat, mkdir, open, readFile, readdir, realpath, rename, unlink } from "node:fs/promises";
 import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 
 import { emptyWorkspaceRegistry, workspaceRegistrySchema } from "./workspace-schema.mjs";
 
 const FILE_NAME = "workspace-registry.json";
+const LOCK_FILE_NAME = "workspace-registry.lock";
 const MAX_BYTES = 2 * 1024 * 1024;
+const LOCK_RETRY_MS = 20;
+const LOCK_TIMEOUT_MS = 5_000;
 const REBIND_TTL_MS = 15 * 60 * 1000;
 const LEGACY_ID = /^[a-f0-9]{24}$/;
 
@@ -87,12 +91,19 @@ export function createWorkspaceRegistry({
   }
   const root = path.resolve(directory);
   const target = path.join(root, FILE_NAME);
+  const lockTarget = path.join(root, LOCK_FILE_NAME);
   let canonicalRoot = null;
   let queue = Promise.resolve();
 
-  async function ensureDirectory() {
-    await mkdir(root, { recursive: true, mode: 0o700 });
-    const details = await lstat(root);
+  async function ensureDirectory({ create = true } = {}) {
+    if (create) await mkdir(root, { recursive: true, mode: 0o700 });
+    let details;
+    try {
+      details = await lstat(root);
+    } catch (error) {
+      if (!create && error?.code === "ENOENT") return null;
+      throw error;
+    }
     if (!details.isDirectory() || details.isSymbolicLink()) {
       fail("WORKSPACE_REGISTRY_PATH_UNSAFE", "工作区注册表目录不能是符号链接或联接点。");
     }
@@ -104,8 +115,9 @@ export function createWorkspaceRegistry({
     return actual;
   }
 
-  async function readStore() {
-    await ensureDirectory();
+  async function readStore({ createDirectory = true } = {}) {
+    const actualRoot = await ensureDirectory({ create: createDirectory });
+    if (!actualRoot) return emptyWorkspaceRegistry(timestamp(now).toISOString());
     let details;
     try {
       details = await lstat(target);
@@ -155,15 +167,64 @@ export function createWorkspaceRegistry({
     return checked.data;
   }
 
-  function serialized(operation) {
-    const result = queue.then(operation, operation);
+  async function withRegistryLock(operation) {
+    await ensureDirectory();
+    const deadline = Date.now() + LOCK_TIMEOUT_MS;
+    let handle;
+    let identity;
+    for (;;) {
+      try {
+        handle = await open(lockTarget, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600);
+        identity = await handle.stat();
+        await handle.writeFile(`${JSON.stringify({ pid: process.pid })}\n`, "utf8");
+        await handle.sync();
+        break;
+      } catch (error) {
+        if (handle) await handle.close().catch(() => {});
+        handle = null;
+        if (error?.code !== "EEXIST") throw error;
+        try {
+          const details = await lstat(lockTarget);
+          if (!details.isFile() || details.isSymbolicLink()) {
+            fail("WORKSPACE_REGISTRY_PATH_UNSAFE", "工作区注册表锁文件不安全。");
+          }
+        } catch (inspectionError) {
+          if (inspectionError?.code === "ENOENT") continue;
+          throw inspectionError;
+        }
+        if (Date.now() >= deadline) {
+          fail("WORKSPACE_REGISTRY_BUSY", "工作区注册表正被另一个进程使用。", 503);
+        }
+        await delay(LOCK_RETRY_MS);
+      }
+    }
+
+    try {
+      return await operation();
+    } finally {
+      await handle.close().catch(() => {});
+      try {
+        const current = await lstat(lockTarget);
+        if (current.dev === identity.dev && current.ino === identity.ino) {
+          await unlink(lockTarget);
+        }
+      } catch (error) {
+        if (error?.code !== "ENOENT") throw error;
+      }
+    }
+  }
+
+  function serialized(operation, { lock = false } = {}) {
+    const execute = () => lock ? withRegistryLock(operation) : operation();
+    const result = queue.then(execute, execute);
     queue = result.catch(() => {});
     return result;
   }
 
-  async function legacyStorageLayout(workspaceId) {
+  async function legacyStorageLayout(workspaceId, { createDirectory = true } = {}) {
     if (!LEGACY_ID.test(workspaceId)) return "versioned";
-    const actualRoot = await ensureDirectory();
+    const actualRoot = await ensureDirectory({ create: createDirectory });
+    if (!actualRoot) return "versioned";
     const candidate = path.join(root, workspaceId);
     let details;
     try {
@@ -180,15 +241,24 @@ export function createWorkspaceRegistry({
     return "legacy";
   }
 
-  async function ensureVersionedWorkspaceRoot(workspaceId) {
-    const actualRoot = await ensureDirectory();
+  async function ensureVersionedWorkspaceRoot(workspaceId, { create = true } = {}) {
+    const actualRoot = await ensureDirectory({ create });
+    if (!actualRoot) return null;
     const workspacesRoot = path.join(root, "workspaces");
-    try {
-      await mkdir(workspacesRoot, { mode: 0o700 });
-    } catch (error) {
-      if (error?.code !== "EEXIST") throw error;
+    if (create) {
+      try {
+        await mkdir(workspacesRoot, { mode: 0o700 });
+      } catch (error) {
+        if (error?.code !== "EEXIST") throw error;
+      }
     }
-    const workspacesDetails = await lstat(workspacesRoot);
+    let workspacesDetails;
+    try {
+      workspacesDetails = await lstat(workspacesRoot);
+    } catch (error) {
+      if (!create && error?.code === "ENOENT") return null;
+      throw error;
+    }
     if (!workspacesDetails.isDirectory() || workspacesDetails.isSymbolicLink()) {
       fail("WORKSPACE_STATE_PATH_UNSAFE", "版本化工作区目录不能是符号链接或联接点。");
     }
@@ -198,12 +268,20 @@ export function createWorkspaceRegistry({
     }
 
     const workspaceRoot = path.join(workspacesRoot, workspaceId);
-    try {
-      await mkdir(workspaceRoot, { mode: 0o700 });
-    } catch (error) {
-      if (error?.code !== "EEXIST") throw error;
+    if (create) {
+      try {
+        await mkdir(workspaceRoot, { mode: 0o700 });
+      } catch (error) {
+        if (error?.code !== "EEXIST") throw error;
+      }
     }
-    const workspaceDetails = await lstat(workspaceRoot);
+    let workspaceDetails;
+    try {
+      workspaceDetails = await lstat(workspaceRoot);
+    } catch (error) {
+      if (!create && error?.code === "ENOENT") return null;
+      throw error;
+    }
     if (!workspaceDetails.isDirectory() || workspaceDetails.isSymbolicLink()) {
       fail("WORKSPACE_STATE_PATH_UNSAFE", "工作区状态目录不能是符号链接或联接点。");
     }
@@ -211,11 +289,15 @@ export function createWorkspaceRegistry({
     if (!isPathInside(actualWorkspacesRoot, actualWorkspaceRoot)) {
       fail("WORKSPACE_STATE_PATH_UNSAFE", "工作区状态目录越出了版本化工作区目录。");
     }
+    return actualWorkspaceRoot;
   }
 
-  async function storageLayoutFor(workspaceId, { prepare = false } = {}) {
-    const storageLayout = await legacyStorageLayout(workspaceId);
+  async function storageLayoutFor(workspaceId, { prepare = false, createDirectory = true } = {}) {
+    const storageLayout = await legacyStorageLayout(workspaceId, { createDirectory });
     if (storageLayout === "versioned" && prepare) await ensureVersionedWorkspaceRoot(workspaceId);
+    if (storageLayout === "versioned" && !prepare) {
+      await ensureVersionedWorkspaceRoot(workspaceId, { create: false });
+    }
     return storageLayout;
   }
 
@@ -235,10 +317,10 @@ export function createWorkspaceRegistry({
     return directoryContainsState(workspaceRoot);
   }
 
-  async function publicWorkspace(workspace, { prepare = false } = {}) {
+  async function publicWorkspace(workspace, { prepare = false, createDirectory = true } = {}) {
     return {
       ...structuredClone(workspace),
-      storageLayout: await storageLayoutFor(workspace.workspaceId, { prepare }),
+      storageLayout: await storageLayoutFor(workspace.workspaceId, { prepare, createDirectory }),
     };
   }
 
@@ -281,13 +363,24 @@ export function createWorkspaceRegistry({
       store.updatedAt = createdAt;
       await writeStore(store);
       return { ...structuredClone(workspace), storageLayout };
-    });
+    }, { lock: true });
   }
 
   async function listWorkspaces() {
     return serialized(async () => {
-      const store = await readStore();
-      return Promise.all(store.workspaces.map(publicWorkspace));
+      const store = await readStore({ createDirectory: false });
+      return Promise.all(store.workspaces.map((workspace) => publicWorkspace(workspace, { createDirectory: false })));
+    });
+  }
+
+  async function lookupVault({ fingerprint: rawFingerprint } = {}) {
+    const fingerprint = normalizeFingerprint(rawFingerprint);
+    return serialized(async () => {
+      const store = await readStore({ createDirectory: false });
+      const workspace = store.workspaces.find((item) => item.fingerprint === fingerprint);
+      return workspace
+        ? publicWorkspace(workspace, { createDirectory: false })
+        : null;
     });
   }
 
@@ -326,7 +419,7 @@ export function createWorkspaceRegistry({
         expiresAt: pending.expiresAt,
         requiresConfirmation: true,
       };
-    });
+    }, { lock: true });
   }
 
   async function confirmRebind({ token } = {}) {
@@ -353,6 +446,7 @@ export function createWorkspaceRegistry({
       const storageLayout = await storageLayoutFor(workspace.workspaceId, { prepare: true });
 
       const conflicting = store.workspaces.find((item) => item.fingerprint === pending.fingerprint);
+      let removedWorkspaceId = null;
       if (conflicting && conflicting.workspaceId !== workspace.workspaceId) {
         if (
           Date.parse(conflicting.createdAt) < Date.parse(pending.requestedAt) ||
@@ -360,19 +454,23 @@ export function createWorkspaceRegistry({
         ) {
           fail("WORKSPACE_REBIND_CONFLICT", "该 Vault 已属于另一个既有工作区。", 409);
         }
+        removedWorkspaceId = conflicting.workspaceId;
         store.workspaces = store.workspaces.filter((item) => item.workspaceId !== conflicting.workspaceId);
       }
       workspace.fingerprint = pending.fingerprint;
       workspace.updatedAt = confirmedAt.toISOString();
       store.pendingRebinds = store.pendingRebinds.filter(
-        (item) => item.workspaceId !== workspace.workspaceId && item.fingerprint !== pending.fingerprint,
+        (item) =>
+          item.workspaceId !== workspace.workspaceId &&
+          item.workspaceId !== removedWorkspaceId &&
+          item.fingerprint !== pending.fingerprint,
       );
       store.revision += 1;
       store.updatedAt = confirmedAt.toISOString();
       await writeStore(store);
       return { ...structuredClone(workspace), storageLayout };
-    });
+    }, { lock: true });
   }
 
-  return Object.freeze({ resolveVault, listWorkspaces, previewRebind, confirmRebind });
+  return Object.freeze({ resolveVault, lookupVault, listWorkspaces, previewRebind, confirmRebind });
 }

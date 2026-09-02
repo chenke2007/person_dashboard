@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { lstat, readFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -50,7 +50,7 @@ import { createVaultSyncService } from "./vault-sync.mjs";
 import { loadAttentionStrategy } from "./public-config.mjs";
 import { readIndexedFile } from "./obsidian-vault.mjs";
 import { createKnowledgeRoutes } from "./knowledge-chat/routes.mjs";
-import { createProjectRepository } from "./projects/project-repository.mjs";
+import { ProjectRepositoryError, createProjectRepository } from "./projects/project-repository.mjs";
 import { createProjectRoutes } from "./projects/project-routes.mjs";
 import { createWorkspaceRegistry } from "./workspace-state/workspace-registry.mjs";
 
@@ -80,6 +80,15 @@ const readerImageAllowedRoots = [
   "50_scripts",
   "wiki",
 ];
+
+const emptyReadOnlyProjectRepository = Object.freeze({
+  async getWorkspace() {
+    return { version: 1, revision: 0, updatedAt: null, projects: [], metrics: {} };
+  },
+  async getProject() {
+    throw new ProjectRepositoryError("PROJECT_NOT_FOUND", "项目不存在。", 404);
+  },
+});
 
 function json(res, status, value) {
   res.writeHead(status, jsonHeaders);
@@ -824,14 +833,25 @@ export function workbenchApiPlugin({
     projectRepositoryPromise ??= (async () => {
       let resolvedProjectDirectory = projectDirectory;
       if (!resolvedProjectDirectory) {
-        const workspace = await registry.resolveVault({
-          fingerprint: vaultFingerprint,
-          label: path.basename(vaultRoot),
-        });
+        const workspace = projectReadOnly
+          ? await registry.lookupVault({ fingerprint: vaultFingerprint })
+          : await registry.resolveVault({
+              fingerprint: vaultFingerprint,
+              label: path.basename(vaultRoot),
+            });
+        if (!workspace) return emptyReadOnlyProjectRepository;
         const stateRoot = workspace.storageLayout === "legacy"
           ? path.join(workspaceRegistryDirectory, workspace.workspaceId)
           : path.join(workspaceRegistryDirectory, "workspaces", workspace.workspaceId);
         resolvedProjectDirectory = path.join(stateRoot, "projects");
+      }
+      if (projectReadOnly) {
+        try {
+          await lstat(resolvedProjectDirectory);
+        } catch (error) {
+          if (error?.code === "ENOENT") return emptyReadOnlyProjectRepository;
+          throw error;
+        }
       }
       return createProjectRepository({
         directory: resolvedProjectDirectory,

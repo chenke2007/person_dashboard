@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { access, mkdtemp, mkdir, readFile, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { once } from "node:events";
 import { spawn } from "node:child_process";
 import os from "node:os";
@@ -38,6 +38,44 @@ function mutableClock(initial = "2026-09-02T00:00:00.000Z") {
 
 async function readRegistry(directory) {
   return JSON.parse(await readFile(path.join(directory, "workspace-registry.json"), "utf8"));
+}
+
+async function startLockOwner(t, directory, { exitAfterLock = false } = {}) {
+  const lockPath = path.join(directory, "workspace-registry.lock");
+  const childSource = `
+    import { open } from "node:fs/promises";
+    import { once } from "node:events";
+    import { randomBytes } from "node:crypto";
+    const lockPath = process.argv.at(-2);
+    const exitAfterLock = process.argv.at(-1) === "exit";
+    const handle = await open(lockPath, "wx", 0o600);
+    await handle.writeFile(JSON.stringify({
+      version: 1,
+      pid: process.pid,
+      token: randomBytes(32).toString("hex"),
+      status: "held",
+    }) + "\\n", "utf8");
+    await handle.sync();
+    process.stdout.write("locked\\n");
+    if (exitAfterLock) {
+      await handle.close();
+    } else {
+      await once(process.stdin, "data");
+      await handle.close();
+    }
+  `;
+  const holder = spawn(
+    process.execPath,
+    ["--input-type=module", "-e", childSource, lockPath, exitAfterLock ? "exit" : "hold"],
+    { stdio: ["pipe", "pipe", "pipe"] },
+  );
+  const exited = once(holder, "exit");
+  t.after(() => {
+    if (holder.exitCode == null) holder.kill();
+  });
+  const [ready] = await once(holder.stdout, "data");
+  assert.equal(ready.toString("utf8"), "locked\n");
+  return { holder, lockPath, exited };
 }
 
 test("keeps a stable workspace id and requires confirmation to rebind", async (t) => {
@@ -181,6 +219,69 @@ test("waits for a cross-process lock and re-reads before writing", async (t) => 
     (error) => error instanceof WorkspaceRegistryError && error.code === "WORKSPACE_REGISTRY_VERSION_UNSUPPORTED",
   );
   assert.equal(await readFile(target, "utf8"), newer);
+});
+
+test("reclaims a lock after its child-process owner exits abruptly", async (t) => {
+  const directory = await makeStore(t);
+  const { lockPath, exited } = await startLockOwner(t, directory, { exitAfterLock: true });
+  await exited;
+  const registry = createWorkspaceRegistry({
+    directory,
+    makeId: sequenceIds("workspace-1"),
+    lockTimeoutMs: 250,
+  });
+
+  const workspace = await registry.resolveVault({ fingerprint: FINGERPRINT_A, label: "Synthetic Vault" });
+
+  assert.equal(workspace.workspaceId, "workspace-1");
+  await assert.rejects(access(lockPath), (error) => error?.code === "ENOENT");
+});
+
+test("never steals a lock from a live child-process owner", async (t) => {
+  const directory = await makeStore(t);
+  const { holder, lockPath, exited } = await startLockOwner(t, directory);
+  const registry = createWorkspaceRegistry({
+    directory,
+    makeId: sequenceIds("workspace-1"),
+    lockTimeoutMs: 100,
+  });
+
+  await assert.rejects(
+    registry.resolveVault({ fingerprint: FINGERPRINT_A, label: "Synthetic Vault" }),
+    (error) => error instanceof WorkspaceRegistryError && error.code === "WORKSPACE_REGISTRY_BUSY",
+  );
+  assert.equal(JSON.parse(await readFile(lockPath, "utf8")).pid, holder.pid);
+  holder.stdin.end("release\n");
+  await exited;
+  await unlink(lockPath);
+});
+
+test("does not replace a committed result when lock cleanup fails and recovers later", async (t) => {
+  const directory = await makeStore(t);
+  const lockPath = path.join(directory, "workspace-registry.lock");
+  let failCleanup = true;
+  const registry = createWorkspaceRegistry({
+    directory,
+    makeId: sequenceIds("workspace-1", "workspace-2"),
+    async removeLock(candidate) {
+      if (failCleanup) {
+        failCleanup = false;
+        const error = new Error("synthetic cleanup denial");
+        error.code = "EACCES";
+        throw error;
+      }
+      await unlink(candidate);
+    },
+  });
+
+  const first = await registry.resolveVault({ fingerprint: FINGERPRINT_A, label: "Synthetic Vault A" });
+
+  assert.equal(first.workspaceId, "workspace-1");
+  assert.equal(JSON.parse(await readFile(lockPath, "utf8")).status, "released");
+  const second = await registry.resolveVault({ fingerprint: FINGERPRINT_B, label: "Synthetic Vault B" });
+  assert.equal(second.workspaceId, "workspace-2");
+  assert.equal((await registry.listWorkspaces()).length, 2);
+  await assert.rejects(access(lockPath), (error) => error?.code === "ENOENT");
 });
 
 test("refuses unknown and corrupt schema versions without overwriting them", async (t) => {

@@ -8,11 +8,13 @@ import { emptyWorkspaceRegistry, workspaceRegistrySchema } from "./workspace-sch
 
 const FILE_NAME = "workspace-registry.json";
 const LOCK_FILE_NAME = "workspace-registry.lock";
+const LOCK_MAX_BYTES = 4 * 1024;
 const MAX_BYTES = 2 * 1024 * 1024;
 const LOCK_RETRY_MS = 20;
 const LOCK_TIMEOUT_MS = 5_000;
 const REBIND_TTL_MS = 15 * 60 * 1000;
 const LEGACY_ID = /^[a-f0-9]{24}$/;
+const activeLockTokens = new Set();
 
 export class WorkspaceRegistryError extends Error {
   constructor(code, message, status = 500, details = undefined) {
@@ -81,13 +83,43 @@ function confirmationHash(token, pending) {
     .digest("hex");
 }
 
+function validLockPayload(value) {
+  return Boolean(
+    value &&
+    value.version === 1 &&
+    Number.isSafeInteger(value.pid) &&
+    value.pid > 0 &&
+    typeof value.token === "string" &&
+    /^[a-f0-9]{64}$/.test(value.token) &&
+    ["held", "released"].includes(value.status),
+  );
+}
+
+function processIsProvenDead(pid) {
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (error) {
+    return error?.code === "ESRCH";
+  }
+}
+
+function sameFileIdentity(left, right) {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
 export function createWorkspaceRegistry({
   directory,
   now = () => new Date(),
   makeId = randomUUID,
+  lockTimeoutMs = LOCK_TIMEOUT_MS,
+  removeLock = unlink,
 } = {}) {
   if (typeof directory !== "string" || !path.isAbsolute(directory)) {
     fail("WORKSPACE_REGISTRY_PATH_INVALID", "工作区注册表目录无效。");
+  }
+  if (!Number.isFinite(lockTimeoutMs) || lockTimeoutMs < 10 || typeof removeLock !== "function") {
+    fail("WORKSPACE_REGISTRY_LOCK_OPTIONS_INVALID", "工作区注册表锁配置无效。");
   }
   const root = path.resolve(directory);
   const target = path.join(root, FILE_NAME);
@@ -169,29 +201,83 @@ export function createWorkspaceRegistry({
 
   async function withRegistryLock(operation) {
     await ensureDirectory();
-    const deadline = Date.now() + LOCK_TIMEOUT_MS;
+    const deadline = Date.now() + lockTimeoutMs;
     let handle;
     let identity;
+    let token;
+
+    async function writeLockPayload(status) {
+      const body = Buffer.from(`${JSON.stringify({ version: 1, pid: process.pid, token, status })}\n`, "utf8");
+      await handle.truncate(0);
+      await handle.write(body, 0, body.length, 0);
+      await handle.sync();
+    }
+
+    async function inspectLock() {
+      let details;
+      try {
+        details = await lstat(lockTarget);
+      } catch (error) {
+        if (error?.code === "ENOENT") return null;
+        throw error;
+      }
+      if (!details.isFile() || details.isSymbolicLink() || details.size > LOCK_MAX_BYTES) {
+        fail("WORKSPACE_REGISTRY_PATH_UNSAFE", "工作区注册表锁文件不安全。");
+      }
+      let payload = null;
+      try {
+        const parsed = JSON.parse(await readFile(lockTarget, "utf8"));
+        if (validLockPayload(parsed)) payload = parsed;
+      } catch (error) {
+        if (error?.code === "ENOENT") return null;
+      }
+      return { details, payload };
+    }
+
+    function reclaimable(snapshot) {
+      const payload = snapshot?.payload;
+      if (!payload) return false;
+      if (payload.status === "released") return true;
+      if (payload.pid === process.pid) return !activeLockTokens.has(payload.token);
+      return processIsProvenDead(payload.pid);
+    }
+
+    async function reclaim(snapshot) {
+      let current;
+      try {
+        current = await lstat(lockTarget);
+      } catch (error) {
+        if (error?.code === "ENOENT") return true;
+        throw error;
+      }
+      if (!sameFileIdentity(snapshot.details, current)) return false;
+      try {
+        await removeLock(lockTarget);
+        return true;
+      } catch (error) {
+        if (error?.code === "ENOENT") return true;
+        return false;
+      }
+    }
+
     for (;;) {
       try {
         handle = await open(lockTarget, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600);
         identity = await handle.stat();
-        await handle.writeFile(`${JSON.stringify({ pid: process.pid })}\n`, "utf8");
-        await handle.sync();
+        token = randomBytes(32).toString("hex");
+        await writeLockPayload("held");
+        activeLockTokens.add(token);
         break;
       } catch (error) {
-        if (handle) await handle.close().catch(() => {});
+        if (handle) {
+          await handle.close().catch(() => {});
+          await removeLock(lockTarget).catch(() => {});
+        }
         handle = null;
         if (error?.code !== "EEXIST") throw error;
-        try {
-          const details = await lstat(lockTarget);
-          if (!details.isFile() || details.isSymbolicLink()) {
-            fail("WORKSPACE_REGISTRY_PATH_UNSAFE", "工作区注册表锁文件不安全。");
-          }
-        } catch (inspectionError) {
-          if (inspectionError?.code === "ENOENT") continue;
-          throw inspectionError;
-        }
+        const snapshot = await inspectLock();
+        if (!snapshot) continue;
+        if (reclaimable(snapshot) && await reclaim(snapshot)) continue;
         if (Date.now() >= deadline) {
           fail("WORKSPACE_REGISTRY_BUSY", "工作区注册表正被另一个进程使用。", 503);
         }
@@ -202,15 +288,15 @@ export function createWorkspaceRegistry({
     try {
       return await operation();
     } finally {
+      await writeLockPayload("released").catch(() => {});
+      activeLockTokens.delete(token);
       await handle.close().catch(() => {});
       try {
         const current = await lstat(lockTarget);
-        if (current.dev === identity.dev && current.ino === identity.ino) {
-          await unlink(lockTarget);
+        if (sameFileIdentity(current, identity)) {
+          await removeLock(lockTarget);
         }
-      } catch (error) {
-        if (error?.code !== "ENOENT") throw error;
-      }
+      } catch {}
     }
   }
 

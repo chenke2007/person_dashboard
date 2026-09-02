@@ -51,6 +51,22 @@ function ArchivedTasks({ snapshot, onRestoreTask }) {
   return <section className="project-archived-tasks"><p>已归档的任务不会出现在看板、列表或 Backlog 中。</p>{tasks.length ? <ul>{tasks.map((task) => <li key={task.id}><span>{snapshot.project.key}-{task.number} · {task.title}</span><button className="project-button" onClick={() => onRestoreTask(task)} type="button">恢复任务</button></li>)}</ul> : <div className="project-empty">暂无已归档任务</div>}</section>;
 }
 
+export function createProjectSnapshotLoader(load, applySnapshot) {
+  let latestRequest = 0;
+  return {
+    invalidate() {
+      latestRequest += 1;
+    },
+    async load(projectId, { includeArchived = false } = {}) {
+      const request = ++latestRequest;
+      const snapshot = await load(projectId, { includeArchived });
+      if (request !== latestRequest) return null;
+      applySnapshot(snapshot);
+      return snapshot;
+    },
+  };
+}
+
 export function ProjectView({ snapshot, view, filters, onChangeView, onChangeFilters, onCreateTask, onOpenTask, onMoveTask, onOpenSettings, onRestoreTask = () => {} }) {
   const labelFilterRef = useRef(null);
   const [labelFilterOpen, setLabelFilterOpen] = useState(false);
@@ -77,9 +93,16 @@ export function ProjectPage({ onOpenDocument }) {
   const { projectId } = useParams();
   const [snapshot, setSnapshot] = useState(null); const [error, setError] = useState(null); const [selectedTask, setSelectedTask] = useState(null); const [settingsOpen, setSettingsOpen] = useState(false);
   const [view, setView] = useState(() => localStorage.getItem("workbench-project-view") || "board"); const [filters, setFilters] = useState({});
-  const refresh = useCallback(async (includeArchived = false) => { const next = await loadProject(projectId, { includeArchived }); setSnapshot(next); setSelectedTask((current) => current?.id ? next.tasks.find((task) => task.id === current.id) || null : current); return next; }, [projectId]);
+  const snapshotLoader = useRef(null);
+  if (!snapshotLoader.current) {
+    snapshotLoader.current = createProjectSnapshotLoader(loadProject, (next) => {
+      setSnapshot(next);
+      setSelectedTask((current) => current?.id ? next.tasks.find((task) => task.id === current.id) || null : current);
+    });
+  }
+  const refresh = useCallback((includeArchived = false) => snapshotLoader.current.load(projectId, { includeArchived }), [projectId]);
   useEffect(() => { refresh(view === "archived").catch(setError); }, [refresh, view]);
-  const changeView = (next) => { setView(next); localStorage.setItem("workbench-project-view", next); };
+  const changeView = (next) => { snapshotLoader.current.invalidate(); setView(next); localStorage.setItem("workbench-project-view", next); };
   const move = async (task, columnId, index) => { const previous = snapshot; setError(null); try { setSnapshot(await moveTask(task.id, { columnId, index, revision: snapshot.revision })); } catch (moveError) { setSnapshot(previous); setError(moveError); await refresh().catch(() => {}); } };
   const save = async (patch) => { setError(null); const result = selectedTask.id ? await updateTask(selectedTask.id, patch) : await createTask(projectId, patch); await refresh(); if (!selectedTask.id) setSelectedTask(result.task); return result.task; };
   const mutateAndRefresh = async (operation) => { setError(null); try { const result = await operation(); await refresh(); return result; } catch (mutationError) { setError(mutationError); throw mutationError; } };

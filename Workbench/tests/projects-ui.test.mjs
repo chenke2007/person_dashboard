@@ -13,12 +13,13 @@ const result = await build({
       import { renderToStaticMarkup } from "react-dom/server";
       import { MemoryRouter } from "react-router-dom";
       import { ProjectsView } from "../src/pages/ProjectsPage.jsx";
-      import { ProjectView } from "../src/pages/ProjectPage.jsx";
+      import { ProjectView, createProjectSnapshotLoader } from "../src/pages/ProjectPage.jsx";
       import { TaskDrawer } from "../src/components/projects/TaskDrawer.jsx";
       const render = (Component, props) => renderToStaticMarkup(<MemoryRouter><Component {...props} /></MemoryRouter>);
       exports.renderProjects = (props) => render(ProjectsView, props);
       exports.renderProject = (props) => render(ProjectView, props);
       exports.renderTaskDrawer = (props) => render(TaskDrawer, props);
+      exports.createProjectSnapshotLoader = createProjectSnapshotLoader;
     `,
     resolveDir: fileURLToPath(new URL(".", import.meta.url)),
     loader: "jsx",
@@ -110,6 +111,34 @@ test("project view exposes archived tasks and their restore action", () => {
   assert.match(html, /已归档任务/);
   assert.match(html, /Synthetic archived task/);
   assert.match(html, /恢复任务/);
+});
+
+test("project snapshot lifecycle requests archives only for that view and ignores stale responses", async () => {
+  const requests = [];
+  const snapshots = [];
+  const loader = compiled.exports.createProjectSnapshotLoader((projectId, options) => new Promise((resolve) => {
+    requests.push({ projectId, options, resolve });
+  }), (snapshot) => snapshots.push(snapshot));
+
+  const initial = loader.load("project-1");
+  assert.deepEqual(requests[0], { projectId: "project-1", options: { includeArchived: false }, resolve: requests[0].resolve });
+  const defaultSnapshot = { tasks: [{ id: "active", archivedAt: null }] };
+  requests[0].resolve(defaultSnapshot);
+  assert.equal(await initial, defaultSnapshot);
+
+  const archived = loader.load("project-1", { includeArchived: true });
+  assert.equal(requests[1].options.includeArchived, true);
+  loader.invalidate();
+  const archivedSnapshot = { tasks: [{ id: "archived", archivedAt: "2026-09-01T00:00:00.000Z" }] };
+  requests[1].resolve(archivedSnapshot);
+  assert.equal(await archived, null);
+  assert.deepEqual(snapshots, [defaultSnapshot]);
+
+  const board = loader.load("project-1");
+  assert.equal(requests[2].options.includeArchived, false);
+  requests[2].resolve(defaultSnapshot);
+  assert.equal(await board, defaultSnapshot);
+  assert.deepEqual(snapshots, [defaultSnapshot, defaultSnapshot]);
 });
 
 test("project planning keeps drag, drawer, filters and view preference wired", async () => {

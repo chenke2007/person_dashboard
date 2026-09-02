@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { access, mkdtemp, mkdir, readFile, rm, symlink, unlink, writeFile } from "node:fs/promises";
+import { access, mkdtemp, mkdir, readFile, readdir, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { once } from "node:events";
 import { spawn } from "node:child_process";
 import os from "node:os";
@@ -270,6 +270,100 @@ test("does not replace a committed result when lock cleanup fails and recovers l
   assert.equal(second.workspaceId, "workspace-2");
   assert.equal((await registry.listWorkspaces()).length, 2);
   await assert.rejects(access(failedTicketPath), (error) => error?.code === "ENOENT");
+});
+
+test("keeps a published same-process ticket active while another registry inspects it", async (t) => {
+  const directory = await makeStore(t);
+  const lockDirectory = path.join(directory, "workspace-registry.lock");
+  let firstPublished;
+  const firstTicketIsPublished = new Promise((resolve) => { firstPublished = resolve; });
+  let releaseFirst;
+  const firstPublishGate = new Promise((resolve) => { releaseFirst = resolve; });
+  let secondInspectedTwice;
+  const secondCompletedTwoInspections = new Promise((resolve) => { secondInspectedTwice = resolve; });
+  let releaseSecondInspection;
+  const secondInspectionGate = new Promise((resolve) => { releaseSecondInspection = resolve; });
+  t.after(() => {
+    releaseFirst();
+    releaseSecondInspection();
+  });
+
+  let inside = 0;
+  let maximumInside = 0;
+  const firstRegistry = createWorkspaceRegistry({
+    directory,
+    makeId: () => "workspace-a",
+    lockTimeoutMs: 2_000,
+    lockLifecycle: {
+      async ticketPublished() {
+        firstPublished();
+        await firstPublishGate;
+      },
+      acquired() {
+        inside += 1;
+        maximumInside = Math.max(maximumInside, inside);
+      },
+      released() {
+        inside -= 1;
+      },
+    },
+  });
+  const firstResult = firstRegistry.resolveVault({ fingerprint: FINGERPRINT_A, label: "Synthetic Vault A" });
+  await Promise.race([
+    firstTicketIsPublished,
+    delay(1_000).then(() => assert.fail("first contender did not publish its ticket")),
+  ]);
+  const [firstTicketName] = await readdir(lockDirectory);
+  const firstTicketPath = path.join(lockDirectory, firstTicketName);
+  assert.equal(JSON.parse(await readFile(firstTicketPath, "utf8")).status, "waiting");
+
+  let inspectionCount = 0;
+  const secondRegistry = createWorkspaceRegistry({
+    directory,
+    makeId: () => "workspace-b",
+    lockTimeoutMs: 2_000,
+    lockLifecycle: {
+      async ticketsInspected() {
+        inspectionCount += 1;
+        if (inspectionCount === 2) {
+          secondInspectedTwice();
+          await secondInspectionGate;
+        }
+      },
+      acquired() {
+        inside += 1;
+        maximumInside = Math.max(maximumInside, inside);
+      },
+      released() {
+        inside -= 1;
+      },
+    },
+  });
+  const secondResult = secondRegistry.resolveVault({ fingerprint: FINGERPRINT_B, label: "Synthetic Vault B" });
+  await Promise.race([
+    secondCompletedTwoInspections,
+    delay(1_000).then(() => assert.fail("second contender did not complete two ticket inspections")),
+  ]);
+
+  let firstTicketSurvived = true;
+  try {
+    await access(firstTicketPath);
+  } catch (error) {
+    if (error?.code === "ENOENT") firstTicketSurvived = false;
+    else throw error;
+  }
+  releaseFirst();
+  releaseSecondInspection();
+  const outcomes = await Promise.allSettled([firstResult, secondResult]);
+
+  assert.equal(firstTicketSurvived, true, "the live same-process ticket was reclaimed");
+  assert.deepEqual(outcomes.map((outcome) => outcome.status), ["fulfilled", "fulfilled"]);
+  assert.equal(maximumInside, 1);
+  assert.equal(inside, 0);
+  assert.deepEqual(
+    (await firstRegistry.listWorkspaces()).map((item) => item.workspaceId).sort(),
+    ["workspace-a", "workspace-b"],
+  );
 });
 
 test("serializes two contenders reclaiming the same stale ticket without losing updates", async (t) => {

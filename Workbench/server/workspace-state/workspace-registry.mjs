@@ -122,6 +122,8 @@ export function createWorkspaceRegistry({
     lockTimeoutMs < 10 ||
     typeof removeLock !== "function" ||
     typeof lockLifecycle !== "object" ||
+    (lockLifecycle.ticketPublished != null && typeof lockLifecycle.ticketPublished !== "function") ||
+    (lockLifecycle.ticketsInspected != null && typeof lockLifecycle.ticketsInspected !== "function") ||
     (lockLifecycle.acquired != null && typeof lockLifecycle.acquired !== "function") ||
     (lockLifecycle.released != null && typeof lockLifecycle.released !== "function")
   ) {
@@ -225,8 +227,9 @@ export function createWorkspaceRegistry({
     const token = randomBytes(32).toString("hex");
     const order = process.hrtime.bigint().toString();
     const ticketPath = path.join(lockDirectory, `${token}.ticket`);
-    let handle = await open(ticketPath, constants.O_CREAT | constants.O_EXCL | constants.O_RDWR, 0o600);
-    let status = "waiting";
+    let handle;
+    let status = null;
+    let activated = false;
     let enteredLifecycle = false;
 
     async function writeTicket(nextStatus) {
@@ -307,12 +310,16 @@ export function createWorkspaceRegistry({
     }
 
     try {
-      await writeTicket("waiting");
+      handle = await open(ticketPath, constants.O_CREAT | constants.O_EXCL | constants.O_RDWR, 0o600);
       activeLockTokens.add(token);
+      activated = true;
+      await writeTicket("waiting");
+      await lockLifecycle.ticketPublished?.();
       await delay(LOCK_RETRY_MS);
 
       for (;;) {
         const inspected = await inspectTickets();
+        await lockLifecycle.ticketsInspected?.();
         let removed = false;
         for (const ticket of inspected) {
           if (ticket.payload?.token !== token && reclaimable(ticket.payload)) {
@@ -367,9 +374,9 @@ export function createWorkspaceRegistry({
           .catch(() => {});
       }
       if (handle && status !== "released") await writeTicket("released").catch(() => {});
-      activeLockTokens.delete(token);
+      if (activated) activeLockTokens.delete(token);
       await handle?.close().catch(() => {});
-      await removeTicket(ticketPath).catch(() => {});
+      if (handle) await removeTicket(ticketPath).catch(() => {});
     }
   }
 

@@ -6,7 +6,7 @@ function command(path, method, body = {}) {
 
 export const loadProjects = ({ includeArchived = false } = {}) => request(includeArchived ? "/api/projects?archived=include" : "/api/projects");
 export const createProject = (input) => command("/api/projects", "POST", input);
-export const loadProject = (projectId) => request(`/api/projects/${encodeURIComponent(projectId)}`);
+export const loadProject = (projectId, { includeArchived = false } = {}) => request(`/api/projects/${encodeURIComponent(projectId)}${includeArchived ? "?archived=include" : ""}`);
 export const updateProject = (projectId, patch) => command(`/api/projects/${encodeURIComponent(projectId)}`, "PATCH", patch);
 export const archiveProject = (projectId) => command(`/api/projects/${encodeURIComponent(projectId)}/archive`, "POST");
 export const restoreProject = (projectId) => command(`/api/projects/${encodeURIComponent(projectId)}/restore`, "POST");
@@ -17,6 +17,7 @@ export const createTask = (projectId, input) => command(`/api/projects/${encodeU
 export const updateTask = (taskId, patch) => command(`/api/tasks/${encodeURIComponent(taskId)}`, "PATCH", patch);
 export const moveTask = (taskId, input) => command(`/api/tasks/${encodeURIComponent(taskId)}/move`, "POST", input);
 export const archiveTask = (taskId) => command(`/api/tasks/${encodeURIComponent(taskId)}/archive`, "POST");
+export const restoreTask = (taskId) => command(`/api/tasks/${encodeURIComponent(taskId)}/restore`, "POST");
 export const createLabel = (input) => command("/api/projects/labels", "POST", input);
 export const setTaskLabels = (taskId, labelIds) => command(`/api/tasks/${encodeURIComponent(taskId)}/labels`, "PUT", { labelIds });
 export const addTaskLink = (taskId, documentId) => command(`/api/tasks/${encodeURIComponent(taskId)}/links`, "POST", { documentId });

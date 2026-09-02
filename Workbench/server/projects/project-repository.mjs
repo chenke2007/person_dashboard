@@ -179,9 +179,10 @@ export function createProjectRepository({
     return result;
   }
 
-  function projectProjection(store, projectId) {
+  function projectProjection(store, projectId, { includeArchived = false } = {}) {
     const project = store.projects.find((item) => item.id === projectId);
     if (!project) fail("PROJECT_NOT_FOUND", "项目不存在。", 404);
+    const tasks = store.tasks.filter((item) => item.projectId === projectId && (includeArchived || !item.archivedAt));
     const taskIds = new Set(store.tasks.filter((item) => item.projectId === projectId).map((item) => item.id));
     return structuredClone({
       version: store.version,
@@ -189,7 +190,7 @@ export function createProjectRepository({
       updatedAt: store.updatedAt,
       project,
       columns: store.columns.filter((item) => item.projectId === projectId).sort((a, b) => a.position - b.position),
-      tasks: store.tasks.filter((item) => item.projectId === projectId).sort((a, b) => a.position - b.position),
+      tasks: tasks.sort((a, b) => a.position - b.position),
       labels: store.labels,
       taskLabels: store.taskLabels.filter((item) => taskIds.has(item.taskId)),
       taskLinks: store.taskLinks.filter((item) => taskIds.has(item.taskId)),
@@ -228,9 +229,9 @@ export function createProjectRepository({
         });
       });
     },
-    async getProject(projectId) {
+    async getProject(projectId, { includeArchived = false } = {}) {
       return serialized(async () => {
-        const snapshot = projectProjection(await readStore(), projectId);
+        const snapshot = projectProjection(await readStore(), projectId, { includeArchived });
         snapshot.taskLinks = await Promise.all(snapshot.taskLinks.map(async (link) => {
           const document = await resolveDocument(link.documentId);
           return {
@@ -536,6 +537,24 @@ export function createProjectRepository({
           id: makeId(), projectId: task.projectId, taskId: task.id, type: "task.archived", data: {}, createdAt: timestamp,
         });
         return (saved) => ({ revision: saved.revision, task: structuredClone(task) });
+      });
+    },
+    restoreTask(taskId) {
+      return mutate((store) => {
+        const task = requireTask(store, taskId);
+        const timestamp = now().toISOString();
+        task.archivedAt = null;
+        task.updatedAt = timestamp;
+        normalizeTaskPositions(store, task.projectId, task.columnId);
+        const restoredActivity = {
+          id: makeId(), projectId: task.projectId, taskId: task.id, type: "task.restored", data: {}, createdAt: timestamp,
+        };
+        store.activities.push(restoredActivity);
+        return (saved) => ({
+          revision: saved.revision,
+          task: structuredClone(task),
+          activities: [structuredClone(restoredActivity)],
+        });
       });
     },
   });

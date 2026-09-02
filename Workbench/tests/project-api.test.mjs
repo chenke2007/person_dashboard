@@ -151,6 +151,27 @@ test("mutates the complete first-phase project model through command endpoints",
   assert.equal((await request(origin, `/api/projects/${projectId}/restore`, { method: "POST", body: {} })).body.project.archivedAt, null);
 });
 
+test("lists archived tasks only on request and restores them through the local API", async (t) => {
+  const { origin } = await startFixture(t);
+  const created = (await request(origin, "/api/projects", {
+    method: "POST",
+    body: { key: "PAW", name: "Workbench" },
+  })).body;
+  const task = (await request(origin, `/api/projects/${created.project.id}/tasks`, {
+    method: "POST",
+    body: { title: "Synthetic task" },
+  })).body.task;
+
+  await request(origin, `/api/tasks/${task.id}/archive`, { method: "POST", body: {} });
+
+  assert.equal((await request(origin, `/api/projects/${created.project.id}`)).body.tasks.length, 0);
+  assert.equal((await request(origin, `/api/projects/${created.project.id}?archived=include`)).body.tasks.length, 1);
+  const restored = await request(origin, `/api/tasks/${task.id}/restore`, { method: "POST", body: {} });
+  assert.equal(restored.response.status, 200);
+  assert.equal(restored.body.task.archivedAt, null);
+  assert.equal(restored.body.activities[0].type, "task.restored");
+});
+
 test("rejects unsafe, read-only, stale, and malformed mutations", async (t) => {
   const writable = await startFixture(t);
   const crossOrigin = await fetch(`${writable.origin}/api/projects`, {

@@ -208,6 +208,21 @@ test("persists labels, safe Vault links, archives, and auditable activities", as
   );
 });
 
+test("lists and restores archived tasks without changing their number", async (t) => {
+  const { repository, created } = await projectFixture(t);
+  const made = await repository.createTask({ projectId: created.project.id, title: "Synthetic task" });
+
+  await repository.archiveTask(made.task.id);
+
+  assert.equal((await repository.getProject(created.project.id)).tasks.length, 0);
+  assert.equal((await repository.getProject(created.project.id, { includeArchived: true })).tasks.length, 1);
+
+  const restored = await repository.restoreTask(made.task.id);
+  assert.equal(restored.task.number, made.task.number);
+  assert.equal(restored.task.archivedAt, null);
+  assert.equal(restored.activities[0].type, "task.restored");
+});
+
 test("updates projects, columns, tasks, links, and project archive state", async (t) => {
   const document = { id: "wiki/plan.md", path: "wiki/plan.md", kind: "wiki" };
   const { repository, created } = await projectFixture(t, {

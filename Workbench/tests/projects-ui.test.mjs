@@ -95,6 +95,23 @@ test("project view exposes Board, List, Backlog and accessible task movement", (
   assert.match(html, /移动任务“实现看板”/);
 });
 
+test("project view exposes archived tasks and their restore action", () => {
+  const html = compiled.exports.renderProject({
+    snapshot: {
+      project: { id: "project-1", key: "PAW", name: "Workbench" },
+      columns: [],
+      tasks: [{ id: "task-1", number: 1, title: "Synthetic archived task", columnId: null, priority: "medium", position: 0, archivedAt: "2026-09-01T00:00:00.000Z" }],
+      labels: [], taskLabels: [], taskLinks: [], activities: [],
+    },
+    view: "archived",
+    filters: {},
+    onChangeView() {}, onChangeFilters() {}, onCreateTask() {}, onOpenTask() {}, onMoveTask() {}, onOpenSettings() {}, onRestoreTask() {},
+  });
+  assert.match(html, /已归档任务/);
+  assert.match(html, /Synthetic archived task/);
+  assert.match(html, /恢复任务/);
+});
+
 test("project planning keeps drag, drawer, filters and view preference wired", async () => {
   const page = await readFile(new URL("../src/pages/ProjectPage.jsx", import.meta.url), "utf8");
   const drawer = await readFile(new URL("../src/components/projects/TaskDrawer.jsx", import.meta.url), "utf8");

@@ -5,7 +5,7 @@ const PROJECT = /^\/([0-9a-f-]{36})$/i;
 const PROJECT_ACTION = /^\/([0-9a-f-]{36})\/(archive|restore|columns|tasks)$/i;
 const PROJECT_COLUMN = /^\/([0-9a-f-]{36})\/columns\/([0-9a-f-]{36})$/i;
 const PROJECT_COLUMN_ORDER = /^\/([0-9a-f-]{36})\/columns\/order$/i;
-const TASK = /^\/api\/tasks\/([0-9a-f-]{36})(?:\/(move|archive|labels|links))?$/i;
+const TASK = /^\/api\/tasks\/([0-9a-f-]{36})(?:\/(move|archive|restore|labels|links))?$/i;
 const TASK_LINK = /^\/api\/task-links\/([0-9a-f-]{36})$/i;
 
 function sendJson(res, status, value) {
@@ -55,7 +55,7 @@ export function createProjectRoutes({ repository, readOnly = false } = {}) {
         if (req.method === "POST" && route === "") return sendJson(res, 201, await repository.createProject(await bodyJson(req)));
         if (req.method === "POST" && route === "/labels") return sendJson(res, 201, await repository.createLabel(await bodyJson(req)));
         const projectMatch = PROJECT.exec(route);
-        if (req.method === "GET" && projectMatch) return sendJson(res, 200, await repository.getProject(projectMatch[1]));
+        if (req.method === "GET" && projectMatch) return sendJson(res, 200, await repository.getProject(projectMatch[1], { includeArchived: url.searchParams.get("archived") === "include" }));
         if (req.method === "PATCH" && projectMatch) return sendJson(res, 200, await repository.updateProject(projectMatch[1], await bodyJson(req)));
         const orderMatch = PROJECT_COLUMN_ORDER.exec(route);
         if (req.method === "PUT" && orderMatch) {
@@ -88,6 +88,10 @@ export function createProjectRoutes({ repository, readOnly = false } = {}) {
         if (taskMatch && req.method === "POST" && taskMatch[2] === "archive") {
           await bodyJson(req);
           return sendJson(res, 200, await repository.archiveTask(taskMatch[1]));
+        }
+        if (taskMatch && req.method === "POST" && taskMatch[2] === "restore") {
+          await bodyJson(req);
+          return sendJson(res, 200, await repository.restoreTask(taskMatch[1]));
         }
         if (taskMatch && req.method === "PUT" && taskMatch[2] === "labels") {
           return sendJson(res, 200, await repository.setTaskLabels({ taskId: taskMatch[1], ...(await bodyJson(req)) }));

@@ -57,12 +57,10 @@ person_dashboard/
 先使用仓库自带的 synthetic demo，确认总览、知识星图、社媒洞察和抖音数据页面可以正常打开。
 ```
 
-项目要求 Node.js 20+。Agent 最终执行的基础命令是：
+项目要求 Node.js 20+。请先确保需要的功能已合并到当前检出的分支。Agent 最终执行的基础命令是：
 
 ```bash
-cd Workbench
-npm install
-npm run dev
+cd Workbench && npm run dev
 ```
 
 ### 接入自己的知识库

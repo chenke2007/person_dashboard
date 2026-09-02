@@ -29,11 +29,12 @@ Workbench 提供可复用的读取、索引和可视化能力，不包含任何�
 环境要求：Node.js 22 或更新版本。
 
 ```bash
-npm install
-npm run dev
+cd Workbench && npm run dev
 ```
 
 默认读取 `../个人知识库/`。浏览器打开终端输出中的本地地址即可查看演示。
+
+启动前请确保需要的功能已合并到当前检出的分支。
 
 ### 连接自己的 Vault
 
@@ -67,7 +68,7 @@ PERSONAL_DASHBOARD_READ_ONLY=true
 - 只读模式阻止笔记保存、待看写入、Wiki 入库、AI 工作流和本地程序启动；浏览不会创建知识库状态目录。正文中的外部图片不自动加载。
 - 文件变化会自动重新索引。首次扫描在服务就绪前完成；丢失或不可访问的 Vault 会报错，不会回退到演示数据。
 
-Windows 启动：在本目录运行 `npm run dev`。构建脚本包含 POSIX 环境变量语法，可从 Git Bash 执行 `npm run build`。
+Windows 和 POSIX 均使用同一个启动命令：`cd Workbench && npm run dev`。发布构建使用跨平台的 `npm run build`。
 
 ### 知识库助手：问答与确认入库
 

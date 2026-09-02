@@ -8,7 +8,7 @@
     "test": "npm run build && node --test --test-concurrency=1 tests/*.test.mjs",
     "privacy:scan": "node scripts/privacy-scan.mjs",
     "demo:generate": "node scripts/generate-demo-douyin.mjs",
-    "build": "VITE_WORKBENCH_HOSTED=true vite build && node scripts/prepare-sites-build.mjs",
+    "build": "node scripts/build-workbench.mjs",
     "preview": "vite preview",
     "test:authenticity": "node --test tests/data-authenticity.test.mjs",
     "test:ui-information-gate": "node --test tests/ui-information-gate.test.mjs",

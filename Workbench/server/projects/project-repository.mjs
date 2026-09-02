@@ -77,6 +77,10 @@ function normalizeTaskPositions(store, projectId, columnId) {
     .forEach((item, position) => { item.position = position; });
 }
 
+function migrateProjectStore(value) {
+  return value;
+}
+
 function metricsFor(store, project, today) {
   const columns = new Map(store.columns.filter((item) => item.projectId === project.id).map((item) => [item.id, item]));
   const tasks = store.tasks.filter((item) => item.projectId === project.id && !item.archivedAt);
@@ -156,7 +160,18 @@ export function createProjectRepository({
     if (!checked.success) fail("PROJECT_STORAGE_CORRUPT", "项目数据未通过完整性检查。", 500);
     const body = `${JSON.stringify(checked.data, null, 2)}\n`;
     if (Buffer.byteLength(body) > MAX_BYTES) fail("PROJECT_STORAGE_TOO_LARGE", "项目数据超过容量限制。", 413);
-    const temporary = path.join(root, `.${FILE_NAME}.${randomUUID()}.tmp`);
+    const temporary = await writeTemporary(body, "tmp");
+    try {
+      await ensureDirectory();
+      await rename(temporary, target);
+    } finally {
+      await unlink(temporary).catch(() => {});
+    }
+    return checked.data;
+  }
+
+  async function writeTemporary(body, suffix) {
+    const temporary = path.join(root, `.${FILE_NAME}.${randomUUID()}.${suffix}`);
     let handle;
     try {
       handle = await open(temporary, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600);
@@ -164,19 +179,105 @@ export function createProjectRepository({
       await handle.sync();
       await handle.close();
       handle = null;
-      await ensureDirectory();
-      await rename(temporary, target);
+      return temporary;
+    } catch (error) {
+      await unlink(temporary).catch(() => {});
+      throw error;
     } finally {
       if (handle) await handle.close().catch(() => {});
-      await unlink(temporary).catch(() => {});
     }
-    return checked.data;
   }
 
   function serialized(operation) {
     const result = queue.then(operation, operation);
     queue = result.catch(() => {});
     return result;
+  }
+
+  async function validatedImport(value) {
+    try {
+      return structuredClone(await projectStoreSchema.parseAsync(migrateProjectStore(value)));
+    } catch {
+      fail("PROJECT_STORAGE_CORRUPT", "项目导入数据未通过完整性检查。", 400);
+    }
+  }
+
+  async function acquireExclusiveTransaction() {
+    const previous = queue;
+    let release;
+    const barrier = new Promise((resolve) => { release = resolve; });
+    queue = previous.then(() => barrier, () => barrier);
+    await previous.catch(() => {});
+    return release;
+  }
+
+  async function stageImport(value) {
+    const checked = await validatedImport(value);
+    const body = `${JSON.stringify(checked, null, 2)}\n`;
+    if (Buffer.byteLength(body) > MAX_BYTES) fail("PROJECT_STORAGE_TOO_LARGE", "项目数据超过容量限制。", 413);
+    const release = await acquireExclusiveTransaction();
+    let stagedPath = null;
+    let rollbackPath = null;
+    let hadOriginal = false;
+    let committed = false;
+    let preserveRollback = false;
+    let closed = false;
+    try {
+      try {
+        await lstat(target);
+        hadOriginal = true;
+      } catch (error) {
+        if (error?.code !== "ENOENT") throw error;
+      }
+      const previous = await readStore();
+      if (hadOriginal) {
+        rollbackPath = await writeTemporary(`${JSON.stringify(previous, null, 2)}\n`, "rollback");
+      }
+      stagedPath = await writeTemporary(body, "stage");
+    } catch (error) {
+      if (stagedPath) await unlink(stagedPath).catch(() => {});
+      if (rollbackPath) await unlink(rollbackPath).catch(() => {});
+      release();
+      throw error;
+    }
+
+    async function commit() {
+      if (closed || committed) return;
+      await rename(stagedPath, target);
+      stagedPath = null;
+      committed = true;
+    }
+
+    async function rollback() {
+      if (closed || !committed) return;
+      try {
+        if (hadOriginal) {
+          await rename(rollbackPath, target);
+          rollbackPath = null;
+        } else {
+          await unlink(target).catch((error) => {
+            if (error?.code !== "ENOENT") throw error;
+          });
+        }
+        committed = false;
+      } catch (error) {
+        preserveRollback = true;
+        throw error;
+      }
+    }
+
+    async function cleanup() {
+      if (closed) return;
+      closed = true;
+      if (stagedPath) await unlink(stagedPath).catch(() => {});
+      if (rollbackPath && !preserveRollback) await unlink(rollbackPath).catch(() => {});
+      release();
+    }
+
+    // The caller must always invoke cleanup. Until then this transaction owns
+    // the repository queue, so all providers can stage before any provider
+    // commits and a later failure can roll committed stores back safely.
+    return Object.freeze({ commit, rollback, cleanup });
   }
 
   function projectProjection(store, projectId, { includeArchived = false } = {}) {
@@ -216,6 +317,18 @@ export function createProjectRepository({
   }
 
   return Object.freeze({
+    id: "projects",
+    schemaVersion: 1,
+    exportState() {
+      return serialized(async () => structuredClone(await readStore()));
+    },
+    validateImport(value) {
+      return validatedImport(value);
+    },
+    replaceState(value) {
+      return serialized(async () => writeStore(await validatedImport(value)));
+    },
+    stageImport,
     async getWorkspace({ includeArchived = false } = {}) {
       return serialized(async () => {
         const store = await readStore();

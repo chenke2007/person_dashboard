@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { lstat, readFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -52,7 +52,10 @@ import { readIndexedFile } from "./obsidian-vault.mjs";
 import { createKnowledgeRoutes } from "./knowledge-chat/routes.mjs";
 import { ProjectRepositoryError, createProjectRepository } from "./projects/project-repository.mjs";
 import { createProjectRoutes } from "./projects/project-routes.mjs";
+import { emptyProjectStore, projectStoreSchema } from "./projects/project-schema.mjs";
+import { createWorkspaceBackup } from "./workspace-state/workspace-backup.mjs";
 import { createWorkspaceRegistry } from "./workspace-state/workspace-registry.mjs";
+import { createWorkspaceRoutes } from "./workspace-state/workspace-routes.mjs";
 
 const workbenchRoot = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const defaultVaultRoot = path.resolve(
@@ -82,6 +85,17 @@ const readerImageAllowedRoots = [
 ];
 
 const emptyReadOnlyProjectRepository = Object.freeze({
+  id: "projects",
+  schemaVersion: 1,
+  async exportState() {
+    return emptyProjectStore();
+  },
+  async validateImport(value) {
+    return structuredClone(await projectStoreSchema.parseAsync(value));
+  },
+  async replaceState() {
+    throw new ProjectRepositoryError("VAULT_READ_ONLY", "当前知识库为只读接入，不允许修改项目。", 403);
+  },
   async getWorkspace() {
     return { version: 1, revision: 0, updatedAt: null, projects: [], metrics: {} };
   },
@@ -233,6 +247,7 @@ function errorPayload(error) {
 }
 
 function errorStatus(error) {
+  if (Number.isInteger(error?.status) && error.status >= 400 && error.status <= 599) return error.status;
   const code = error?.code;
   if (code === "LOCAL_API_ORIGIN_DENIED") return 403;
   if (code === "UNSUPPORTED_MEDIA_TYPE") return 415;
@@ -427,6 +442,7 @@ async function readJson(req, maximumBytes = 64 * 1024) {
     if (Buffer.byteLength(raw, "utf8") > maximumBytes) {
       const error = new Error("请求内容超过安全上限。");
       error.code = "REQUEST_TOO_LARGE";
+      error.status = 413;
       throw error;
     }
   }
@@ -809,6 +825,7 @@ export function workbenchApiPlugin({
   knowledgeOptions = {},
   projectDirectory = null,
   appDataRoot = process.env.LOCALAPPDATA || path.join(os.homedir(), ".local", "share"),
+  hosted = process.env.VITE_WORKBENCH_HOSTED === "true",
 } = {}) {
   let readerNoteApiMutationQueue = Promise.resolve();
   const readerNotes = readOnly ? { get: async () => null } : createReaderNotesRepository({ vaultRoot });
@@ -828,17 +845,28 @@ export function workbenchApiPlugin({
     .digest("hex");
   const workspaceRegistryDirectory = path.join(appDataRoot, "PersonalAIWorkbench");
   const registry = projectDirectory ? null : createWorkspaceRegistry({ directory: workspaceRegistryDirectory });
+  let workspacePromise = null;
+  async function currentWorkspace({ create = !projectReadOnly } = {}) {
+    if (projectDirectory) {
+      return {
+        workspaceId: `direct-${vaultFingerprint.slice(0, 24)}`,
+        projectDirectory,
+      };
+    }
+    if (!create) return registry.lookupVault({ fingerprint: vaultFingerprint });
+    workspacePromise ??= registry.resolveVault({
+      fingerprint: vaultFingerprint,
+      label: path.basename(vaultRoot),
+    });
+    return workspacePromise;
+  }
+
   let projectRepositoryPromise = null;
   function projectRepository() {
     projectRepositoryPromise ??= (async () => {
       let resolvedProjectDirectory = projectDirectory;
       if (!resolvedProjectDirectory) {
-        const workspace = projectReadOnly
-          ? await registry.lookupVault({ fingerprint: vaultFingerprint })
-          : await registry.resolveVault({
-              fingerprint: vaultFingerprint,
-              label: path.basename(vaultRoot),
-            });
+        const workspace = await currentWorkspace();
         if (!workspace) return emptyReadOnlyProjectRepository;
         const stateRoot = workspace.storageLayout === "legacy"
           ? path.join(workspaceRegistryDirectory, workspace.workspaceId)
@@ -869,6 +897,38 @@ export function workbenchApiPlugin({
     },
   });
   const projectRoutes = createProjectRoutes({ repository: projects, readOnly: projectReadOnly });
+  const backupSecret = randomBytes(32);
+  let workspaceBackupPromise = null;
+  function workspaceBackup() {
+    workspaceBackupPromise ??= (async () => {
+      const workspace = await currentWorkspace();
+      if (!workspace) {
+        const error = new Error("当前 Vault 尚未绑定工作区。");
+        error.code = "WORKSPACE_NOT_FOUND";
+        error.status = 404;
+        throw error;
+      }
+      return createWorkspaceBackup({
+        providers: [await projectRepository()],
+        secret: backupSecret,
+        workspaceId: workspace.workspaceId,
+      });
+    })();
+    return workspaceBackupPromise;
+  }
+  const workspaceRoutes = createWorkspaceRoutes({
+    getBackup: workspaceBackup,
+    registry,
+    currentFingerprint: vaultFingerprint,
+    readOnly: projectReadOnly,
+    hosted,
+    readJson,
+    async onRebind() {
+      workspacePromise = null;
+      projectRepositoryPromise = null;
+      workspaceBackupPromise = null;
+    },
+  });
   const knowledge = createKnowledgeRoutes({ vaultRoot, getIndex: currentIndex, notifyPaths: (paths) => vaultSync.refresh({ reason: "knowledge-create", paths }), ...knowledgeOptions });
   const refreshIndex = (options = {}) => vaultSync.refresh({
     reason: "manual",
@@ -1046,6 +1106,7 @@ export function workbenchApiPlugin({
         try {
           if (knowledge.matches(req, url)) return await knowledge.handle(req, res, url);
           assertLocalMutationRequest(req);
+          if (workspaceRoutes.matches(req, url)) return await workspaceRoutes.handle(req, res, url, json);
           if (projectRoutes.matches(req, url)) return await projectRoutes.handle(req, res, url);
           if (readOnly && (!['GET', 'HEAD'].includes(req.method) || /^\/api\/(?:wiki-ingest|workflows|reader-explanations)(?:\/|$)/.test(url.pathname))) {
             return json(res, 403, { error: { code: "VAULT_READ_ONLY", message: "当前知识库为只读接入，不允许写入、执行脚本或启动 AI 工作流。" } });

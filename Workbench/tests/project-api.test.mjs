@@ -33,7 +33,7 @@ async function listenOnFetchSafePort(server) {
   }
 }
 
-async function startFixture(t, { readOnly = false, projectReadOnly, useWorkspaceRegistry = false, beforeStart } = {}) {
+async function startFixture(t, { readOnly = false, projectReadOnly, useWorkspaceRegistry = false, hosted = false, beforeStart } = {}) {
   const root = await mkdtemp(path.join(os.tmpdir(), "workbench-project-api-"));
   const vaultRoot = path.join(root, "vault");
   const appDataRoot = path.join(root, "app-data");
@@ -45,7 +45,7 @@ async function startFixture(t, { readOnly = false, projectReadOnly, useWorkspace
     configFile: false,
     logLevel: "silent",
     server: { middlewareMode: true },
-    plugins: [workbenchApiPlugin({ vaultRoot, projectDirectory, appDataRoot, readOnly, projectReadOnly })],
+    plugins: [workbenchApiPlugin({ vaultRoot, projectDirectory, appDataRoot, readOnly, projectReadOnly, hosted })],
   });
   const server = http.createServer(vite.middlewares);
   await listenOnFetchSafePort(server);
@@ -282,4 +282,122 @@ test("rejects a versioned projects junction at the API integration seam", async 
   assert.equal(listed.response.status, 500);
   assert.equal(listed.body.error.code, "PROJECT_STORAGE_PATH_UNSAFE");
   assert.deepEqual(await readdir(outside), []);
+});
+
+test("exports and restores project state only after a safe preview is confirmed", async (t) => {
+  const fixture = await startFixture(t, { useWorkspaceRegistry: true });
+  await request(fixture.origin, "/api/projects", {
+    method: "POST",
+    body: { key: "ONE", name: "Synthetic original project" },
+  });
+  const exported = await request(fixture.origin, "/api/workspace/backup");
+  assert.equal(exported.response.status, 200);
+  assert.deepEqual(Object.keys(exported.body.providers), ["projects"]);
+  assert.equal(JSON.stringify(exported.body).includes(fixture.vaultRoot), false);
+
+  await request(fixture.origin, "/api/projects", {
+    method: "POST",
+    body: { key: "TWO", name: "Synthetic later project" },
+  });
+  const preview = await request(fixture.origin, "/api/workspace/restore/preview", {
+    method: "POST",
+    body: exported.body,
+  });
+  assert.equal(preview.response.status, 200);
+  assert.deepEqual(preview.body.providers, [{ id: "projects", version: 1, count: 4 }]);
+  assert.equal((await request(fixture.origin, "/api/projects")).body.projects.length, 2);
+
+  const confirmed = await request(fixture.origin, "/api/workspace/restore/confirm", {
+    method: "POST",
+    body: { token: preview.body.token },
+  });
+  assert.equal(confirmed.response.status, 200);
+  assert.equal(confirmed.body.restored, true);
+  assert.equal((await request(fixture.origin, "/api/projects")).body.projects.length, 1);
+});
+
+test("workspace restore routes keep origin, JSON, read-only, checksum, and hosted gates", async (t) => {
+  const writable = await startFixture(t, { useWorkspaceRegistry: true });
+  const bundle = (await request(writable.origin, "/api/workspace/backup")).body;
+
+  const crossOrigin = await fetch(`${writable.origin}/api/workspace/restore/preview`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Origin: "https://example.invalid" },
+    body: JSON.stringify(bundle),
+  });
+  assert.equal(crossOrigin.status, 403);
+
+  const wrongContentType = await fetch(`${writable.origin}/api/workspace/restore/preview`, {
+    method: "POST",
+    headers: { "Content-Type": "text/plain" },
+    body: JSON.stringify(bundle),
+  });
+  assert.equal(wrongContentType.status, 415);
+
+  bundle.providers.projects.data.revision += 1;
+  const altered = await request(writable.origin, "/api/workspace/restore/preview", {
+    method: "POST",
+    body: bundle,
+  });
+  assert.equal(altered.response.status, 400);
+  assert.equal(altered.body.error.code, "WORKSPACE_BACKUP_CHECKSUM_INVALID");
+
+  const readOnly = await startFixture(t, { readOnly: true, useWorkspaceRegistry: true });
+  const denied = await request(readOnly.origin, "/api/workspace/restore/confirm", {
+    method: "POST",
+    body: { token: "synthetic-invalid-token" },
+  });
+  assert.equal(denied.response.status, 403);
+  assert.equal(denied.body.error.code, "VAULT_READ_ONLY");
+
+  const hosted = await startFixture(t, { hosted: true, useWorkspaceRegistry: true });
+  const absent = await request(hosted.origin, "/api/workspace/backup");
+  assert.equal(absent.response.status, 404);
+});
+
+test("lists safe workspace candidates and requires preview confirmation before rebind", async (t) => {
+  let existingWorkspaceId;
+  const fixture = await startFixture(t, {
+    useWorkspaceRegistry: true,
+    async beforeStart({ appDataRoot }) {
+      const registryDirectory = path.join(appDataRoot, "PersonalAIWorkbench");
+      const registry = createWorkspaceRegistry({ directory: registryDirectory, makeId: () => "workspace-existing" });
+      const existing = await registry.resolveVault({
+        fingerprint: "a".repeat(64),
+        label: "Synthetic Existing Workspace",
+      });
+      existingWorkspaceId = existing.workspaceId;
+      const repository = createProjectRepository({
+        directory: path.join(registryDirectory, "workspaces", existing.workspaceId, "projects"),
+      });
+      await repository.createProject({ key: "OLD", name: "Synthetic retained project" });
+    },
+  });
+
+  const candidates = await request(fixture.origin, "/api/workspace/rebind/candidates");
+  assert.equal(candidates.response.status, 200);
+  assert.deepEqual(candidates.body.items, [{
+    workspaceId: existingWorkspaceId,
+    label: "Synthetic Existing Workspace",
+    updatedAt: candidates.body.items[0].updatedAt,
+    isCurrent: false,
+  }]);
+  assert.equal(JSON.stringify(candidates.body).includes("fingerprint"), false);
+
+  const preview = await request(fixture.origin, "/api/workspace/rebind/preview", {
+    method: "POST",
+    body: { workspaceId: existingWorkspaceId },
+  });
+  assert.equal(preview.response.status, 200);
+  assert.equal(preview.body.requiresConfirmation, true);
+  assert.equal((await request(fixture.origin, "/api/workspace/rebind/candidates")).body.items[0].isCurrent, false);
+
+  const confirmed = await request(fixture.origin, "/api/workspace/rebind/confirm", {
+    method: "POST",
+    body: { token: preview.body.token },
+  });
+  assert.equal(confirmed.response.status, 200);
+  assert.equal(confirmed.body.workspaceId, existingWorkspaceId);
+  const projects = await request(fixture.origin, "/api/projects");
+  assert.equal(projects.body.projects[0].name, "Synthetic retained project");
 });

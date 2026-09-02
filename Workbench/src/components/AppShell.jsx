@@ -19,6 +19,7 @@ import {
   IconX,
   IconMessageChatbot,
 } from "@tabler/icons-react";
+import { workbenchBrand, workbenchTitle } from "../lib/branding.js";
 
 const localWorkbench = import.meta.env.VITE_WORKBENCH_HOSTED !== "true";
 const obsidianWorkbench = import.meta.env.VITE_WORKBENCH_PROFILE === "obsidian";
@@ -43,6 +44,10 @@ export function AppShell({ children, onOpenSearch, onOpenKnowledge, knowledgeOpe
   const [mobileOpen, setMobileOpen] = useState(false);
 
   useEffect(() => {
+    document.title = workbenchTitle;
+  }, []);
+
+  useEffect(() => {
     if (!mobileOpen) return undefined;
     const onKeyDown = (event) => {
       if (event.key === "Escape") setMobileOpen(false);
@@ -64,7 +69,7 @@ export function AppShell({ children, onOpenSearch, onOpenKnowledge, knowledgeOpe
         </button>
         <span className="mobile-header__brand">
           <img alt="" aria-hidden="true" src="/workbench-mark.svg" />
-          <span>个人 AI</span>
+          <span>{workbenchBrand}</span>
         </span>
         <button
           aria-label="搜索"
@@ -90,7 +95,7 @@ export function AppShell({ children, onOpenSearch, onOpenKnowledge, knowledgeOpe
           <div className="sidebar__brand-row">
             <NavLink className="sidebar__brand" onClick={() => setMobileOpen(false)} to="/">
               <img alt="" aria-hidden="true" src="/workbench-mark.svg" />
-              <span>个人 AI</span>
+              <span>{workbenchBrand}</span>
             </NavLink>
             <button
               aria-label="关闭导航"

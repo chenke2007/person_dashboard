@@ -165,6 +165,58 @@ test("rebind preview ignores an older candidate after a newer workspace is selec
   assert.equal(state.rebind.token, "fresh-b");
 });
 
+test("rejected restore confirmation clears pending state for the matching backup preview", () => {
+  let state = compiled.exports.workspaceDataReducer(compiled.exports.initialWorkspaceDataState, {
+    type: "restore-selected",
+    inputIdentity: "bundle-a.json",
+    requestGeneration: 1,
+  });
+  state = compiled.exports.workspaceDataReducer(state, {
+    type: "restore-previewed",
+    inputIdentity: "bundle-a.json",
+    requestGeneration: 1,
+    preview: { token: "restore-token", requiresConfirmation: true },
+  });
+  state = compiled.exports.workspaceDataReducer(state, { type: "restore-confirming" });
+  state = compiled.exports.workspaceDataReducer(state, {
+    type: "restore-confirmation-failed",
+    inputIdentity: "bundle-a.json",
+    requestGeneration: 1,
+    message: "恢复操作暂时无法完成，请重新预览后再试。",
+  });
+
+  assert.equal(state.restore.status, "error");
+  assert.equal(state.restore.message, "恢复操作暂时无法完成，请重新预览后再试。");
+  assert.equal(state.restore.confirmationEnabled, false);
+  assert.equal(state.restore.token, null);
+});
+
+test("rejected rebind confirmation clears pending state for the matching workspace preview", () => {
+  let state = compiled.exports.workspaceDataReducer(compiled.exports.initialWorkspaceDataState, {
+    type: "rebind-selected",
+    workspaceId: "workspace-a",
+    requestGeneration: 1,
+  });
+  state = compiled.exports.workspaceDataReducer(state, {
+    type: "rebind-previewed",
+    workspaceId: "workspace-a",
+    requestGeneration: 1,
+    preview: { token: "rebind-token", requiresConfirmation: true },
+  });
+  state = compiled.exports.workspaceDataReducer(state, { type: "rebind-confirming" });
+  state = compiled.exports.workspaceDataReducer(state, {
+    type: "rebind-confirmation-failed",
+    workspaceId: "workspace-a",
+    requestGeneration: 1,
+    message: "重新绑定暂时无法完成，请稍后重试。",
+  });
+
+  assert.equal(state.rebind.status, "error");
+  assert.equal(state.rebind.message, "重新绑定暂时无法完成，请稍后重试。");
+  assert.equal(state.rebind.confirmationEnabled, false);
+  assert.equal(state.rebind.token, null);
+});
+
 test("hosted System pages do not enable local workspace recovery", () => {
   const liveMutableRuntime = { source: "live", data: { readOnly: false } };
   assert.equal(compiled.exports.systemRecoveryAvailable(liveMutableRuntime, false), false);

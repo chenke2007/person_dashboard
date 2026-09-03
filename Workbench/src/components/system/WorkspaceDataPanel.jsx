@@ -157,6 +157,22 @@ export function workspaceDataReducer(state, action) {
           confirmationEnabled: false,
         },
       };
+    case "restore-confirmation-failed":
+      if (
+        state.restore.inputIdentity !== action.inputIdentity ||
+        state.restore.requestGeneration !== action.requestGeneration
+      ) return state;
+      return {
+        ...state,
+        restore: {
+          ...state.restore,
+          status: "error",
+          message: action.message,
+          token: null,
+          preview: null,
+          confirmationEnabled: false,
+        },
+      };
     case "restore-confirming":
       return { ...state, restore: { ...state.restore, status: "pending", message: "正在恢复工作区…" } };
     case "restore-confirmed":
@@ -220,6 +236,22 @@ export function workspaceDataReducer(state, action) {
       };
     }
     case "rebind-failed":
+      if (
+        state.rebind.workspaceId !== action.workspaceId ||
+        state.rebind.requestGeneration !== action.requestGeneration
+      ) return state;
+      return {
+        ...state,
+        rebind: {
+          ...state.rebind,
+          status: "error",
+          message: action.message,
+          token: null,
+          preview: null,
+          confirmationEnabled: false,
+        },
+      };
+    case "rebind-confirmation-failed":
       if (
         state.rebind.workspaceId !== action.workspaceId ||
         state.rebind.requestGeneration !== action.requestGeneration
@@ -331,12 +363,18 @@ export function WorkspaceDataPanel({ available = false }) {
 
   const confirmRestore = async () => {
     if (!state.restore.confirmationEnabled || !state.restore.token) return;
+    const { inputIdentity, requestGeneration, token } = state.restore;
     dispatch({ type: "restore-confirming" });
     try {
-      await confirmWorkspaceRestore(state.restore.token);
+      await confirmWorkspaceRestore(token);
       dispatch({ type: "restore-confirmed" });
     } catch (error) {
-      dispatch({ type: "restore-failed", message: safeWorkspaceMessage(error, "restore") });
+      dispatch({
+        type: "restore-confirmation-failed",
+        inputIdentity,
+        requestGeneration,
+        message: safeWorkspaceMessage(error, "restore"),
+      });
     }
   };
 
@@ -364,12 +402,18 @@ export function WorkspaceDataPanel({ available = false }) {
 
   const confirmRebind = async () => {
     if (!state.rebind.confirmationEnabled || !state.rebind.token) return;
+    const { workspaceId, requestGeneration, token } = state.rebind;
     dispatch({ type: "rebind-confirming" });
     try {
-      await confirmWorkspaceRebind(state.rebind.token);
+      await confirmWorkspaceRebind(token);
       dispatch({ type: "rebind-confirmed" });
     } catch (error) {
-      dispatch({ type: "rebind-failed", message: safeWorkspaceMessage(error, "rebind") });
+      dispatch({
+        type: "rebind-confirmation-failed",
+        workspaceId,
+        requestGeneration,
+        message: safeWorkspaceMessage(error, "rebind"),
+      });
     }
   };
 

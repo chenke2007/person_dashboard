@@ -291,6 +291,13 @@ function Status({ section }) {
   return <p className={`workspace-data__status workspace-data__status--${section.status}`} role={section.status === "error" ? "alert" : "status"} aria-live="polite">{section.message}</p>;
 }
 
+export function openRestoreFilePicker(input) {
+  if (!input) return false;
+  input.value = "";
+  input.click();
+  return true;
+}
+
 function downloadBackup(bundle) {
   const blob = new Blob([JSON.stringify(bundle, null, 2)], { type: "application/json" });
   const href = URL.createObjectURL(blob);
@@ -303,6 +310,7 @@ function downloadBackup(bundle) {
 
 export function WorkspaceDataPanel({ available = false }) {
   const [state, dispatch] = useReducer(workspaceDataReducer, initialWorkspaceDataState);
+  const restoreFileInput = useRef(null);
   const restorePreviewGeneration = useRef(0);
   const rebindPreviewGeneration = useRef(0);
 
@@ -432,9 +440,9 @@ export function WorkspaceDataPanel({ available = false }) {
         <h3>恢复</h3>
         <p className="workspace-data__hint">{EXCLUDED_DATA_NOTICE}</p>
         <label className="workspace-data__file-label" htmlFor="workspace-restore-file">选择备份文件</label>
-        <input id="workspace-restore-file" type="file" accept="application/json,.json" onChange={selectRestoreBundle} />
+        <input ref={restoreFileInput} id="workspace-restore-file" type="file" accept="application/json,.json" onChange={selectRestoreBundle} />
         {state.restore.fileName ? <p className="workspace-data__selection">已选择：{state.restore.fileName}</p> : null}
-        <button className="graph-filter" type="button" onClick={() => document.getElementById("workspace-restore-file")?.click()} disabled={state.restore.status === "pending"}>{state.restore.status === "pending" ? "正在预览…" : "预览恢复"}</button>
+        <button className="graph-filter" type="button" onClick={() => openRestoreFilePicker(restoreFileInput.current)} disabled={state.restore.status === "pending"}>{state.restore.status === "pending" ? "正在预览…" : "预览恢复"}</button>
         {state.restore.preview ? <div className="workspace-data__preview" aria-label="恢复预览"><p>状态提供方：</p><ul>{state.restore.preview.providers.map((provider) => <li key={provider.id}>{provider.id} · v{provider.version} · {provider.count} 条记录</li>)}</ul><p>提示：</p><ul>{state.restore.preview.warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul></div> : null}
         <button className="graph-filter workspace-data__confirm" type="button" onClick={confirmRestore} disabled={!state.restore.confirmationEnabled || state.restore.status === "pending"}>确认恢复</button>
         <Status section={state.restore} />

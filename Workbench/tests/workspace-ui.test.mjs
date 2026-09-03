@@ -11,11 +11,12 @@ const result = await build({
   stdin: {
     contents: `
       import React from "react";
-      import { WorkspaceDataPanel, workspaceDataReducer, initialWorkspaceDataState } from "../src/components/system/WorkspaceDataPanel.jsx";
+      import { WorkspaceDataPanel, workspaceDataReducer, initialWorkspaceDataState, openRestoreFilePicker } from "../src/components/system/WorkspaceDataPanel.jsx";
       import { systemRecoveryAvailable } from "../src/pages/SystemPage.jsx";
       exports.render = (props) => React.createElement(WorkspaceDataPanel, props);
       exports.workspaceDataReducer = workspaceDataReducer;
       exports.initialWorkspaceDataState = initialWorkspaceDataState;
+      exports.openRestoreFilePicker = openRestoreFilePicker;
       exports.systemRecoveryAvailable = systemRecoveryAvailable;
     `,
     resolveDir: fileURLToPath(new URL(".", import.meta.url)),
@@ -189,6 +190,42 @@ test("rejected restore confirmation clears pending state for the matching backup
   assert.equal(state.restore.message, "恢复操作暂时无法完成，请重新预览后再试。");
   assert.equal(state.restore.confirmationEnabled, false);
   assert.equal(state.restore.token, null);
+});
+
+test("restore retry resets the native picker so selecting the same rejected backup emits change", () => {
+  let state = compiled.exports.workspaceDataReducer(compiled.exports.initialWorkspaceDataState, {
+    type: "restore-selected",
+    inputIdentity: "bundle-a.json",
+    requestGeneration: 1,
+  });
+  state = compiled.exports.workspaceDataReducer(state, {
+    type: "restore-previewed",
+    inputIdentity: "bundle-a.json",
+    requestGeneration: 1,
+    preview: { token: "restore-token", requiresConfirmation: true },
+  });
+  state = compiled.exports.workspaceDataReducer(state, { type: "restore-confirming" });
+  state = compiled.exports.workspaceDataReducer(state, {
+    type: "restore-confirmation-failed",
+    inputIdentity: "bundle-a.json",
+    requestGeneration: 1,
+    message: "恢复操作暂时无法完成，请重新预览后再试。",
+  });
+  assert.equal(state.restore.status, "error");
+
+  let changes = 0;
+  const input = {
+    value: "bundle-a.json",
+    onchange() { changes += 1; },
+    click() {
+      assert.equal(this.value, "");
+      this.value = "bundle-a.json";
+      this.onchange();
+    },
+  };
+
+  assert.equal(compiled.exports.openRestoreFilePicker(input), true);
+  assert.equal(changes, 1);
 });
 
 test("rejected rebind confirmation clears pending state for the matching workspace preview", () => {

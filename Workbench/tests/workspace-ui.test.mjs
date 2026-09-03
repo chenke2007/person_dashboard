@@ -12,9 +12,11 @@ const result = await build({
     contents: `
       import React from "react";
       import { WorkspaceDataPanel, workspaceDataReducer, initialWorkspaceDataState } from "../src/components/system/WorkspaceDataPanel.jsx";
+      import { systemRecoveryAvailable } from "../src/pages/SystemPage.jsx";
       exports.render = (props) => React.createElement(WorkspaceDataPanel, props);
       exports.workspaceDataReducer = workspaceDataReducer;
       exports.initialWorkspaceDataState = initialWorkspaceDataState;
+      exports.systemRecoveryAvailable = systemRecoveryAvailable;
     `,
     resolveDir: fileURLToPath(new URL(".", import.meta.url)),
     loader: "jsx",
@@ -23,6 +25,7 @@ const result = await build({
   platform: "node",
   format: "cjs",
   jsx: "automatic",
+  define: { "import.meta.env": "{}" },
   packages: "external",
   plugins: [{
     name: "ignore-css",
@@ -59,6 +62,8 @@ test("workspace confirmation requires a successful preview token and invalidates
 
   state = compiled.exports.workspaceDataReducer(state, {
     type: "restore-previewed",
+    inputIdentity: null,
+    requestGeneration: 0,
     preview: {
       token: "synthetic-restore-token",
       requiresConfirmation: true,
@@ -70,19 +75,101 @@ test("workspace confirmation requires a successful preview token and invalidates
   assert.deepEqual(state.restore.preview.providers, [{ id: "projects", version: 1, count: 2 }]);
   assert.equal("token" in state.restore.preview, false);
 
-  state = compiled.exports.workspaceDataReducer(state, { type: "restore-selected", name: "replacement.backup.json" });
+  state = compiled.exports.workspaceDataReducer(state, {
+    type: "restore-selected",
+    name: "replacement.backup.json",
+    inputIdentity: "replacement.backup.json",
+    requestGeneration: 1,
+  });
   assert.equal(state.restore.confirmationEnabled, false);
   assert.equal(state.restore.preview, null);
 
   state = compiled.exports.workspaceDataReducer(state, {
     type: "rebind-previewed",
+    workspaceId: "",
+    requestGeneration: 0,
     preview: { token: "synthetic-rebind-token", requiresConfirmation: true },
   });
   assert.equal(state.rebind.confirmationEnabled, true);
 
-  state = compiled.exports.workspaceDataReducer(state, { type: "rebind-selected", workspaceId: "workspace-synthetic" });
+  state = compiled.exports.workspaceDataReducer(state, {
+    type: "rebind-selected",
+    workspaceId: "workspace-synthetic",
+    requestGeneration: 1,
+  });
   assert.equal(state.rebind.confirmationEnabled, false);
   assert.equal(state.rebind.preview, null);
+});
+
+test("restore preview ignores an older selected bundle after a newer file is selected", () => {
+  let state = compiled.exports.workspaceDataReducer(compiled.exports.initialWorkspaceDataState, {
+    type: "restore-selected",
+    inputIdentity: "bundle-a.json",
+    requestGeneration: 1,
+  });
+  state = compiled.exports.workspaceDataReducer(state, {
+    type: "restore-selected",
+    inputIdentity: "bundle-b.json",
+    requestGeneration: 2,
+  });
+  state = compiled.exports.workspaceDataReducer(state, {
+    type: "restore-previewed",
+    inputIdentity: "bundle-a.json",
+    requestGeneration: 1,
+    preview: { token: "stale-a", requiresConfirmation: true },
+  });
+
+  assert.equal(state.restore.confirmationEnabled, false);
+  assert.equal(state.restore.token, null);
+  assert.equal(state.restore.preview, null);
+
+  state = compiled.exports.workspaceDataReducer(state, {
+    type: "restore-previewed",
+    inputIdentity: "bundle-b.json",
+    requestGeneration: 2,
+    preview: { token: "fresh-b", requiresConfirmation: true },
+  });
+  assert.equal(state.restore.confirmationEnabled, true);
+  assert.equal(state.restore.token, "fresh-b");
+});
+
+test("rebind preview ignores an older candidate after a newer workspace is selected", () => {
+  let state = compiled.exports.workspaceDataReducer(compiled.exports.initialWorkspaceDataState, {
+    type: "rebind-selected",
+    workspaceId: "workspace-a",
+    requestGeneration: 1,
+  });
+  state = compiled.exports.workspaceDataReducer(state, {
+    type: "rebind-selected",
+    workspaceId: "workspace-b",
+    requestGeneration: 2,
+  });
+  state = compiled.exports.workspaceDataReducer(state, {
+    type: "rebind-previewed",
+    workspaceId: "workspace-a",
+    requestGeneration: 1,
+    preview: { token: "stale-a", requiresConfirmation: true },
+  });
+
+  assert.equal(state.rebind.confirmationEnabled, false);
+  assert.equal(state.rebind.token, null);
+  assert.equal(state.rebind.preview, null);
+
+  state = compiled.exports.workspaceDataReducer(state, {
+    type: "rebind-previewed",
+    workspaceId: "workspace-b",
+    requestGeneration: 2,
+    preview: { token: "fresh-b", requiresConfirmation: true },
+  });
+  assert.equal(state.rebind.confirmationEnabled, true);
+  assert.equal(state.rebind.token, "fresh-b");
+});
+
+test("hosted System pages do not enable local workspace recovery", () => {
+  const liveMutableRuntime = { source: "live", data: { readOnly: false } };
+  assert.equal(compiled.exports.systemRecoveryAvailable(liveMutableRuntime, false), false);
+  assert.equal(compiled.exports.systemRecoveryAvailable(liveMutableRuntime, true), true);
+  assert.equal(compiled.exports.systemRecoveryAvailable({ source: "live", data: { readOnly: true } }, true), false);
 });
 
 test("workspace panel does not expose recovery controls outside the local mutable System page", () => {

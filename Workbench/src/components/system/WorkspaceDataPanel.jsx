@@ -1,4 +1,4 @@
-import { useEffect, useReducer } from "react";
+import { useEffect, useReducer, useRef } from "react";
 import {
   confirmWorkspaceRebind,
   confirmWorkspaceRestore,
@@ -20,6 +20,8 @@ export const initialWorkspaceDataState = Object.freeze({
   restore: {
     ...initialSection,
     fileName: "",
+    inputIdentity: null,
+    requestGeneration: 0,
     token: null,
     preview: null,
     confirmationEnabled: false,
@@ -29,6 +31,7 @@ export const initialWorkspaceDataState = Object.freeze({
     candidates: [],
     candidatesLoading: false,
     workspaceId: "",
+    requestGeneration: 0,
     token: null,
     preview: null,
     confirmationEnabled: false,
@@ -107,14 +110,24 @@ export function workspaceDataReducer(state, action) {
         restore: {
           ...initialSection,
           fileName: action.name || "",
+          inputIdentity: action.inputIdentity ?? null,
+          requestGeneration: action.requestGeneration ?? state.restore.requestGeneration + 1,
           token: null,
           preview: null,
           confirmationEnabled: false,
         },
       };
     case "restore-pending":
+      if (
+        state.restore.inputIdentity !== action.inputIdentity ||
+        state.restore.requestGeneration !== action.requestGeneration
+      ) return state;
       return { ...state, restore: { ...state.restore, status: "pending", message: "正在校验备份…" } };
     case "restore-previewed": {
+      if (
+        state.restore.inputIdentity !== action.inputIdentity ||
+        state.restore.requestGeneration !== action.requestGeneration
+      ) return state;
       const canConfirm = action.preview?.requiresConfirmation === true && typeof action.preview?.token === "string";
       return {
         ...state,
@@ -129,6 +142,10 @@ export function workspaceDataReducer(state, action) {
       };
     }
     case "restore-failed":
+      if (
+        state.restore.inputIdentity !== action.inputIdentity ||
+        state.restore.requestGeneration !== action.requestGeneration
+      ) return state;
       return {
         ...state,
         restore: {
@@ -167,14 +184,28 @@ export function workspaceDataReducer(state, action) {
           status: "idle",
           message: null,
           workspaceId: action.workspaceId || "",
+          requestGeneration: action.requestGeneration ?? state.rebind.requestGeneration + 1,
           token: null,
           preview: null,
           confirmationEnabled: false,
         },
       };
     case "rebind-pending":
-      return { ...state, rebind: { ...state.rebind, status: "pending", message: "正在生成重新绑定预览…" } };
+      if (state.rebind.workspaceId !== action.workspaceId) return state;
+      return {
+        ...state,
+        rebind: {
+          ...state.rebind,
+          requestGeneration: action.requestGeneration,
+          status: "pending",
+          message: "正在生成重新绑定预览…",
+        },
+      };
     case "rebind-previewed": {
+      if (
+        state.rebind.workspaceId !== action.workspaceId ||
+        state.rebind.requestGeneration !== action.requestGeneration
+      ) return state;
       const canConfirm = action.preview?.requiresConfirmation === true && typeof action.preview?.token === "string";
       return {
         ...state,
@@ -189,6 +220,10 @@ export function workspaceDataReducer(state, action) {
       };
     }
     case "rebind-failed":
+      if (
+        state.rebind.workspaceId !== action.workspaceId ||
+        state.rebind.requestGeneration !== action.requestGeneration
+      ) return state;
       return {
         ...state,
         rebind: {
@@ -236,6 +271,8 @@ function downloadBackup(bundle) {
 
 export function WorkspaceDataPanel({ available = false }) {
   const [state, dispatch] = useReducer(workspaceDataReducer, initialWorkspaceDataState);
+  const restorePreviewGeneration = useRef(0);
+  const rebindPreviewGeneration = useRef(0);
 
   useEffect(() => {
     if (!available) return undefined;
@@ -269,14 +306,26 @@ export function WorkspaceDataPanel({ available = false }) {
 
   const selectRestoreBundle = async (event) => {
     const file = event.target.files?.[0];
-    dispatch({ type: "restore-selected", name: file?.name || "" });
+    const requestGeneration = ++restorePreviewGeneration.current;
+    const inputIdentity = file ? `${file.name}\u0000${file.size}\u0000${file.lastModified}` : "";
+    dispatch({ type: "restore-selected", name: file?.name || "", inputIdentity, requestGeneration });
     if (!file) return;
-    dispatch({ type: "restore-pending" });
+    dispatch({ type: "restore-pending", inputIdentity, requestGeneration });
     try {
       const bundle = JSON.parse(await file.text());
-      dispatch({ type: "restore-previewed", preview: await previewWorkspaceRestore(bundle) });
+      dispatch({
+        type: "restore-previewed",
+        inputIdentity,
+        requestGeneration,
+        preview: await previewWorkspaceRestore(bundle),
+      });
     } catch (error) {
-      dispatch({ type: "restore-failed", message: safeWorkspaceMessage(error, "restore") });
+      dispatch({
+        type: "restore-failed",
+        inputIdentity,
+        requestGeneration,
+        message: safeWorkspaceMessage(error, "restore"),
+      });
     }
   };
 
@@ -293,11 +342,23 @@ export function WorkspaceDataPanel({ available = false }) {
 
   const previewRebind = async () => {
     if (!state.rebind.workspaceId) return;
-    dispatch({ type: "rebind-pending" });
+    const workspaceId = state.rebind.workspaceId;
+    const requestGeneration = ++rebindPreviewGeneration.current;
+    dispatch({ type: "rebind-pending", workspaceId, requestGeneration });
     try {
-      dispatch({ type: "rebind-previewed", preview: await previewWorkspaceRebind(state.rebind.workspaceId) });
+      dispatch({
+        type: "rebind-previewed",
+        workspaceId,
+        requestGeneration,
+        preview: await previewWorkspaceRebind(workspaceId),
+      });
     } catch (error) {
-      dispatch({ type: "rebind-failed", message: safeWorkspaceMessage(error, "rebind") });
+      dispatch({
+        type: "rebind-failed",
+        workspaceId,
+        requestGeneration,
+        message: safeWorkspaceMessage(error, "rebind"),
+      });
     }
   };
 
@@ -338,7 +399,7 @@ export function WorkspaceDataPanel({ available = false }) {
       <div className="workspace-data__section">
         <h3>重新绑定</h3>
         <label className="workspace-data__file-label" htmlFor="workspace-rebind-candidate">选择已保存的工作区</label>
-        <select id="workspace-rebind-candidate" value={state.rebind.workspaceId} onChange={(event) => dispatch({ type: "rebind-selected", workspaceId: event.target.value })} disabled={state.rebind.candidatesLoading}>
+        <select id="workspace-rebind-candidate" value={state.rebind.workspaceId} onChange={(event) => dispatch({ type: "rebind-selected", workspaceId: event.target.value, requestGeneration: ++rebindPreviewGeneration.current })} disabled={state.rebind.candidatesLoading}>
           <option value="">{state.rebind.candidatesLoading ? "正在读取可用工作区…" : "请选择工作区"}</option>
           {state.rebind.candidates.map((candidate) => <option key={candidate.workspaceId} value={candidate.workspaceId}>{candidate.label}{candidate.isCurrent ? "（当前）" : ""}</option>)}
         </select>

@@ -4,6 +4,12 @@ import { WorkspaceDataPanel } from "../components/system/WorkspaceDataPanel";
 import { getRuntimeStatus, refreshVault } from "../lib/api";
 import { formatFullDate } from "../lib/format";
 
+const localWorkbench = import.meta.env?.VITE_WORKBENCH_HOSTED !== "true";
+
+export function systemRecoveryAvailable(runtime, isLocalWorkbench = localWorkbench) {
+  return isLocalWorkbench && runtime.source === "live" && runtime.data?.readOnly !== true;
+}
+
 export function SystemPage() {
   const [runtime, setRuntime] = useState({ data: null, source: "loading", error: null });
   const [refreshing, setRefreshing] = useState(false);
@@ -139,7 +145,7 @@ export function SystemPage() {
         </div>
       </div>
 
-      <WorkspaceDataPanel available={runtime.source === "live" && runtime.data?.readOnly !== true} />
+      <WorkspaceDataPanel available={systemRecoveryAvailable(runtime)} />
 
       {/* Data boundary note */}
       <div className="panel" style={{ marginTop: "20px" }}>

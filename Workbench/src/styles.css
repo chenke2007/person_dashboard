@@ -2124,6 +2124,90 @@ h3 {
   font-size: 12.5px;
 }
 
+.workspace-data {
+  margin-top: 20px;
+}
+
+.workspace-data__hint,
+.workspace-data__selection,
+.workspace-data__status,
+.workspace-data__preview {
+  margin: 8px 0 0;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.workspace-data__hint,
+.workspace-data__selection {
+  color: var(--ink-soft);
+}
+
+.workspace-data__section {
+  display: grid;
+  gap: 10px;
+  margin-top: 20px;
+  padding-top: 18px;
+  border-top: 1px dashed var(--line);
+}
+
+.workspace-data__section h3 {
+  margin: 0;
+  font-size: 14px;
+}
+
+.workspace-data__file-label {
+  color: var(--ink-soft);
+  font-size: 13px;
+}
+
+.workspace-data input[type="file"],
+.workspace-data select {
+  width: 100%;
+  max-width: 540px;
+  color: var(--ink);
+}
+
+.workspace-data__section .graph-filter {
+  width: fit-content;
+}
+
+.workspace-data__confirm {
+  margin-top: 2px;
+}
+
+.workspace-data__preview {
+  padding: 10px 12px;
+  border-left: 3px solid var(--accent);
+  background: var(--surface-sunken);
+}
+
+.workspace-data__preview p,
+.workspace-data__preview ul {
+  margin: 0;
+}
+
+.workspace-data__preview ul + p {
+  margin-top: 8px;
+}
+
+.workspace-data__preview ul {
+  padding-left: 18px;
+}
+
+.workspace-data__status--error {
+  color: var(--danger);
+}
+
+.workspace-data__status--success {
+  color: var(--accent);
+}
+
+@media (max-width: 480px) {
+  .workspace-data__section .graph-filter {
+    width: 100%;
+  }
+}
+
 /* ============================================================
    EASTER EGG — 点阵彩蛋 & misc
    ============================================================ */

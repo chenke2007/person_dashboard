@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { PageHeader } from "../components/PageHeader";
+import { WorkspaceDataPanel } from "../components/system/WorkspaceDataPanel";
 import { getRuntimeStatus, refreshVault } from "../lib/api";
 import { formatFullDate } from "../lib/format";
 
@@ -137,6 +138,8 @@ export function SystemPage() {
           </div>
         </div>
       </div>
+
+      <WorkspaceDataPanel available={runtime.source === "live" && runtime.data?.readOnly !== true} />
 
       {/* Data boundary note */}
       <div className="panel" style={{ marginTop: "20px" }}>

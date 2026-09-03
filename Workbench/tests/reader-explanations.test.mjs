@@ -530,6 +530,7 @@ test("runs at most two Codex processes concurrently", async (t) => {
   await Promise.all(started.map((record) =>
     waitForStatus(service, record.id, READER_EXPLANATION_STATUS.COMPLETED),
   ));
+  await service.close();
 });
 
 test("recovers persisted running records as failed and closes the public mutation API", async (t) => {
@@ -636,7 +637,11 @@ test("rejects an explanation store directory that escapes the Vault through a sy
   const { root } = await fixture(t);
   const outside = await mkdtemp(path.join(os.tmpdir(), "reader-explanations-outside-"));
   t.after(() => rm(outside, { recursive: true, force: true }));
-  await symlink(outside, path.join(root, "state"));
+  await symlink(
+    outside,
+    path.join(root, "state"),
+    process.platform === "win32" ? "junction" : "dir",
+  );
   const service = makeService(
     root,
     path.join(root, "state", "reader-explanations.json"),

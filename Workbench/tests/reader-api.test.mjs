@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -11,7 +11,8 @@ import { buildVaultIndex } from "../server/vault-index.mjs";
 import { workbenchApiPlugin } from "../server/vite-plugin-workbench.mjs";
 
 async function startFixture(t, { readerExplanationService = null } = {}) {
-  const vaultRoot = await mkdtemp(path.join(os.tmpdir(), "workbench-reader-api-"));
+  const stableTempRoot = await realpath(os.tmpdir());
+  const vaultRoot = await mkdtemp(path.join(stableTempRoot, "workbench-reader-api-"));
   await mkdir(path.join(vaultRoot, "10_raw", "articles"), { recursive: true });
   await mkdir(path.join(vaultRoot, "10_raw", "articles", "imgs"), { recursive: true });
   await mkdir(path.join(vaultRoot, "wiki"), { recursive: true });

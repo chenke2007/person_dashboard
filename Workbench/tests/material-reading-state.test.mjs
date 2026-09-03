@@ -169,7 +169,11 @@ test("rejects a reading-state directory that escapes the Vault through a symlink
   t.after(() => rm(outside, { recursive: true, force: true }));
   const storageParent = path.join(vaultRoot, "10_raw", "my-thoughts");
   await mkdir(storageParent, { recursive: true });
-  await symlink(outside, path.join(storageParent, "reading-notes"));
+  await symlink(
+    outside,
+    path.join(storageParent, "reading-notes"),
+    process.platform === "win32" ? "junction" : "dir",
+  );
   const repository = createMaterialReadingStateRepository({ vaultRoot });
 
   await assert.rejects(

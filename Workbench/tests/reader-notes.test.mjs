@@ -188,7 +188,11 @@ test("rejects a reading-notes directory that escapes through a symlink", async (
   const vaultRoot = await makeVault(t);
   const outside = await mkdtemp(path.join(os.tmpdir(), "workbench-notes-outside-"));
   t.after(() => rm(outside, { recursive: true, force: true }));
-  await symlink(outside, path.join(vaultRoot, "10_raw", "my-thoughts", "reading-notes"));
+  await symlink(
+    outside,
+    path.join(vaultRoot, "10_raw", "my-thoughts", "reading-notes"),
+    process.platform === "win32" ? "junction" : "dir",
+  );
   const repository = createReaderNotesRepository({ vaultRoot });
 
   await assert.rejects(

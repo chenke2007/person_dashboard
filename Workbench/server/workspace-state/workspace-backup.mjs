@@ -1,4 +1,5 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import path from "node:path";
 
 import {
   MAX_WORKSPACE_BACKUP_BYTES,
@@ -13,8 +14,8 @@ const CREDENTIAL_KEY = /(?:^|_)(?:api_?key|access_?key|private_?key|refresh_?tok
 const CACHE_KEY = /(?:^|_)(?:cache|cached|cache_dir|cache_path)s?(?:$|_)/;
 const VAULT_BODY_KEY = /(?:^|_)(?:vault_?body|document_?body|readme_?body|raw_?body|raw_?content|markdown_?body)(?:$|_)/;
 const VAULT_BODY_EXACT_KEYS = new Set(["body", "content", "markdown", "readme"]);
-const WINDOWS_ABSOLUTE_PATH = /^[A-Za-z]:[\\/]/;
-const UNC_ABSOLUTE_PATH = /^(?:\\\\|\/\/)[^\\/]+[\\/]/;
+const MAX_PENDING_RESTORE_PREVIEWS = 4;
+const MAX_PENDING_RESTORE_BYTES = 64 * 1024 * 1024;
 
 export class WorkspaceBackupError extends Error {
   constructor(code, message, status = 400) {
@@ -66,9 +67,8 @@ function normalizedKey(key) {
 
 function isAbsolutePath(value) {
   const candidate = value.trim();
-  return candidate.startsWith("/") ||
-    WINDOWS_ABSOLUTE_PATH.test(candidate) ||
-    UNC_ABSOLUTE_PATH.test(candidate) ||
+  return path.win32.isAbsolute(candidate) ||
+    path.posix.isAbsolute(candidate) ||
     /^file:\/\//i.test(candidate);
 }
 
@@ -230,12 +230,51 @@ export function createWorkspaceBackup({ providers, now = () => new Date(), secre
 
   const signingSecret = Buffer.from(secret);
   const pending = new Map();
+  let pendingBytes = 0;
   let confirmationQueue = Promise.resolve();
+
+  function deletePending(nonce) {
+    const preview = pending.get(nonce);
+    if (!preview) return false;
+    pending.delete(nonce);
+    clearTimeout(preview.expiryTimer);
+    pendingBytes -= preview.retainedBytes;
+    return true;
+  }
+
+  function retainPending(nonce, preview, requestedAt) {
+    const requestedAtMs = requestedAt.getTime();
+    for (const [pendingNonce, candidate] of pending) {
+      if (requestedAtMs > Date.parse(candidate.expiresAt)) deletePending(pendingNonce);
+    }
+    if (preview.retainedBytes > MAX_PENDING_RESTORE_BYTES) {
+      fail("WORKSPACE_BACKUP_TOO_LARGE", "备份超过容量限制。", 413);
+    }
+    while (
+      pending.size >= MAX_PENDING_RESTORE_PREVIEWS ||
+      pendingBytes + preview.retainedBytes > MAX_PENDING_RESTORE_BYTES
+    ) {
+      const oldestNonce = pending.keys().next().value;
+      if (!oldestNonce) break;
+      deletePending(oldestNonce);
+    }
+    const expiryDelay = Math.max(1, Date.parse(preview.expiresAt) - requestedAtMs + 1);
+    preview.expiryTimer = setTimeout(() => deletePending(nonce), expiryDelay);
+    preview.expiryTimer.unref?.();
+    pending.set(nonce, preview);
+    pendingBytes += preview.retainedBytes;
+  }
 
   async function exportBundle() {
     const exportedProviders = {};
     for (const provider of orderedProviders) {
-      const data = safeClone(await provider.exportState());
+      let exported;
+      try {
+        exported = await provider.exportState();
+      } catch {
+        fail("WORKSPACE_BACKUP_EXPORT_FAILED", "工作区状态导出失败。", 500);
+      }
+      const data = safeClone(exported);
       exportedProviders[provider.id] = { version: provider.schemaVersion, data };
     }
     const unsigned = workspaceBackupUnsignedSchema.parse({
@@ -292,7 +331,14 @@ export function createWorkspaceBackup({ providers, now = () => new Date(), secre
     const nonce = randomBytes(16).toString("hex");
     const versions = summary.map(({ id, version }) => [id, version]);
     const payload = { version: 1, nonce, checksum, workspaceId, providers: versions, expiresAt };
-    pending.set(nonce, { checksum, workspaceId, providers: versions, expiresAt, validated });
+    retainPending(nonce, {
+      checksum,
+      workspaceId,
+      providers: versions,
+      expiresAt,
+      validated,
+      retainedBytes: serializedBytes(Object.fromEntries(validated)),
+    }, requestedAt);
     return {
       token: encodeToken(payload, signingSecret),
       workspaceId,
@@ -307,7 +353,7 @@ export function createWorkspaceBackup({ providers, now = () => new Date(), secre
     const payload = decodeToken(token, signingSecret);
     const preview = pending.get(payload.nonce);
     if (!preview) fail("WORKSPACE_RESTORE_PREVIEW_INVALID", "恢复确认无效或已不存在。");
-    pending.delete(payload.nonce);
+    deletePending(payload.nonce);
     if (currentTime(now).getTime() > Date.parse(preview.expiresAt)) {
       fail("WORKSPACE_RESTORE_PREVIEW_EXPIRED", "恢复确认已经过期。", 410);
     }
@@ -360,11 +406,16 @@ export function createWorkspaceBackup({ providers, now = () => new Date(), secre
         committed.push(item);
       }
     } catch {
-      const rollbackResults = await Promise.allSettled(
-        [...committed].reverse().map(({ transaction }) => transaction.rollback()),
-      );
+      const rollbackFailures = [];
+      for (const { transaction } of [...committed].reverse()) {
+        try {
+          await transaction.rollback();
+        } catch (error) {
+          rollbackFailures.push(error);
+        }
+      }
       await Promise.allSettled(staged.map(({ transaction }) => transaction.cleanup()));
-      if (rollbackResults.some((result) => result.status === "rejected")) {
+      if (rollbackFailures.length > 0) {
         fail("WORKSPACE_RESTORE_ROLLBACK_FAILED", "恢复提交失败，且回滚未能完整完成。", 500);
       }
       fail("WORKSPACE_RESTORE_COMMIT_FAILED", "恢复提交失败，已回滚当前工作区状态。", 500);

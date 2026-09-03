@@ -148,7 +148,9 @@ test("rejects credentials, caches, absolute paths, Vault bodies, and oversized p
   const unsafe = [
     ["credential", { version: 1, credentials: { apiToken: "synthetic-secret" } }, "WORKSPACE_BACKUP_SENSITIVE_DATA"],
     ["cache", { version: 1, cache: { etag: "synthetic" } }, "WORKSPACE_BACKUP_SENSITIVE_DATA"],
-    ["absolute path", { version: 1, sourcePath: "C:\\synthetic-vault\\note.md" }, "WORKSPACE_BACKUP_ABSOLUTE_PATH"],
+    ["Windows drive absolute path", { version: 1, sourcePath: "C:\\synthetic-vault\\note.md" }, "WORKSPACE_BACKUP_ABSOLUTE_PATH"],
+    ["Windows rooted absolute path", { version: 1, sourcePath: "\\synthetic-vault\\note.md" }, "WORKSPACE_BACKUP_ABSOLUTE_PATH"],
+    ["POSIX rooted absolute path", { version: 1, sourcePath: "/synthetic-vault/note.md" }, "WORKSPACE_BACKUP_ABSOLUTE_PATH"],
     ["Vault body", { version: 1, vaultBody: "synthetic private body" }, "WORKSPACE_BACKUP_VAULT_BODY"],
     ["oversized", { version: 1, projects: [], padding: "x".repeat(33 * 1024 * 1024) }, "WORKSPACE_BACKUP_TOO_LARGE"],
   ];
@@ -163,9 +165,82 @@ test("rejects credentials, caches, absolute paths, Vault bodies, and oversized p
   }
 });
 
-test("stages every provider before commit and rolls committed providers back after a later failure", async () => {
+test("sanitizes unknown provider export failures", async () => {
+  const provider = providerFixture();
+  provider.exportState = async () => {
+    throw new Error("could not open C:\\synthetic-user\\private-token.txt");
+  };
+  const backup = createWorkspaceBackup({
+    providers: [provider],
+    now: mutableClock().now,
+    secret: SECRET,
+    workspaceId: WORKSPACE_ID,
+  });
+
+  await assert.rejects(
+    backup.exportBundle(),
+    (error) => {
+      assert.equal(error instanceof WorkspaceBackupError, true);
+      assert.equal(error.code, "WORKSPACE_BACKUP_EXPORT_FAILED");
+      assert.equal(error.status, 500);
+      assert.equal(error.message, "工作区状态导出失败。");
+      assert.equal(error.message.includes("synthetic-user"), false);
+      assert.equal(error.message.includes("private-token"), false);
+      return true;
+    },
+  );
+});
+
+test("bounds pending restore previews by count and evicts expired and oldest tokens", async () => {
+  const clock = mutableClock();
+  const backup = createWorkspaceBackup({
+    providers: [providerFixture()],
+    now: clock.now,
+    secret: SECRET,
+    workspaceId: WORKSPACE_ID,
+  });
+  const bundle = await backup.exportBundle();
+  const expired = await backup.previewImport(bundle);
+  clock.advance(15 * 60 * 1000 + 1);
+  const previews = [];
+  for (let index = 0; index < 5; index += 1) {
+    previews.push(await backup.previewImport(bundle));
+  }
+
+  await assert.rejects(
+    backup.confirmImport(expired.token),
+    (error) => error instanceof WorkspaceBackupError && error.code === "WORKSPACE_RESTORE_PREVIEW_INVALID",
+  );
+  await assert.rejects(
+    backup.confirmImport(previews[0].token),
+    (error) => error instanceof WorkspaceBackupError && error.code === "WORKSPACE_RESTORE_PREVIEW_INVALID",
+  );
+  await assert.doesNotReject(backup.confirmImport(previews.at(-1).token));
+});
+
+test("bounds pending restore previews to 64 MiB of retained bundle data", async () => {
+  const backup = createWorkspaceBackup({
+    providers: [providerFixture({ state: { version: 1, padding: "x".repeat(30 * 1024 * 1024) } })],
+    now: mutableClock().now,
+    secret: SECRET,
+    workspaceId: WORKSPACE_ID,
+  });
+  const bundle = await backup.exportBundle();
+  const first = await backup.previewImport(bundle);
+  const second = await backup.previewImport(bundle);
+  const third = await backup.previewImport(bundle);
+
+  await assert.rejects(
+    backup.confirmImport(first.token),
+    (error) => error instanceof WorkspaceBackupError && error.code === "WORKSPACE_RESTORE_PREVIEW_INVALID",
+  );
+  await assert.doesNotReject(backup.confirmImport(second.token));
+  await assert.doesNotReject(backup.confirmImport(third.token));
+});
+
+test("stages every provider before commit and rolls committed providers back sequentially in reverse order", async () => {
   const events = [];
-  const states = { alpha: "old-alpha", beta: "old-beta" };
+  const states = { alpha: "old-alpha", beta: "old-beta", gamma: "old-gamma" };
   function transactionalProvider(id, { failCommit = false } = {}) {
     return providerFixture({
       id,
@@ -180,8 +255,10 @@ test("stages every provider before commit and rolls committed providers back aft
             states[id] = value.value;
           },
           async rollback() {
-            events.push(`rollback:${id}`);
+            events.push(`rollback-start:${id}`);
+            await Promise.resolve();
             states[id] = previous;
+            events.push(`rollback-end:${id}`);
           },
           async cleanup() { events.push(`cleanup:${id}`); },
         };
@@ -189,7 +266,11 @@ test("stages every provider before commit and rolls committed providers back aft
     });
   }
   const backup = createWorkspaceBackup({
-    providers: [transactionalProvider("alpha"), transactionalProvider("beta", { failCommit: true })],
+    providers: [
+      transactionalProvider("alpha"),
+      transactionalProvider("beta"),
+      transactionalProvider("gamma", { failCommit: true }),
+    ],
     now: mutableClock().now,
     secret: SECRET,
     workspaceId: WORKSPACE_ID,
@@ -200,12 +281,66 @@ test("stages every provider before commit and rolls committed providers back aft
     backup.confirmImport(preview.token),
     (error) => error instanceof WorkspaceBackupError && error.code === "WORKSPACE_RESTORE_COMMIT_FAILED",
   );
-  assert.deepEqual(states, { alpha: "old-alpha", beta: "old-beta" });
-  assert.deepEqual(events.slice(0, 4), ["stage:alpha", "stage:beta", "commit:alpha", "commit:beta"]);
-  assert.ok(events.indexOf("rollback:alpha") > events.indexOf("commit:beta"));
-  assert.equal(events.includes("rollback:beta"), false);
+  assert.deepEqual(states, { alpha: "old-alpha", beta: "old-beta", gamma: "old-gamma" });
+  assert.deepEqual(events.slice(0, 6), [
+    "stage:alpha", "stage:beta", "stage:gamma", "commit:alpha", "commit:beta", "commit:gamma",
+  ]);
+  assert.deepEqual(events.filter((event) => event.startsWith("rollback")), [
+    "rollback-start:beta",
+    "rollback-end:beta",
+    "rollback-start:alpha",
+    "rollback-end:alpha",
+  ]);
+  assert.equal(events.some((event) => event.includes("gamma")), true);
+  assert.equal(events.includes("rollback-start:gamma"), false);
   assert.ok(events.includes("cleanup:alpha"));
   assert.ok(events.includes("cleanup:beta"));
+  assert.ok(events.includes("cleanup:gamma"));
+});
+
+test("continues reverse rollback after one provider rollback fails", async () => {
+  const events = [];
+  function transactionalProvider(id, { failCommit = false, failRollback = false } = {}) {
+    return providerFixture({
+      id,
+      async stageImport() {
+        return {
+          async commit() {
+            events.push(`commit:${id}`);
+            if (failCommit) throw new Error("synthetic commit failure");
+          },
+          async rollback() {
+            events.push(`rollback:${id}`);
+            if (failRollback) throw new Error("synthetic rollback failure");
+          },
+          async cleanup() {},
+        };
+      },
+    });
+  }
+  const backup = createWorkspaceBackup({
+    providers: [
+      transactionalProvider("alpha"),
+      transactionalProvider("beta", { failRollback: true }),
+      transactionalProvider("gamma", { failCommit: true }),
+    ],
+    now: mutableClock().now,
+    secret: SECRET,
+    workspaceId: WORKSPACE_ID,
+  });
+  const preview = await backup.previewImport(await backup.exportBundle());
+
+  await assert.rejects(
+    backup.confirmImport(preview.token),
+    (error) => error instanceof WorkspaceBackupError && error.code === "WORKSPACE_RESTORE_ROLLBACK_FAILED",
+  );
+  assert.deepEqual(events, [
+    "commit:alpha",
+    "commit:beta",
+    "commit:gamma",
+    "rollback:beta",
+    "rollback:alpha",
+  ]);
 });
 
 test("leaves every provider unchanged when staging fails", async () => {

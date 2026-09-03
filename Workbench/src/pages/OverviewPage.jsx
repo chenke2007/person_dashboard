@@ -85,7 +85,8 @@ export function OverviewPage({ onOpenDocument }) {
   const demoMode = overview?.data?.demoMode === true;
   const recent = overview?.data?.recent ?? [];
   const activity = overview?.data?.activity ?? [];
-  const provenance = overview?.data?.qualityNotices ?? [];
+  const showDouyin = overview?.data?.capabilities?.douyin ?? (import.meta.env?.VITE_WORKBENCH_PROFILE !== "obsidian");
+  const provenance = showDouyin ? overview?.data?.qualityNotices ?? [] : [];
   const graphData = graph?.data;
 
   const today = useMemo(
@@ -145,13 +146,13 @@ export function OverviewPage({ onOpenDocument }) {
           value={metrics.topics ?? null}
           hint={`候选 ${metrics.candidates ?? "—"}`}
         />
-        <MetricStat label="已发布作品" value={metrics.publishedWorks ?? null} hint="抖音" />
+        {showDouyin ? <><MetricStat label="已发布作品" value={metrics.publishedWorks ?? null} hint="抖音" />
         <MetricStat
           label="总播放"
           value={metrics.totalPlays ?? null}
           hint="全部作品累计"
           accent
-        />
+        /></> : null}
         <MetricStat
           label="知识链接"
           value={graphData?.stats?.edgeCount ?? null}

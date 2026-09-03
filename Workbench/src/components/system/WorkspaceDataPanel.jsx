@@ -308,14 +308,14 @@ function downloadBackup(bundle) {
   URL.revokeObjectURL(href);
 }
 
-export function WorkspaceDataPanel({ available = false }) {
+export function WorkspaceDataPanel({ available = false, capabilities = {} }) {
   const [state, dispatch] = useReducer(workspaceDataReducer, initialWorkspaceDataState);
   const restoreFileInput = useRef(null);
   const restorePreviewGeneration = useRef(0);
   const rebindPreviewGeneration = useRef(0);
 
   useEffect(() => {
-    if (!available) return undefined;
+    if (!available || capabilities.list !== true) return undefined;
     let cancelled = false;
     dispatch({ type: "rebind-candidates-pending" });
     loadWorkspaceRebindCandidates()
@@ -330,11 +330,12 @@ export function WorkspaceDataPanel({ available = false }) {
         if (!cancelled) dispatch({ type: "rebind-candidates-failed", message: safeWorkspaceMessage(error, "rebind") });
       });
     return () => { cancelled = true; };
-  }, [available]);
+  }, [available, capabilities.list]);
 
-  if (!available) return null;
+  if (!available || !["export", "list", "restore", "rebind"].some((key) => capabilities[key] === true)) return null;
 
   const exportBackup = async () => {
+    if (capabilities.export !== true) return;
     dispatch({ type: "export-pending" });
     try {
       downloadBackup(await exportWorkspaceBackup());
@@ -345,6 +346,7 @@ export function WorkspaceDataPanel({ available = false }) {
   };
 
   const selectRestoreBundle = async (event) => {
+    if (capabilities.restore !== true) return;
     const file = event.target.files?.[0];
     const requestGeneration = ++restorePreviewGeneration.current;
     const inputIdentity = file ? `${file.name}\u0000${file.size}\u0000${file.lastModified}` : "";
@@ -370,7 +372,7 @@ export function WorkspaceDataPanel({ available = false }) {
   };
 
   const confirmRestore = async () => {
-    if (!state.restore.confirmationEnabled || !state.restore.token) return;
+    if (capabilities.restore !== true || !state.restore.confirmationEnabled || !state.restore.token) return;
     const { inputIdentity, requestGeneration, token } = state.restore;
     dispatch({ type: "restore-confirming" });
     try {
@@ -387,7 +389,7 @@ export function WorkspaceDataPanel({ available = false }) {
   };
 
   const previewRebind = async () => {
-    if (!state.rebind.workspaceId) return;
+    if (capabilities.rebind !== true || !state.rebind.workspaceId) return;
     const workspaceId = state.rebind.workspaceId;
     const requestGeneration = ++rebindPreviewGeneration.current;
     dispatch({ type: "rebind-pending", workspaceId, requestGeneration });
@@ -409,7 +411,7 @@ export function WorkspaceDataPanel({ available = false }) {
   };
 
   const confirmRebind = async () => {
-    if (!state.rebind.confirmationEnabled || !state.rebind.token) return;
+    if (capabilities.rebind !== true || !state.rebind.confirmationEnabled || !state.rebind.token) return;
     const { workspaceId, requestGeneration, token } = state.rebind;
     dispatch({ type: "rebind-confirming" });
     try {
@@ -430,13 +432,13 @@ export function WorkspaceDataPanel({ available = false }) {
       <div className="panel__head"><h2 className="panel__title" id="workspace-data-title">工作区备份与恢复</h2></div>
       <p className="workspace-data__hint">仅用于本地工作台状态；不会导出凭据、缓存、绝对路径或 Vault 正文。</p>
 
-      <div className="workspace-data__section">
+      {capabilities.export === true ? <div className="workspace-data__section">
         <h3>导出</h3>
         <button className="graph-filter" type="button" onClick={exportBackup} disabled={state.export.status === "pending"}>{state.export.status === "pending" ? "正在导出…" : "导出工作台备份"}</button>
         <Status section={state.export} />
-      </div>
+      </div> : null}
 
-      <div className="workspace-data__section">
+      {capabilities.restore === true ? <div className="workspace-data__section">
         <h3>恢复</h3>
         <p className="workspace-data__hint">{EXCLUDED_DATA_NOTICE}</p>
         <label className="workspace-data__file-label" htmlFor="workspace-restore-file">选择备份文件</label>
@@ -446,20 +448,20 @@ export function WorkspaceDataPanel({ available = false }) {
         {state.restore.preview ? <div className="workspace-data__preview" aria-label="恢复预览"><p>状态提供方：</p><ul>{state.restore.preview.providers.map((provider) => <li key={provider.id}>{provider.id} · v{provider.version} · {provider.count} 条记录</li>)}</ul><p>提示：</p><ul>{state.restore.preview.warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul></div> : null}
         <button className="graph-filter workspace-data__confirm" type="button" onClick={confirmRestore} disabled={!state.restore.confirmationEnabled || state.restore.status === "pending"}>确认恢复</button>
         <Status section={state.restore} />
-      </div>
+      </div> : null}
 
-      <div className="workspace-data__section">
+      {capabilities.list === true ? <div className="workspace-data__section">
         <h3>重新绑定</h3>
         <label className="workspace-data__file-label" htmlFor="workspace-rebind-candidate">选择已保存的工作区</label>
         <select id="workspace-rebind-candidate" value={state.rebind.workspaceId} onChange={(event) => dispatch({ type: "rebind-selected", workspaceId: event.target.value, requestGeneration: ++rebindPreviewGeneration.current })} disabled={state.rebind.candidatesLoading}>
           <option value="">{state.rebind.candidatesLoading ? "正在读取可用工作区…" : "请选择工作区"}</option>
           {state.rebind.candidates.map((candidate) => <option key={candidate.workspaceId} value={candidate.workspaceId}>{candidate.label}{candidate.isCurrent ? "（当前）" : ""}</option>)}
         </select>
-        <button className="graph-filter" type="button" onClick={previewRebind} disabled={!state.rebind.workspaceId || state.rebind.status === "pending"}>预览重新绑定</button>
+        {capabilities.rebind === true ? <><button className="graph-filter" type="button" onClick={previewRebind} disabled={!state.rebind.workspaceId || state.rebind.status === "pending"}>预览重新绑定</button>
         {state.rebind.preview ? <p className="workspace-data__preview">预览已完成。确认后，当前 Vault 将关联到所选工作区。</p> : null}
-        <button className="graph-filter workspace-data__confirm" type="button" onClick={confirmRebind} disabled={!state.rebind.confirmationEnabled || state.rebind.status === "pending"}>重新绑定本地工作区</button>
+        <button className="graph-filter workspace-data__confirm" type="button" onClick={confirmRebind} disabled={!state.rebind.confirmationEnabled || state.rebind.status === "pending"}>重新绑定本地工作区</button></> : null}
         <Status section={state.rebind} />
-      </div>
+      </div> : null}
     </section>
   );
 }

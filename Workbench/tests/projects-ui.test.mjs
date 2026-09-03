@@ -141,6 +141,22 @@ test("project snapshot lifecycle requests archives only for that view and ignore
   assert.deepEqual(snapshots, [defaultSnapshot, defaultSnapshot]);
 });
 
+test("superseded archived request rejection cannot pollute a newer board snapshot", async () => {
+  const requests = [];
+  const snapshots = [];
+  const loader = compiled.exports.createProjectSnapshotLoader((id, options) => new Promise((resolve, reject) => requests.push({ resolve, reject })), (snapshot) => snapshots.push(snapshot));
+  const archived = loader.load("synthetic", { includeArchived: true });
+  const board = loader.load("synthetic");
+  requests[1].resolve({ tasks: [] });
+  await board;
+  requests[0].reject(new Error("stale synthetic archive failure"));
+  assert.equal(await archived, null);
+  assert.deepEqual(snapshots, [{ tasks: [] }]);
+  const current = loader.load("synthetic");
+  requests[2].reject(new Error("current synthetic failure"));
+  await assert.rejects(current, /current synthetic failure/);
+});
+
 test("project planning keeps drag, drawer, filters and view preference wired", async () => {
   const page = await readFile(new URL("../src/pages/ProjectPage.jsx", import.meta.url), "utf8");
   const drawer = await readFile(new URL("../src/components/projects/TaskDrawer.jsx", import.meta.url), "utf8");

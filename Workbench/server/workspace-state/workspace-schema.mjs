@@ -15,6 +15,8 @@ export const workspaceRecordSchema = z.object({
 export const pendingRebindSchema = z.object({
   workspaceId: workspaceIdSchema,
   fingerprint: fingerprintSchema,
+  sourceFingerprint: fingerprintSchema.optional(),
+  replacedWorkspaceId: workspaceIdSchema.nullable().optional(),
   requestedAt: timestampSchema,
   expiresAt: timestampSchema,
   confirmationHash: z.string().regex(/^[a-f0-9]{64}$/),

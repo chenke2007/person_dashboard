@@ -39,6 +39,7 @@ export function createWorkspaceRoutes({
     throw new TypeError("workspace routes require backup and JSON readers");
   }
   return Object.freeze({
+    capabilities: Object.freeze({ export: !hosted, list: !hosted && Boolean(registry), restore: !hosted && !readOnly, rebind: !hosted && !readOnly && Boolean(registry) }),
     matches(_req, url) {
       return !hosted && url.pathname.startsWith(ROOT);
     },

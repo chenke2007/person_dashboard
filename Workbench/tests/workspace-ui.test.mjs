@@ -47,7 +47,7 @@ function render(props) {
 }
 
 test("workspace panel exposes local backup, restore preview, and rebind controls", () => {
-  const html = render({ available: true });
+  const html = render({ available: true, capabilities: { export: true, list: true, restore: true, rebind: true } });
 
   assert.match(html, /导出工作台备份/);
   assert.match(html, /预览恢复/);
@@ -255,10 +255,19 @@ test("rejected rebind confirmation clears pending state for the matching workspa
 });
 
 test("hosted System pages do not enable local workspace recovery", () => {
-  const liveMutableRuntime = { source: "live", data: { readOnly: false } };
+  const liveMutableRuntime = { source: "live", data: { readOnly: true, workspaceCapabilities: { export: true, list: true, restore: true, rebind: true } } };
   assert.equal(compiled.exports.systemRecoveryAvailable(liveMutableRuntime, false), false);
   assert.equal(compiled.exports.systemRecoveryAvailable(liveMutableRuntime, true), true);
   assert.equal(compiled.exports.systemRecoveryAvailable({ source: "live", data: { readOnly: true } }, true), false);
+  assert.equal(compiled.exports.systemRecoveryAvailable({ source: "live", data: { readOnly: false } }, true), false);
+  assert.equal(compiled.exports.systemRecoveryAvailable({ source: "fallback", data: liveMutableRuntime.data }, true), false);
+  const readOnlyCapabilities = { export: true, list: true, restore: false, rebind: false };
+  assert.equal(compiled.exports.systemRecoveryAvailable({ source: "live", data: { readOnly: false, workspaceCapabilities: readOnlyCapabilities } }, true), true);
+  const html = render({ available: true, capabilities: readOnlyCapabilities });
+  assert.match(html, /导出工作台备份/);
+  assert.match(html, /选择已保存的工作区/);
+  assert.doesNotMatch(html, /预览恢复|确认恢复|预览重新绑定|重新绑定本地工作区/);
+  assert.equal(render({ available: true }), "");
 });
 
 test("workspace panel does not expose recovery controls outside the local mutable System page", () => {

@@ -7,7 +7,8 @@ import { formatFullDate } from "../lib/format";
 const localWorkbench = import.meta.env?.VITE_WORKBENCH_HOSTED !== "true";
 
 export function systemRecoveryAvailable(runtime, isLocalWorkbench = localWorkbench) {
-  return isLocalWorkbench && runtime.source === "live" && runtime.data?.readOnly !== true;
+  return isLocalWorkbench && runtime.source === "live" &&
+    ["export", "list", "restore", "rebind"].some((key) => runtime.data?.workspaceCapabilities?.[key] === true);
 }
 
 export function SystemPage() {
@@ -145,7 +146,7 @@ export function SystemPage() {
         </div>
       </div>
 
-      <WorkspaceDataPanel available={systemRecoveryAvailable(runtime)} />
+      <WorkspaceDataPanel available={systemRecoveryAvailable(runtime)} capabilities={runtime.data?.workspaceCapabilities} />
 
       {/* Data boundary note */}
       <div className="panel" style={{ marginTop: "20px" }}>

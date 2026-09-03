@@ -1,8 +1,9 @@
-import { constants, lstat, mkdir, open, readFile, realpath, rename, unlink } from "node:fs/promises";
+import { constants, lstat, mkdir, open, realpath, rename, unlink } from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 
 import { emptyProjectStore, projectStoreSchema } from "./project-schema.mjs";
+import { createTicketLock } from "../workspace-state/ticket-lock.mjs";
 
 const FILE_NAME = "projects.json";
 const MAX_BYTES = 32 * 1024 * 1024;
@@ -113,9 +114,13 @@ export function createProjectRepository({
   let queue = Promise.resolve();
   let canonicalRoot = null;
 
-  async function ensureDirectory() {
-    await mkdir(root, { recursive: true, mode: 0o700 });
-    const details = await lstat(root);
+  async function ensureDirectory({ create = true } = {}) {
+    if (create) await mkdir(root, { recursive: true, mode: 0o700 });
+    let details;
+    try { details = await lstat(root); } catch (error) {
+      if (!create && error?.code === "ENOENT") return null;
+      throw error;
+    }
     if (!details.isDirectory() || details.isSymbolicLink()) {
       fail("PROJECT_STORAGE_PATH_UNSAFE", "项目存储目录不安全。", 500);
     }
@@ -125,23 +130,49 @@ export function createProjectRepository({
       fail("PROJECT_STORAGE_PATH_UNSAFE", "项目存储目录不安全。", 500);
     }
     canonicalRoot = comparable;
+    return comparable;
   }
 
-  async function readStore() {
-    await ensureDirectory();
+  const withWriteLock = createTicketLock({ directory: path.join(root, "projects.lock"), ensureDirectory, fail, codePrefix: "PROJECT_STORAGE" });
+
+  async function readRawStore() {
+    if (!await ensureDirectory({ create: false })) return null;
     let details;
     try {
       details = await lstat(target);
     } catch (error) {
-      if (error?.code === "ENOENT") return emptyProjectStore();
+      if (error?.code === "ENOENT") return null;
       throw error;
     }
     if (!details.isFile() || details.isSymbolicLink() || details.size > MAX_BYTES) {
       fail("PROJECT_STORAGE_CORRUPT", "项目数据文件无效或超过容量限制。", 500);
     }
+    // Use a bounded handle read, recheck file identity and reject links before reading.
+    const handle = await open(target, constants.O_RDONLY | (constants.O_NOFOLLOW || 0));
+    try {
+      const opened = await handle.stat();
+      const current = await lstat(target);
+      if (!opened.isFile() || current.isSymbolicLink() || !current.isFile() || opened.ino !== details.ino || current.ino !== opened.ino || opened.size > MAX_BYTES) {
+        fail("PROJECT_STORAGE_CORRUPT", "项目数据文件无效或超过容量限制。", 500);
+      }
+      const bytes = Buffer.alloc(opened.size + 1);
+      let length = 0;
+      while (length < bytes.length) {
+        const result = await handle.read(bytes, length, bytes.length - length, length);
+        if (!result.bytesRead) break;
+        length += result.bytesRead;
+      }
+      if (length > opened.size) fail("PROJECT_STORAGE_CORRUPT", "项目数据文件在读取期间发生变化。", 500);
+      return bytes.subarray(0, length);
+    } finally { await handle.close(); }
+  }
+
+  async function readStore() {
+    const raw = await readRawStore();
+    if (raw === null) return emptyProjectStore();
     let parsed;
     try {
-      parsed = JSON.parse(await readFile(target, "utf8"));
+      parsed = JSON.parse(raw.toString("utf8"));
     } catch {
       fail("PROJECT_STORAGE_CORRUPT", "项目数据文件无法解析。", 500);
     }
@@ -188,8 +219,9 @@ export function createProjectRepository({
     }
   }
 
-  function serialized(operation) {
-    const result = queue.then(operation, operation);
+  function serialized(operation, { write = false } = {}) {
+    const execute = () => write ? withWriteLock(operation) : operation();
+    const result = queue.then(execute, execute);
     queue = result.catch(() => {});
     return result;
   }
@@ -203,12 +235,13 @@ export function createProjectRepository({
   }
 
   async function acquireExclusiveTransaction() {
-    const previous = queue;
-    let release;
+    let acquired, rejected, release;
+    const ready = new Promise((resolve, reject) => { acquired = resolve; rejected = reject; });
     const barrier = new Promise((resolve) => { release = resolve; });
-    queue = previous.then(() => barrier, () => barrier);
-    await previous.catch(() => {});
-    return release;
+    const complete = serialized(async () => { acquired(); await barrier; }, { write: true });
+    complete.catch(rejected);
+    await ready;
+    return async () => { release(); await complete; };
   }
 
   async function stageImport(value) {
@@ -223,26 +256,28 @@ export function createProjectRepository({
     let preserveRollback = false;
     let closed = false;
     try {
-      try {
-        await lstat(target);
-        hadOriginal = true;
-      } catch (error) {
-        if (error?.code !== "ENOENT") throw error;
-      }
-      const previous = await readStore();
+      const previous = await readRawStore();
+      hadOriginal = previous !== null;
       if (hadOriginal) {
-        rollbackPath = await writeTemporary(`${JSON.stringify(previous, null, 2)}\n`, "rollback");
+        // Malformed current bytes are recoverable, but recognized unsupported versions are not downgraded.
+        let parsed;
+        try { parsed = JSON.parse(previous.toString("utf8")); } catch { /* Preserve corrupt bytes verbatim. */ }
+        if (parsed && Object.hasOwn(parsed, "version") && parsed.version !== 1) {
+          fail("PROJECT_STORAGE_VERSION_UNSUPPORTED", "项目数据版本不受支持。", 500);
+        }
+        rollbackPath = await writeTemporary(previous, "rollback");
       }
       stagedPath = await writeTemporary(body, "stage");
     } catch (error) {
       if (stagedPath) await unlink(stagedPath).catch(() => {});
       if (rollbackPath) await unlink(rollbackPath).catch(() => {});
-      release();
+      await release();
       throw error;
     }
 
     async function commit() {
       if (closed || committed) return;
+      await ensureDirectory();
       await rename(stagedPath, target);
       stagedPath = null;
       committed = true;
@@ -251,6 +286,7 @@ export function createProjectRepository({
     async function rollback() {
       if (closed || !committed) return;
       try {
+        await ensureDirectory();
         if (hadOriginal) {
           await rename(rollbackPath, target);
           rollbackPath = null;
@@ -271,11 +307,11 @@ export function createProjectRepository({
       closed = true;
       if (stagedPath) await unlink(stagedPath).catch(() => {});
       if (rollbackPath && !preserveRollback) await unlink(rollbackPath).catch(() => {});
-      release();
+      await release();
     }
 
     // The caller must always invoke cleanup. Until then this transaction owns
-    // the repository queue, so all providers can stage before any provider
+    // the process-safe store lock, so all providers can stage before any provider
     // commits and a later failure can roll committed stores back safely.
     return Object.freeze({ commit, rollback, cleanup });
   }
@@ -313,7 +349,7 @@ export function createProjectRepository({
       store.updatedAt = now().toISOString();
       await writeStore(store);
       return typeof result === "function" ? result(store) : result;
-    });
+    }, { write: true });
   }
 
   return Object.freeze({
@@ -326,7 +362,10 @@ export function createProjectRepository({
       return validatedImport(value);
     },
     replaceState(value) {
-      return serialized(async () => writeStore(await validatedImport(value)));
+      return (async () => {
+        const transaction = await stageImport(value);
+        try { await transaction.commit(); } finally { await transaction.cleanup(); }
+      })();
     },
     stageImport,
     async getWorkspace({ includeArchived = false } = {}) {

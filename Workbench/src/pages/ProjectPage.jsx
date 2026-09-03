@@ -59,10 +59,15 @@ export function createProjectSnapshotLoader(load, applySnapshot) {
     },
     async load(projectId, { includeArchived = false } = {}) {
       const request = ++latestRequest;
-      const snapshot = await load(projectId, { includeArchived });
-      if (request !== latestRequest) return null;
-      applySnapshot(snapshot);
-      return snapshot;
+      try {
+        const snapshot = await load(projectId, { includeArchived });
+        if (request !== latestRequest) return null;
+        applySnapshot(snapshot);
+        return snapshot;
+      } catch (error) {
+        if (request !== latestRequest) return null;
+        throw error;
+      }
     },
   };
 }
@@ -93,6 +98,8 @@ export function ProjectPage({ onOpenDocument }) {
   const { projectId } = useParams();
   const [snapshot, setSnapshot] = useState(null); const [error, setError] = useState(null); const [selectedTask, setSelectedTask] = useState(null); const [settingsOpen, setSettingsOpen] = useState(false);
   const [view, setView] = useState(() => localStorage.getItem("workbench-project-view") || "board"); const [filters, setFilters] = useState({});
+  const currentView = useRef(view);
+  currentView.current = view;
   const snapshotLoader = useRef(null);
   if (!snapshotLoader.current) {
     snapshotLoader.current = createProjectSnapshotLoader(loadProject, (next) => {
@@ -100,9 +107,9 @@ export function ProjectPage({ onOpenDocument }) {
       setSelectedTask((current) => current?.id ? next.tasks.find((task) => task.id === current.id) || null : current);
     });
   }
-  const refresh = useCallback((includeArchived = false) => snapshotLoader.current.load(projectId, { includeArchived }), [projectId]);
-  useEffect(() => { refresh(view === "archived").catch(setError); }, [refresh, view]);
-  const changeView = (next) => { snapshotLoader.current.invalidate(); setView(next); localStorage.setItem("workbench-project-view", next); };
+  const refresh = useCallback((includeArchived = currentView.current === "archived") => snapshotLoader.current.load(projectId, { includeArchived }), [projectId]);
+  useEffect(() => { setError(null); refresh(view === "archived").catch(setError); return () => snapshotLoader.current.invalidate(); }, [refresh, view]);
+  const changeView = (next) => { snapshotLoader.current.invalidate(); currentView.current = next; setView(next); localStorage.setItem("workbench-project-view", next); };
   const move = async (task, columnId, index) => { const previous = snapshot; setError(null); try { setSnapshot(await moveTask(task.id, { columnId, index, revision: snapshot.revision })); } catch (moveError) { setSnapshot(previous); setError(moveError); await refresh().catch(() => {}); } };
   const save = async (patch) => { setError(null); const result = selectedTask.id ? await updateTask(selectedTask.id, patch) : await createTask(projectId, patch); await refresh(); if (!selectedTask.id) setSelectedTask(result.task); return result.task; };
   const mutateAndRefresh = async (operation) => { setError(null); try { const result = await operation(); await refresh(); return result; } catch (mutationError) { setError(mutationError); throw mutationError; } };

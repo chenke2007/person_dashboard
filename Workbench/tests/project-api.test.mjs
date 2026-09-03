@@ -33,7 +33,7 @@ async function listenOnFetchSafePort(server) {
   }
 }
 
-async function startFixture(t, { readOnly = false, projectReadOnly, useWorkspaceRegistry = false, hosted = false, beforeStart } = {}) {
+async function startFixture(t, { readOnly = false, profile = "default", projectReadOnly, useWorkspaceRegistry = false, hosted = false, beforeStart } = {}) {
   const root = await mkdtemp(path.join(os.tmpdir(), "workbench-project-api-"));
   const vaultRoot = path.join(root, "vault");
   const appDataRoot = path.join(root, "app-data");
@@ -45,7 +45,7 @@ async function startFixture(t, { readOnly = false, projectReadOnly, useWorkspace
     configFile: false,
     logLevel: "silent",
     server: { middlewareMode: true },
-    plugins: [workbenchApiPlugin({ vaultRoot, projectDirectory, appDataRoot, readOnly, projectReadOnly, hosted })],
+    plugins: [workbenchApiPlugin({ vaultRoot, profile, projectDirectory, appDataRoot, readOnly, projectReadOnly, hosted })],
   });
   const server = http.createServer(vite.middlewares);
   await listenOnFetchSafePort(server);
@@ -384,6 +384,9 @@ test("lists safe workspace candidates and requires preview confirmation before r
   }]);
   assert.equal(JSON.stringify(candidates.body).includes("fingerprint"), false);
 
+  // A user commonly discovers the move by first opening the empty Projects page.
+  assert.deepEqual((await request(fixture.origin, "/api/projects")).body.projects, []);
+
   const preview = await request(fixture.origin, "/api/workspace/rebind/preview", {
     method: "POST",
     body: { workspaceId: existingWorkspaceId },
@@ -400,4 +403,40 @@ test("lists safe workspace candidates and requires preview confirmation before r
   assert.equal(confirmed.body.workspaceId, existingWorkspaceId);
   const projects = await request(fixture.origin, "/api/projects");
   assert.equal(projects.body.projects[0].name, "Synthetic retained project");
+});
+
+test("runtime advertises independent recovery capabilities for actual Obsidian and workspace policies", async (t) => {
+  for (const [readOnly, projectReadOnly, hosted] of [[true, false, false], [false, true, false], [true, true, false], [false, false, true]]) {
+    const fixture = await startFixture(t, { profile: "obsidian", readOnly, projectReadOnly, hosted, useWorkspaceRegistry: true });
+    const runtime = (await request(fixture.origin, "/api/runtime")).body;
+    assert.equal(runtime.readOnly, readOnly);
+    assert.equal(runtime.profile, "obsidian");
+    assert.deepEqual(runtime.workspaceCapabilities, { export: !hosted, list: !hosted, restore: !hosted && !projectReadOnly, rebind: !hosted && !projectReadOnly });
+    if (!projectReadOnly && !hosted) {
+      const made = await request(fixture.origin, "/api/projects", { method: "POST", body: { key: "OBS", name: "Synthetic Obsidian state" } });
+      assert.equal(made.response.status, 201);
+      const bundle = (await request(fixture.origin, "/api/workspace/backup")).body;
+      const preview = await request(fixture.origin, "/api/workspace/restore/preview", { method: "POST", body: bundle });
+      assert.equal(preview.response.status, 200);
+      assert.equal((await request(fixture.origin, "/api/workspace/restore/confirm", { method: "POST", body: { token: preview.body.token } })).response.status, 200);
+      assert.equal(await readFile(path.join(fixture.vaultRoot, "wiki", "plan.md"), "utf8"), "# Project plan\n");
+    }
+  }
+});
+
+test("Obsidian overview hides Douyin metrics and their notices while default keeps missing-data semantics", async (t) => {
+  for (const profile of ["obsidian", "default"]) {
+    const fixture = await startFixture(t, { profile, readOnly: true });
+    const overview = (await request(fixture.origin, "/api/overview")).body;
+    assert.equal(overview.capabilities.douyin, profile === "default");
+    if (profile === "obsidian") {
+      assert.equal("publishedWorks" in overview.metrics, false);
+      assert.equal("totalPlays" in overview.metrics, false);
+      assert.deepEqual(overview.qualityNotices, []);
+    } else {
+      assert.equal(overview.metrics.publishedWorks, null);
+      assert.equal(overview.metrics.totalPlays, null);
+      assert.match(overview.qualityNotices.join(" "), /抖音数据源不可用/);
+    }
+  }
 });

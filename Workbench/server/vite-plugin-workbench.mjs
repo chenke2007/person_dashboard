@@ -578,7 +578,8 @@ function overviewPayload(index) {
       !topic.isFilmed &&
       !topic.isPublished,
   ).length;
-  const douyinAvailable = index.douyin.available === true;
+  const showDouyin = index.profile !== "obsidian";
+  const douyinAvailable = showDouyin && index.douyin.available === true;
   const personalKnowledgeLine = douyinAvailable
     ? index.douyin.contentLines.find((line) =>
         String(line.name || "").includes("个人知识库"),
@@ -649,24 +650,27 @@ function overviewPayload(index) {
   return {
     generatedAt: index.generatedAt,
     demoMode: index.demoMode === true,
+    capabilities: { douyin: showDouyin },
     metrics: {
       raw: index.stats.rawFiles,
       wiki: index.stats.formalWikiPages,
       topics: index.stats.topics,
       candidates: candidateCount,
       filmed: index.stats.filmedTopics,
-      publishedWorks: douyinAvailable ? index.stats.douyinWorks : null,
       runs: index.stats.runs,
-      totalPlays: douyinAvailable
-        ? index.douyin.summary.totalViews ?? null
-        : null,
-      profileVisits: douyinAvailable
-        ? index.douyin.summary.totalProfileVisits ?? null
-        : null,
-      profileVisitsIsLowerBound:
-        douyinAvailable &&
-        index.douyin.summaryLowerBounds.totalProfileVisits === true,
-      knowledgeContribution: personalKnowledgeLine?.viewSharePct ?? null,
+      ...(showDouyin ? {
+        publishedWorks: douyinAvailable ? index.stats.douyinWorks : null,
+        totalPlays: douyinAvailable
+          ? index.douyin.summary.totalViews ?? null
+          : null,
+        profileVisits: douyinAvailable
+          ? index.douyin.summary.totalProfileVisits ?? null
+          : null,
+        profileVisitsIsLowerBound:
+          douyinAvailable &&
+          index.douyin.summaryLowerBounds.totalProfileVisits === true,
+        knowledgeContribution: personalKnowledgeLine?.viewSharePct ?? null,
+      } : {}),
     },
     wikiStatus: {
       active: index.wiki.countsByStatus.active ?? 0,
@@ -707,7 +711,7 @@ function overviewPayload(index) {
           isRealtime: false,
         }
       : null,
-    qualityNotices: douyinQualityNotices,
+    qualityNotices: showDouyin ? douyinQualityNotices : [],
   };
 }
 
@@ -893,7 +897,13 @@ export function workbenchApiPlugin({
   }
   const projects = new Proxy({}, {
     get(_target, property) {
-      return async (...args) => (await projectRepository())[property](...args);
+      return async (...args) => {
+        const repository = await projectRepository();
+        const operation = () => repository[property](...args);
+        if (!registry || ["getWorkspace", "getProject"].includes(property)) return operation();
+        const workspace = await currentWorkspace();
+        return registry.withBoundWorkspace({ fingerprint: vaultFingerprint, workspaceId: workspace.workspaceId }, operation);
+      };
     },
   });
   const projectRoutes = createProjectRoutes({ repository: projects, readOnly: projectReadOnly });
@@ -908,10 +918,16 @@ export function workbenchApiPlugin({
         error.status = 404;
         throw error;
       }
-      return createWorkspaceBackup({
+      const backup = createWorkspaceBackup({
         providers: [await projectRepository()],
         secret: backupSecret,
         workspaceId: workspace.workspaceId,
+      });
+      return Object.freeze({
+        ...backup,
+        confirmImport: (token) => registry
+          ? registry.withBoundWorkspace({ fingerprint: vaultFingerprint, workspaceId: workspace.workspaceId }, () => backup.confirmImport(token))
+          : backup.confirmImport(token),
       });
     })();
     return workspaceBackupPromise;
@@ -1688,6 +1704,7 @@ export function workbenchApiPlugin({
             return json(res, 200, {
               readOnly,
               profile,
+              workspaceCapabilities: workspaceRoutes.capabilities,
               vault: {
                 connected: true,
                 label: path.basename(vaultRoot),

@@ -208,6 +208,54 @@ test("waits for a cross-process lock and re-reads before writing", async (t) => 
   assert.equal(await readFile(target, "utf8"), newer);
 });
 
+test("rebind previews an existing empty binding but refuses state populated before confirmation", async (t) => {
+  const directory = await makeStore(t);
+  const registry = createWorkspaceRegistry({ directory });
+  const first = await registry.resolveVault({ fingerprint: FINGERPRINT_A, label: "Synthetic original" });
+  const provisional = await registry.resolveVault({ fingerprint: FINGERPRINT_B, label: "Synthetic moved" });
+  const preview = await registry.previewRebind({ currentFingerprint: FINGERPRINT_B, workspaceId: first.workspaceId });
+  const target = path.join(directory, "workspaces", provisional.workspaceId, "synthetic-state.json");
+  await writeFile(target, "synthetic state");
+  await assert.rejects(registry.confirmRebind({ token: preview.token }), { code: "WORKSPACE_REBIND_CONFLICT" });
+  await assert.rejects(registry.previewRebind({ currentFingerprint: FINGERPRINT_B, workspaceId: first.workspaceId }), { code: "WORKSPACE_FINGERPRINT_IN_USE" });
+  assert.equal(await readFile(target, "utf8"), "synthetic state");
+  assert.equal((await registry.lookupVault({ fingerprint: FINGERPRINT_B })).workspaceId, provisional.workspaceId);
+});
+
+test("rebind tokens bind the checked source and provisional workspace identities", async (t) => {
+  const directory = await makeStore(t);
+  const registry = createWorkspaceRegistry({ directory });
+  const first = await registry.resolveVault({ fingerprint: FINGERPRINT_A, label: "Synthetic original" });
+  await registry.resolveVault({ fingerprint: FINGERPRINT_B, label: "Synthetic moved" });
+  const preview = await registry.previewRebind({ currentFingerprint: FINGERPRINT_B, workspaceId: first.workspaceId });
+  const stored = await readRegistry(directory);
+  stored.workspaces.find((item) => item.workspaceId === first.workspaceId).fingerprint = "c".repeat(64);
+  await writeFile(path.join(directory, "workspace-registry.json"), JSON.stringify(stored));
+  await assert.rejects(registry.confirmRebind({ token: preview.token }), { code: "WORKSPACE_REBIND_CONFLICT" });
+});
+
+test("bound workspace operations serialize with rebind and refuse stale cached bindings", async (t) => {
+  const directory = await makeStore(t);
+  const registry = createWorkspaceRegistry({ directory });
+  const peer = createWorkspaceRegistry({ directory });
+  const old = await registry.resolveVault({ fingerprint: FINGERPRINT_A, label: "Synthetic original" });
+  const current = await registry.resolveVault({ fingerprint: FINGERPRINT_B, label: "Synthetic current" });
+  const preview = await registry.previewRebind({ currentFingerprint: FINGERPRINT_B, workspaceId: old.workspaceId });
+  let entered, release;
+  const ready = new Promise((resolve) => { entered = resolve; });
+  const held = new Promise((resolve) => { release = resolve; });
+  const writing = registry.withBoundWorkspace({ fingerprint: FINGERPRINT_B, workspaceId: current.workspaceId }, async () => {
+    entered(); await held;
+    await writeFile(path.join(directory, "workspaces", current.workspaceId, "synthetic-state.json"), "populated");
+  });
+  await ready;
+  let confirmed = false;
+  const confirmation = peer.confirmRebind({ token: preview.token }).then(() => { confirmed = true; }, (error) => error);
+  await delay(100); assert.equal(confirmed, false); release(); await writing;
+  assert.equal((await confirmation).code, "WORKSPACE_REBIND_CONFLICT");
+  await assert.rejects(peer.withBoundWorkspace({ fingerprint: FINGERPRINT_B, workspaceId: old.workspaceId }, async () => { throw new Error("must not run"); }), { code: "WORKSPACE_BINDING_CHANGED" });
+});
+
 test("reclaims a lock after its child-process owner exits abruptly", async (t) => {
   const directory = await makeStore(t);
   const { ticketPath, exited } = await startLockOwner(t, directory, { exitAfterLock: true });

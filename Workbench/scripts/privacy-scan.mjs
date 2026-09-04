@@ -1,5 +1,5 @@
 import { execFile as execFileCallback } from "node:child_process";
-import { lstat, readdir, readFile } from "node:fs/promises";
+import { lstat, readdir, readFile, realpath } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -29,6 +29,7 @@ const checks = [
   {
     label: "credential-like assignment",
     expression: /(?:api[_-]?key|access[_-]?token|client[_-]?secret|password)\s*[:=]\s*["'][^"'\n]{8,}["']/gi,
+    redact: true,
   },
   {
     label: "private key material",
@@ -57,16 +58,22 @@ async function collectFile(root, relativePath) {
   if (!normalizedRelativePath || excludedFiles.has(normalizedRelativePath)) return null;
   if (binaryExtensions.has(path.extname(normalizedRelativePath).toLowerCase())) return null;
 
-  let details;
-  try {
-    details = await lstat(absolutePath);
-  } catch (error) {
-    if (error.code === "ENOENT") return null;
-    throw error;
+  const pathComponents = normalizedRelativePath.split("/");
+  let candidatePath = root;
+  let details = null;
+  for (const component of pathComponents) {
+    candidatePath = path.join(candidatePath, component);
+    try {
+      details = await lstat(candidatePath);
+    } catch (error) {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    }
+    if (details.isSymbolicLink()) return null;
   }
   if (!details.isFile() || details.size > 5 * 1024 * 1024) return null;
 
-  return { absolutePath, relativePath: normalizedRelativePath };
+  return { absolutePath, relativePath: normalizedRelativePath, root };
 }
 
 async function collectFallbackFiles(directory, root) {
@@ -90,23 +97,23 @@ async function collectFallbackFiles(directory, root) {
 }
 
 async function collectGitFiles(root) {
-  let insideWorkTree;
+  let gitRoot;
   try {
-    ({ stdout: insideWorkTree } = await execFile(
+    ({ stdout: gitRoot } = await execFile(
       "git",
-      ["-C", root, "rev-parse", "--is-inside-work-tree"],
+      ["-C", root, "rev-parse", "--show-toplevel"],
       { encoding: "utf8" },
     ));
   } catch {
     return null;
   }
-  if (insideWorkTree.trim() !== "true") return null;
+  const effectiveRoot = await realpath(gitRoot.trim());
 
   const { stdout } = await execFile(
     "git",
     [
       "-C",
-      root,
+      effectiveRoot,
       "ls-files",
       "--cached",
       "--others",
@@ -120,7 +127,7 @@ async function collectGitFiles(root) {
     stdout
       .split("\0")
       .filter(Boolean)
-      .map((relativePath) => collectFile(root, relativePath)),
+      .map((relativePath) => collectFile(effectiveRoot, relativePath)),
   );
   return files.filter(Boolean);
 }
@@ -133,7 +140,9 @@ export async function collectPublishableFiles(root = repositoryRoot) {
 export async function scanRepository(root = repositoryRoot) {
   const findings = [];
   for (const file of await collectPublishableFiles(root)) {
-    const source = await readFile(file.absolutePath, "utf8");
+    const safeFile = await collectFile(file.root ?? root, file.relativePath);
+    if (!safeFile) continue;
+    const source = await readFile(safeFile.absolutePath, "utf8");
     for (const check of checks) {
       check.expression.lastIndex = 0;
       for (const match of source.matchAll(check.expression)) {
@@ -142,7 +151,7 @@ export async function scanRepository(root = repositoryRoot) {
           file: file.relativePath,
           line,
           label: check.label,
-          sample: match[0].slice(0, 120),
+          sample: check.redact ? "[REDACTED]" : match[0].slice(0, 120),
         });
       }
     }

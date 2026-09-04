@@ -2,6 +2,19 @@ const PERIOD_DAYS = Object.freeze({ day: 1, week: 7, month: 30 });
 const PERIOD_LIMITS = Object.freeze({ day: 8, week: 12, month: 20 });
 const FOCUS_AREAS = new Set(["agent", "ai-coding", "rag-knowledge", "ai-productivity"]);
 const RELEVANCE_ORDER = Object.freeze({ low: 1, medium: 2, high: 3 });
+const FOCUS_MATCH_ORDER = Object.freeze({ none: 0, text: 1, topic: 2, explicit: 3 });
+const FOCUS_TOPIC_ALIASES = Object.freeze({
+  agent: new Set(["agent", "agents", "agentic", "ai-agent", "ai-agents"]),
+  "ai-coding": new Set(["ai-coding", "coding-assistant", "code-assistant", "code-generation"]),
+  "rag-knowledge": new Set(["rag", "retrieval-augmented-generation", "knowledge-base", "knowledge-management"]),
+  "ai-productivity": new Set(["ai-productivity", "workflow-automation", "productivity-automation"]),
+});
+const FOCUS_TEXT_PATTERNS = Object.freeze({
+  agent: /\b(?:agent|agents|agentic)\b/i,
+  "ai-coding": /\b(?:ai[- ]?coding|coding assistant|code assistant|code generation)\b/i,
+  "rag-knowledge": /\b(?:rag|retrieval augmented generation|knowledge base|knowledge management)\b/i,
+  "ai-productivity": /\b(?:ai productivity|workflow automation|productivity automation)\b/i,
+});
 
 function requireTimeZone(timeZone) {
   if (typeof timeZone !== "string" || timeZone.trim() === "") {
@@ -255,6 +268,55 @@ function matchingPreferences(repository, preferences) {
   return { more: [...new Set(more)].sort(), less: [...new Set(less)].sort() };
 }
 
+export function classifyRadarFocus(repository = {}) {
+  const explicitDirections = Array.isArray(repository.focusAreas)
+    ? [...new Set(repository.focusAreas.filter((direction) => FOCUS_AREAS.has(direction)))].sort()
+    : [];
+  if (explicitDirections.length > 0) {
+    return {
+      level: "explicit",
+      directions: explicitDirections,
+      reasons: explicitDirections.map((direction) => `明确关注方向：${direction}。`),
+    };
+  }
+
+  const topicMatches = [];
+  for (const topic of Array.isArray(repository.topics) ? repository.topics : []) {
+    if (typeof topic !== "string") continue;
+    const normalizedTopic = topic.trim().toLowerCase();
+    for (const [direction, aliases] of Object.entries(FOCUS_TOPIC_ALIASES)) {
+      if (aliases.has(normalizedTopic)) topicMatches.push({ direction, topic: normalizedTopic });
+    }
+  }
+  if (topicMatches.length > 0) {
+    const selected = new Map();
+    for (const match of topicMatches.sort((left, right) => left.direction.localeCompare(right.direction) || left.topic.localeCompare(right.topic))) {
+      if (!selected.has(match.direction)) selected.set(match.direction, match.topic);
+    }
+    const directions = [...selected.keys()];
+    return {
+      level: "topic",
+      directions,
+      reasons: directions.map((direction) => `主题匹配：${selected.get(direction)}（${direction}）。`),
+    };
+  }
+
+  const textSources = [repository.fullName, repository.description].filter((value) => typeof value === "string" && value.trim() !== "");
+  const textMatches = Object.entries(FOCUS_TEXT_PATTERNS)
+    .map(([direction, pattern]) => ({ direction, source: textSources.find((source) => pattern.test(source))?.trim() ?? null }))
+    .filter((match) => match.source !== null)
+    .sort((left, right) => left.direction.localeCompare(right.direction));
+  if (textMatches.length > 0) {
+    return {
+      level: "text",
+      directions: textMatches.map((match) => match.direction),
+      reasons: textMatches.map((match) => `名称或简介匹配：${match.source}（${match.direction}）。`),
+    };
+  }
+
+  return { level: "none", directions: [], reasons: ["没有可验证的 AI 方向信号。"] };
+}
+
 function validRelevance(entry) {
   return entry
     && Number.isSafeInteger(entry.repositoryId)
@@ -282,7 +344,7 @@ function relevanceByRepository(relevance) {
     const previous = result.get(normalized.repositoryId);
     if (!previous || RELEVANCE_ORDER[normalized.relevance] > RELEVANCE_ORDER[previous.relevance]
       || (RELEVANCE_ORDER[normalized.relevance] === RELEVANCE_ORDER[previous.relevance]
-        && `${normalized.reasonCode}:${normalized.reason}` < `${previous.reasonCode}:${previous.reason}`)) {
+        && `${normalized.direction}:${normalized.reasonCode}:${normalized.reason}` < `${previous.direction}:${previous.reasonCode}:${previous.reason}`)) {
       result.set(normalized.repositoryId, normalized);
     }
   }
@@ -297,10 +359,8 @@ export function rankRelevant(input = {}) {
     .map((repository) => {
       const preferences = matchingPreferences(repository, input.preferences);
       const classifier = relevance.get(repository.id) ?? null;
-      const reasons = [];
-      for (const focus of Array.isArray(repository.focusAreas) ? [...new Set(repository.focusAreas)].sort() : []) {
-        if (FOCUS_AREAS.has(focus)) reasons.push(`关注方向：${focus}。`);
-      }
+      const focusMatch = classifyRadarFocus(repository);
+      const reasons = [...focusMatch.reasons];
       for (const match of preferences.more) reasons.push(`偏好更多：${match}。`);
       for (const match of preferences.less) reasons.push(`偏好更少：${match}。`);
       if (classifier) reasons.push(`分类器（${classifier.relevance}）：${classifier.reason}`);
@@ -309,6 +369,7 @@ export function rankRelevant(input = {}) {
         repositoryId: repository.id,
         repository,
         focusAreas: Array.isArray(repository.focusAreas) ? [...new Set(repository.focusAreas)].filter((focus) => FOCUS_AREAS.has(focus)).sort() : [],
+        focusMatch,
         preferenceMatches: preferences,
         classifierRelevance: classifier,
         reasons,
@@ -319,6 +380,7 @@ export function rankRelevant(input = {}) {
       || Number(right.preferenceMatches.more.length > 0) - Number(left.preferenceMatches.more.length > 0)
       || Number(left.preferenceMatches.less.length > 0) - Number(right.preferenceMatches.less.length > 0)
       || (RELEVANCE_ORDER[right.classifierRelevance?.relevance] ?? 0) - (RELEVANCE_ORDER[left.classifierRelevance?.relevance] ?? 0)
+      || FOCUS_MATCH_ORDER[right.focusMatch.level] - FOCUS_MATCH_ORDER[left.focusMatch.level]
       || left.repositoryId - right.repositoryId
     ))
     .slice(0, limit);

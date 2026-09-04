@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { observedDelta, rankRadar } from "../shared/ai-radar-ranking.mjs";
+import { classifyRadarFocus, observedDelta, rankRadar } from "../shared/ai-radar-ranking.mjs";
 
 const NOW = new Date("2026-09-02T12:00:00.000Z");
 
@@ -243,6 +243,59 @@ test("uses deterministic focus and validated classifier relevance while ignoring
   assert.match(ranked.relevant[0].reasons.join(" "), /偏好更多：主题 agent/);
   assert.match(ranked.relevant[1].reasons.join(" "), /匹配 RAG 知识方向/);
   assert.doesNotMatch(ranked.relevant[1].reasons.join(" "), /偏好更少/);
+});
+
+test("ranks inferred AI focus ahead of arbitrary languages when feedback and classifier data are absent", () => {
+  const repositories = [
+    repository(1, { language: "Python", topics: [], focusAreas: [], fullName: "synthetic-lab/plain-tool", description: "General utility." }),
+    repository(8, { language: "Python", topics: [], focusAreas: ["ai-coding"] }),
+    repository(7, { language: "Rust", topics: ["rag"], focusAreas: [] }),
+    repository(6, { language: "JavaScript", topics: [], focusAreas: [], fullName: "synthetic-lab/agentic-helper", description: "General utility." }),
+  ];
+  const input = { repositories, preferences: [{ id: "reset", repositoryId: null, kind: "language", value: "Python", direction: "more", revertedAt: "2026-09-01T00:00:00.000Z" }], relevance: [{ repositoryId: 8, direction: "invalid", relevance: "high", reasonCode: "TOPIC_MATCH", reason: "ignored" }] };
+  const first = rank(input);
+  const empty = rank({ repositories, preferences: [], relevance: [] });
+  const reordered = rank({ ...input, repositories: [...repositories].reverse(), relevance: [] });
+
+  assert.deepEqual(first.relevant.map((item) => item.repositoryId), [8, 7, 6, 1]);
+  assert.deepEqual(empty.relevant.map((item) => item.repositoryId), [8, 7, 6, 1]);
+  assert.deepEqual(reordered.relevant.map((item) => item.repositoryId), [8, 7, 6, 1]);
+  assert.deepEqual(first.relevant[1].focusMatch, {
+    level: "topic",
+    directions: ["rag-knowledge"],
+    reasons: ["主题匹配：rag（rag-knowledge）。"],
+  });
+  assert.deepEqual(classifyRadarFocus(repositories[0]), { level: "none", directions: [], reasons: ["没有可验证的 AI 方向信号。"] });
+  assert.deepEqual(classifyRadarFocus({ fullName: "synthetic-lab/agent-tool", description: "RAG knowledge base" }), {
+    level: "text",
+    directions: ["agent", "rag-knowledge"],
+    reasons: ["名称或简介匹配：synthetic-lab/agent-tool（agent）。", "名称或简介匹配：RAG knowledge base（rag-knowledge）。"],
+  });
+  assert.match(first.relevant[2].reasons.join(" "), /名称或简介匹配：.*agentic-helper/);
+});
+
+test("uses an active language preference for comparison without treating language as an AI focus", () => {
+  const repositories = [
+    repository(1, { language: "Rust", topics: [], focusAreas: [] }),
+    repository(9, { language: "Python", topics: [], focusAreas: [] }),
+  ];
+  const ranked = rank({ repositories, preferences: [{ id: "python", repositoryId: null, kind: "language", value: "Python", direction: "more", revertedAt: null }] });
+
+  assert.deepEqual(ranked.relevant.map((item) => item.repositoryId), [9, 1]);
+  assert.equal(ranked.relevant[0].focusMatch.level, "none");
+  assert.match(ranked.relevant[0].reasons.join(" "), /偏好更多：语言 Python/);
+});
+
+test("breaks equivalent classifier ties by direction independently of input order", () => {
+  const entries = [
+    { repositoryId: 1, direction: "agent", relevance: "high", reasonCode: "TOPIC_MATCH", reason: "Matches focus" },
+    { repositoryId: 1, direction: "ai-coding", relevance: "high", reasonCode: "TOPIC_MATCH", reason: "Matches focus" },
+  ];
+  const first = rank({ relevance: entries }).relevant[0].classifierRelevance;
+  const reversed = rank({ relevance: [...entries].reverse() }).relevant[0].classifierRelevance;
+
+  assert.deepEqual(first, { repositoryId: 1, direction: "agent", relevance: "high", reasonCode: "TOPIC_MATCH", reason: "Matches focus" });
+  assert.deepEqual(reversed, first);
 });
 
 test("applies active less-like feedback reversibly and rejects invalid timezone input", () => {

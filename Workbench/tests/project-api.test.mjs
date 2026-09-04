@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { access, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -34,7 +34,9 @@ async function listenOnFetchSafePort(server) {
 }
 
 async function startFixture(t, { readOnly = false, profile = "default", projectReadOnly, useWorkspaceRegistry = false, hosted = false, beforeStart } = {}) {
-  const root = await mkdtemp(path.join(os.tmpdir(), "workbench-project-api-"));
+  const stableTempRoot = await realpath(os.tmpdir());
+  const root = await mkdtemp(path.join(stableTempRoot, "workbench-project-api-"));
+  assert.equal(root, await realpath(root));
   const vaultRoot = path.join(root, "vault");
   const appDataRoot = path.join(root, "app-data");
   const projectDirectory = useWorkspaceRegistry ? null : path.join(root, "state", "projects");

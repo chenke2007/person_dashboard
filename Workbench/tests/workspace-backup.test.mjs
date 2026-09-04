@@ -422,3 +422,53 @@ test("project repository exposes only its versioned store and supports reversibl
   await assert.rejects(repository.replaceState({ ...replacement, version: 99 }));
   assert.deepEqual(await repository.exportState(), original);
 });
+
+test("legacy project-only restore explicitly preserves optional radar state", async (t) => {
+  const { createRadarRepository } = await import("../server/ai-radar/radar-repository.mjs");
+  const directory = await mkdtemp(path.join(os.tmpdir(), "workbench-optional-radar-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const projects = createProjectRepository({ directory: path.join(directory, "projects") });
+  const radar = createRadarRepository({ directory: path.join(directory, "ai-radar"), timeZone: "UTC" });
+  await projects.createProject({ key: "OLD", name: "Synthetic legacy project" });
+  const legacy = createWorkspaceBackup({ providers: [projects], secret: SECRET });
+  const bundle = await legacy.exportBundle();
+  await projects.createProject({ key: "NEW", name: "Synthetic later project" });
+  await radar.updateSchedule({ enabled: true, time: "10:15" });
+  const before = await radar.exportState();
+  const backup = createWorkspaceBackup({ providers: [projects, radar], secret: SECRET });
+  const preview = await backup.previewImport(bundle);
+  assert.match(preview.warnings.join(" "), /ai-radar.*保留/);
+  assert.deepEqual(preview.providers.map(({ id }) => id), ["projects"]);
+  await backup.confirmImport(preview.token);
+  assert.equal((await projects.getWorkspace()).projects.length, 1);
+  assert.deepEqual(await radar.exportState(), before);
+});
+
+test("full project and radar backups round-trip and roll radar back if the later project commit fails", async (t) => {
+  const { createRadarRepository } = await import("../server/ai-radar/radar-repository.mjs");
+  const directory = await mkdtemp(path.join(os.tmpdir(), "workbench-two-providers-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const projects = createProjectRepository({ directory: path.join(directory, "projects") });
+  const radar = createRadarRepository({ directory: path.join(directory, "ai-radar"), timeZone: "UTC" });
+  await projects.createProject({ key: "OLD", name: "Synthetic original project" });
+  await radar.updateSchedule({ enabled: true });
+  const backup = createWorkspaceBackup({ providers: [projects, radar], secret: SECRET });
+  const bundle = await backup.exportBundle();
+  assert.deepEqual(Object.keys(bundle.providers), ["ai-radar", "projects"]);
+  await projects.createProject({ key: "NEW", name: "Synthetic newer project" });
+  await radar.updateSchedule({ time: "12:00" });
+  await backup.confirmImport((await backup.previewImport(bundle)).token);
+  assert.deepEqual(await radar.exportState(), bundle.providers["ai-radar"].data);
+  assert.deepEqual(await projects.exportState(), bundle.providers.projects.data);
+  await radar.updateSchedule({ time: "15:00" });
+  const before = await radar.exportState();
+  const failingProjects = { ...projects, async stageImport(value) {
+    const staged = await projects.stageImport(value);
+    return { ...staged, async commit() { throw new Error("synthetic project commit failure"); } };
+  } };
+  const failingBackup = createWorkspaceBackup({ providers: [failingProjects, radar], secret: SECRET });
+  await assert.rejects(failingBackup.confirmImport((await failingBackup.previewImport(bundle)).token), { code: "WORKSPACE_RESTORE_COMMIT_FAILED" });
+  assert.deepEqual(await radar.exportState(), before);
+  assert.deepEqual(await projects.exportState(), bundle.providers.projects.data);
+  await radar.updateSchedule({ time: "16:00" }); // Cleanup released the durable lock.
+});

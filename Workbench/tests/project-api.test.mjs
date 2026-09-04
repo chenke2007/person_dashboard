@@ -7,6 +7,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { createServer as createViteServer } from "vite";
+import { createRadarRepository } from "../server/ai-radar/radar-repository.mjs";
 import { createProjectRepository } from "../server/projects/project-repository.mjs";
 import { workbenchApiPlugin } from "../server/vite-plugin-workbench.mjs";
 import { createWorkspaceRegistry } from "../server/workspace-state/workspace-registry.mjs";
@@ -227,6 +228,7 @@ test("adopts legacy hashed project state without moving or losing projects", asy
       legacyDirectory = path.join(appDataRoot, "PersonalAIWorkbench", legacyId, "projects");
       const legacy = createProjectRepository({ directory: legacyDirectory });
       await legacy.createProject({ key: "OLD", name: "Synthetic legacy project" });
+      await createRadarRepository({ directory: path.join(path.dirname(legacyDirectory), "ai-radar"), timeZone: "UTC" }).updateSchedule({ time: "11:30" });
     },
   });
 
@@ -241,6 +243,8 @@ test("adopts legacy hashed project state without moving or losing projects", asy
   ));
   assert.equal(registry.workspaces[0].workspaceId, path.basename(path.dirname(legacyDirectory)));
   assert.equal(JSON.stringify(registry).includes(fixture.vaultRoot), false);
+  const backup = await request(fixture.origin, "/api/workspace/backup");
+  assert.equal(backup.body.providers["ai-radar"].data.schedule.time, "11:30");
 });
 
 test("read-only project listing does not create registry or workspace state", async (t) => {
@@ -294,7 +298,7 @@ test("exports and restores project state only after a safe preview is confirmed"
   });
   const exported = await request(fixture.origin, "/api/workspace/backup");
   assert.equal(exported.response.status, 200);
-  assert.deepEqual(Object.keys(exported.body.providers), ["projects"]);
+  assert.deepEqual(Object.keys(exported.body.providers), ["ai-radar", "projects"]);
   assert.equal(JSON.stringify(exported.body).includes(fixture.vaultRoot), false);
 
   await request(fixture.origin, "/api/projects", {
@@ -306,7 +310,7 @@ test("exports and restores project state only after a safe preview is confirmed"
     body: exported.body,
   });
   assert.equal(preview.response.status, 200);
-  assert.deepEqual(preview.body.providers, [{ id: "projects", version: 1, count: 4 }]);
+  assert.deepEqual(preview.body.providers, [{ id: "ai-radar", version: 1, count: 0 }, { id: "projects", version: 1, count: 4 }]);
   assert.equal((await request(fixture.origin, "/api/projects")).body.projects.length, 2);
 
   const confirmed = await request(fixture.origin, "/api/workspace/restore/confirm", {
@@ -373,6 +377,7 @@ test("lists safe workspace candidates and requires preview confirmation before r
         directory: path.join(registryDirectory, "workspaces", existing.workspaceId, "projects"),
       });
       await repository.createProject({ key: "OLD", name: "Synthetic retained project" });
+      await createRadarRepository({ directory: path.join(registryDirectory, "workspaces", existing.workspaceId, "ai-radar"), timeZone: "UTC" }).updateSchedule({ time: "13:45" });
     },
   });
 
@@ -385,6 +390,9 @@ test("lists safe workspace candidates and requires preview confirmation before r
     isCurrent: false,
   }]);
   assert.equal(JSON.stringify(candidates.body).includes("fingerprint"), false);
+
+  const beforeBackup = await request(fixture.origin, "/api/workspace/backup");
+  assert.equal(beforeBackup.body.providers["ai-radar"].data.schedule.time, "08:00");
 
   // A user commonly discovers the move by first opening the empty Projects page.
   assert.deepEqual((await request(fixture.origin, "/api/projects")).body.projects, []);
@@ -405,6 +413,8 @@ test("lists safe workspace candidates and requires preview confirmation before r
   assert.equal(confirmed.body.workspaceId, existingWorkspaceId);
   const projects = await request(fixture.origin, "/api/projects");
   assert.equal(projects.body.projects[0].name, "Synthetic retained project");
+  const afterBackup = await request(fixture.origin, "/api/workspace/backup");
+  assert.equal(afterBackup.body.providers["ai-radar"].data.schedule.time, "13:45");
 });
 
 test("runtime advertises independent recovery capabilities for actual Obsidian and workspace policies", async (t) => {
@@ -441,4 +451,30 @@ test("Obsidian overview hides Douyin metrics and their notices while default kee
       assert.match(overview.qualityNotices.join(" "), /抖音数据源不可用/);
     }
   }
+});
+
+
+test("readonly backup of direct projects includes absent radar without creating its directory", async (t) => {
+  const fixture = await startFixture(t, { readOnly: true });
+  const backup = await request(fixture.origin, "/api/workspace/backup");
+  assert.equal(backup.response.status, 200);
+  assert.equal(backup.body.providers["ai-radar"].data.schedule.enabled, false);
+  await assert.rejects(access(path.join(fixture.root, "state")), { code: "ENOENT" });
+});
+
+test("readonly backup of bound workspace does not create missing radar state", async (t) => {
+  let radarDirectory;
+  const fixture = await startFixture(t, { readOnly: true, useWorkspaceRegistry: true,
+    async beforeStart({ vaultRoot, appDataRoot }) {
+      const directory = path.join(appDataRoot, "PersonalAIWorkbench");
+      const registry = createWorkspaceRegistry({ directory });
+      const fingerprint = createHash("sha256").update(path.resolve(vaultRoot).toLowerCase()).digest("hex");
+      const workspace = await registry.resolveVault({ fingerprint, label: "Synthetic readonly workspace" });
+      radarDirectory = path.join(directory, "workspaces", workspace.workspaceId, "ai-radar");
+    },
+  });
+  const backup = await request(fixture.origin, "/api/workspace/backup");
+  assert.equal(backup.response.status, 200);
+  assert.deepEqual(backup.body.providers["ai-radar"].data.repositories, []);
+  await assert.rejects(access(radarDirectory), { code: "ENOENT" });
 });

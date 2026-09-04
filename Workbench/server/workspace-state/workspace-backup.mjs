@@ -220,7 +220,9 @@ export function createWorkspaceBackup({ providers, now = () => new Date(), secre
       provider.schemaVersion < 1 ||
       typeof provider.exportState !== "function" ||
       typeof provider.validateImport !== "function" ||
-      typeof provider.replaceState !== "function"
+      typeof provider.replaceState !== "function" ||
+      (provider.optionalForImport !== undefined && typeof provider.optionalForImport !== "boolean") ||
+      (provider.stageImport !== undefined && typeof provider.stageImport !== "function")
     ) {
       throw new TypeError("workspace backup provider contract is invalid");
     }
@@ -322,7 +324,8 @@ export function createWorkspaceBackup({ providers, now = () => new Date(), secre
       validated.set(id, checked);
       summary.push({ id, version: entry.version, count: countRecords(checked) });
     }
-    if (validated.size !== providerMap.size) {
+    const omittedProviders = orderedProviders.filter((provider) => !validated.has(provider.id));
+    if (omittedProviders.some((provider) => !provider.optionalForImport)) {
       fail("WORKSPACE_BACKUP_PROVIDER_MISSING", "备份缺少当前工作区所需的状态提供方。");
     }
 
@@ -345,7 +348,10 @@ export function createWorkspaceBackup({ providers, now = () => new Date(), secre
       expiresAt,
       requiresConfirmation: true,
       providers: summary,
-      warnings: ["凭据、缓存、绝对路径和 Vault 正文不会进入恢复内容。"],
+      warnings: [
+        "凭据、缓存、绝对路径和 Vault 正文不会进入恢复内容。",
+        ...omittedProviders.map((provider) => `备份未包含可选状态提供方 ${provider.id}，当前数据将保留。`),
+      ],
     };
   }
 

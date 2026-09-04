@@ -53,6 +53,7 @@ import { createKnowledgeRoutes } from "./knowledge-chat/routes.mjs";
 import { ProjectRepositoryError, createProjectRepository } from "./projects/project-repository.mjs";
 import { createProjectRoutes } from "./projects/project-routes.mjs";
 import { emptyProjectStore, projectStoreSchema } from "./projects/project-schema.mjs";
+import { createRadarRepository } from "./ai-radar/radar-repository.mjs";
 import { createWorkspaceBackup } from "./workspace-state/workspace-backup.mjs";
 import { createWorkspaceRegistry } from "./workspace-state/workspace-registry.mjs";
 import { createWorkspaceRoutes } from "./workspace-state/workspace-routes.mjs";
@@ -828,6 +829,7 @@ export function workbenchApiPlugin({
   projectReadOnly = readOnly,
   knowledgeOptions = {},
   projectDirectory = null,
+  radarDirectory = null,
   appDataRoot = process.env.LOCALAPPDATA || path.join(os.homedir(), ".local", "share"),
   hosted = process.env.VITE_WORKBENCH_HOSTED === "true",
 } = {}) {
@@ -895,6 +897,24 @@ export function workbenchApiPlugin({
     })();
     return projectRepositoryPromise;
   }
+  let radarRepositoryPromise = null;
+  function radarRepository() {
+    radarRepositoryPromise ??= (async () => {
+      let resolvedDirectory = radarDirectory;
+      if (!resolvedDirectory && projectDirectory) resolvedDirectory = path.join(path.dirname(projectDirectory), "ai-radar");
+      if (!resolvedDirectory) {
+        const workspace = await currentWorkspace();
+        // Backup requests check for a bound workspace before obtaining providers.
+        if (!workspace) throw new Error("Radar requires a bound workspace");
+        const stateRoot = workspace.storageLayout === "legacy"
+          ? path.join(workspaceRegistryDirectory, workspace.workspaceId)
+          : path.join(workspaceRegistryDirectory, "workspaces", workspace.workspaceId);
+        resolvedDirectory = path.join(stateRoot, "ai-radar");
+      }
+      return createRadarRepository({ directory: resolvedDirectory });
+    })();
+    return radarRepositoryPromise;
+  }
   const projects = new Proxy({}, {
     get(_target, property) {
       return async (...args) => {
@@ -919,7 +939,7 @@ export function workbenchApiPlugin({
         throw error;
       }
       const backup = createWorkspaceBackup({
-        providers: [await projectRepository()],
+        providers: [await projectRepository(), await radarRepository()],
         secret: backupSecret,
         workspaceId: workspace.workspaceId,
       });
@@ -942,6 +962,7 @@ export function workbenchApiPlugin({
     async onRebind() {
       workspacePromise = null;
       projectRepositoryPromise = null;
+      radarRepositoryPromise = null;
       workspaceBackupPromise = null;
     },
   });

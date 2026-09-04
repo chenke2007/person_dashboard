@@ -401,3 +401,37 @@ test("successful 304 resets secondary backoff and cached search observations ref
   const limitedAgain = await api.discoverCandidates({ focusAreas: ["agent"] });
   assert.equal(limitedAgain.retryAt, "2026-09-04T01:02:00.000Z");
 });
+
+test("discovery and detail focus areas reject nested arrays and non-string entries before fetch", async () => {
+  let calls = 0;
+  const api = client(async (url) => {
+    calls++;
+    return url.includes("/search/") ? json({ items: [repository()], total_count: 1, incomplete_results: false }) : json(repository());
+  });
+  for (const focusAreas of [[["agent"]], [null], [{}], [1], [true], Array(1)]) {
+    await assert.rejects(api.discoverCandidates({ focusAreas }), { code: "GITHUB_INVALID_INPUT" });
+    await assert.rejects(api.getRepositories({ repositories: [...details.repositories, { fullName: "demo-lab/other", focusAreas }] }), { code: "GITHUB_INVALID_INPUT" });
+    assert.equal(calls, 0);
+  }
+});
+
+test("cached HEAD commits preserve omitted versus explicit ref identity in either call order", async () => {
+  for (const firstExplicit of [false, true]) {
+    let calls = 0, date = new Date(INSTANT);
+    const api = client(async (url, options) => {
+      calls++;
+      assert.ok(url.endsWith("/commits/HEAD"));
+      if (calls === 1) return json({ sha: SHA, commit: { committer: { date: INSTANT } } }, 200, { etag: '"head-ref"' });
+      assert.equal(options.headers["If-None-Match"], '"head-ref"');
+      return json(null, 304);
+    }, { now: () => date });
+    const omitted = { fullName: source.fullName }, explicit = { ...omitted, ref: "HEAD" };
+    assert.equal((await api.getHeadCommit(firstExplicit ? explicit : omitted)).ref, firstExplicit ? "HEAD" : null);
+    date = new Date("2026-09-04T01:01:00.000Z");
+    const second = await api.getHeadCommit(firstExplicit ? omitted : explicit);
+    assert.equal(second.ref, firstExplicit ? null : "HEAD");
+    assert.equal(second.sha, SHA);
+    assert.equal(second.observedAt, "2026-09-04T01:01:00.000Z");
+    assert.equal(calls, 2);
+  }
+});

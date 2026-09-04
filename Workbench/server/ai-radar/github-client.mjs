@@ -27,7 +27,7 @@ function validateRef(value) {
   return value;
 }
 function areas(value, required = false) {
-  if (!Array.isArray(value) || value.length > 4 || (required && value.length === 0) || value.some((area) => !Object.hasOwn(GITHUB_RADAR_FOCUS_QUERIES, area)) || new Set(value).size !== value.length) fail("GITHUB_INVALID_INPUT");
+  if (!Array.isArray(value) || value.length > 4 || (required && value.length === 0) || [...value].some((area) => typeof area !== "string" || !Object.hasOwn(GITHUB_RADAR_FOCUS_QUERIES, area)) || new Set(value).size !== value.length) fail("GITHUB_INVALID_INPUT");
   return [...value];
 }
 function timestamp(value) {
@@ -291,11 +291,13 @@ export function createGitHubRadarClient({ fetchImpl = fetch, token = null, userA
   }
   async function getHeadCommit(input) {
     const { fullName, ref } = sourceInput(input);
-    return request(`${ORIGIN}/repos/${fullName}/commits/${encodeURIComponent(ref ?? "HEAD")}`, "head", (raw, observedAt) => {
+    const value = await request(`${ORIGIN}/repos/${fullName}/commits/${encodeURIComponent(ref ?? "HEAD")}`, "head", (raw, observedAt) => {
       if (!object(raw) || !/^[a-f0-9]{40}$/i.test(raw.sha ?? "") || !object(raw.commit) || !object(raw.commit.committer) ||
           (/^[a-f0-9]{40}$/i.test(ref ?? "") && raw.sha.toLowerCase() !== ref.toLowerCase())) fail("GITHUB_INVALID_PAYLOAD");
       return { fullName, ref, sha: raw.sha.toLowerCase(), committedAt: timestamp(raw.commit.committer.date), observedAt };
     });
+    // Omitted ref and explicit HEAD share a representation, not caller identity.
+    return { ...value, ref };
   }
   return { discoverCandidates, getRepositories, getReadme, getHeadCommit };
 }

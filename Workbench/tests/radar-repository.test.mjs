@@ -228,3 +228,39 @@ test("retention supports actual local dates across timezone changes even when UT
   assert.equal(aggregate.first.stars, 10);
   assert.equal(aggregate.last.stars, 5);
 });
+
+test("imports reject conflicting complete endpoints for one observed monthly date", async (t) => {
+  const { radar } = await fixture(t);
+  await radar.upsertRepositories([syntheticRepository()]);
+  await radar.recordSnapshots([snapshot()], "2025-01-01T00:00:00.000Z", timeZone);
+  await radar.applyRetention("2026-09-03");
+  const baseline = await radar.getState();
+  for (const patch of [
+    { stars: 999 }, { forks: 7 }, { openIssues: 8 },
+    { capturedAt: "2025-01-01T06:00:00.000Z" }, { timeZone: "UTC" },
+  ]) {
+    const invalid = structuredClone(baseline);
+    Object.assign(invalid.monthlyAggregates[0].last, patch);
+    await assert.rejects(radar.validateImport(invalid), isCode("RADAR_STORAGE_CORRUPT"));
+    await assert.rejects(radar.replaceState(invalid), isCode("RADAR_STORAGE_CORRUPT"));
+  }
+  assert.deepEqual(await radar.getState(), baseline);
+});
+
+test("single-date aggregate imports compare normalized observations and retain distinct dates normally", async (t) => {
+  const { radar } = await fixture(t);
+  await radar.upsertRepositories([syntheticRepository()]);
+  await radar.recordSnapshots([snapshot(101, 100)], "2025-01-01T00:00:00.000Z", timeZone);
+  await radar.applyRetention("2026-09-03");
+  const single = await radar.getState();
+  assert.deepEqual(single.monthlyAggregates[0].first, single.monthlyAggregates[0].last);
+  single.monthlyAggregates[0].last.capturedAt = "2025-01-01T08:00:00+08:00";
+  const normalized = await radar.validateImport(single);
+  assert.deepEqual(normalized.monthlyAggregates[0].first, normalized.monthlyAggregates[0].last);
+  await radar.recordSnapshots([snapshot(101, 120)], "2025-01-02T00:00:00.000Z", timeZone);
+  await radar.applyRetention("2026-09-03");
+  const [aggregate] = (await radar.getState()).monthlyAggregates;
+  assert.deepEqual(aggregate.observedDates, ["2025-01-01", "2025-01-02"]);
+  assert.equal(aggregate.first.stars, 100);
+  assert.equal(aggregate.last.stars, 120);
+});

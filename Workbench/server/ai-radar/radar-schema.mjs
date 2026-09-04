@@ -88,6 +88,11 @@ const aggregateSchema = z.object({
       item.first.capturedDate !== dates[0] || item.last.capturedDate !== dates.at(-1)) {
     context.addIssue({ code: z.ZodIssueCode.custom, message: "monthly aggregate observations must belong to repository and month" });
   }
+  // Snapshot schemas have already normalized timestamps; one observed day has
+  // exactly one latest snapshot, so both endpoints must describe that record.
+  if (dates.length === 1 && Object.keys(item.first).some((key) => item.first[key] !== item.last[key])) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["last"], message: "single-date aggregate endpoints must describe the same observation" });
+  }
 });
 export const radarStoreSchema = z.object({
   version: z.literal(1), revision: count, updatedAt: nullableTimestamp,

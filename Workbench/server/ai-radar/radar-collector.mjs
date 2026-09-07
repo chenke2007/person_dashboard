@@ -9,6 +9,12 @@ const focusSchema = z.array(z.enum(["agent", "ai-coding", "rag-knowledge", "ai-p
 const timestamp = z.string().datetime({ offset: true }).transform((value) => new Date(value).toISOString());
 const triggerSchema = z.enum(["manual", "schedule", "startup"]);
 function invalid() { throw new RadarRepositoryError("RADAR_INVALID_INPUT", "雷达采集选项无效。"); }
+function safeFailureFullName(failure) {
+  try {
+    const fullName = failure?.fullName;
+    return typeof fullName === "string" && fullName.length <= 240 ? fullName.toLowerCase() : null;
+  } catch { return null; }
+}
 
 // One instance per active workspace. Overlapping calls join the first trigger's
 // run; no unbounded request queue and no network request under a storage lock.
@@ -95,7 +101,8 @@ export function createRadarCollector({ github, repository, rank = rankRadar, now
       }
       for (const failure of result.errors.slice(0, 200)) {
         error(failure);
-        if (typeof failure?.fullName === "string") returnedNames.add(failure.fullName.toLowerCase());
+        const fullName = safeFailureFullName(failure);
+        if (fullName) returnedNames.add(fullName);
       }
       if (result.errors.length > 200) partial = true;
       for (const item of selected) {

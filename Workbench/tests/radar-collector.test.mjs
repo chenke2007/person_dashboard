@@ -162,6 +162,18 @@ test("old cached and future metadata are not fresh observations, and hostile thr
   assert.doesNotMatch(JSON.stringify(safe), /synthetic private value/);
 });
 
+test("hostile batch error metadata is sanitized and the durable run still terminates", async (t) => {
+  const f = await fixture(t);
+  const hostile = { code: "GITHUB_HTTP_ERROR", message: "safe synthetic error", retryAt: null };
+  Object.defineProperty(hostile, "fullName", { get() { throw new Error("HOSTILE_BATCH_FIELD"); } });
+  const result = await collector(f, client(async () => batch([], { partial: true, errors: [hostile] }))).collect({ trigger: "manual" });
+  assert.equal(result.run.status, "failed"); assert.equal(result.persisted, true);
+  assert.deepEqual(result.run.errors, [{ code: "GITHUB_HTTP_ERROR", message: "GitHub request failed." }]);
+  const state = await f.repository.getState();
+  assert.equal(state.runs.length, 1); assert.equal(state.runs[0].status, "failed");
+  assert.doesNotMatch(JSON.stringify({ result, state }), /HOSTILE_BATCH_FIELD|safe synthetic error/);
+});
+
 test("collector retention aggregates only actual unprotected history and keeps saved history sticky", async (t) => {
   const f = await fixture(t);
   await f.repository.upsertRepositories([repo(1), repo(2)]);

@@ -3,10 +3,13 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { createTicketLock } from "../workspace-state/ticket-lock.mjs";
+import { rankRadar, classifyRadarFocus } from "../../shared/ai-radar-ranking.mjs";
+import { GitHubRadarError } from "./github-errors.mjs";
 import {
   MAX_RADAR_BYTES, RADAR_RETENTION_DAYS, emptyRadarStore, radarStoreSchema, radarRepositorySchema,
   radarSnapshotInputSchema, radarSnapshotSchema, radarRunSchema, radarDecisionStatusSchema,
   radarPreferenceInputSchema, radarScheduleSchema, radarLocalDate, radarTimeZoneSchema,
+  radarCollectionControlSchema,
 } from "./radar-schema.mjs";
 
 const FILE_NAME = "radar.json";
@@ -19,6 +22,17 @@ function checked(schema, input) {
   const result = schema.safeParse(input);
   if (!result.success) fail("RADAR_INVALID_INPUT", "雷达输入格式无效。");
   return result.data;
+}
+export function safeRadarError(error, fallback = "RADAR_COLLECTION_FAILED") {
+  const messages = { RADAR_COLLECTION_FAILED: "雷达采集失败。", RADAR_PERSISTENCE_FAILED: "雷达采集结果未能保存。",
+    RADAR_STALE_OBSERVATION: "忽略非本次请求产生的观测。", RADAR_INVALID_BATCH: "雷达数据响应无效。", RADAR_COOLDOWN: "雷达等待请求冷却结束。" };
+  let code;
+  try { code = error?.code; } catch { /* Arbitrary thrown values are not trusted. */ }
+  if (typeof code === "string" && code.startsWith("GITHUB_")) {
+    const safe = new GitHubRadarError(code); return { code: safe.code, message: safe.message };
+  }
+  code = typeof code === "string" && Object.hasOwn(messages, code) ? code : fallback;
+  return { code, message: messages[code] };
 }
 
 export function createRadarRepository({ directory, now = () => new Date(), timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone } = {}) {
@@ -259,9 +273,129 @@ export function createRadarRepository({ directory, now = () => new Date(), timeZ
   }
   function getState() { return serialized(async () => structuredClone(await readStore())); }
 
+  function mergeRepositories(store, items) {
+    const byId = new Map(store.repositories.map((item) => [item.id, item]));
+    for (const item of items) {
+      const existing = byId.get(item.id);
+      if (existing && existing.observedAt >= item.observedAt) continue;
+      byId.set(item.id, { ...item, preservedAt: existing?.preservedAt ?? item.preservedAt });
+    }
+    store.repositories = [...byId.values()];
+    return items.map((item) => byId.get(item.id));
+  }
+  function mergeSnapshots(store, items) {
+    const byDay = new Map(store.snapshots.map((item) => [`${item.repositoryId}:${item.capturedDate}`, item]));
+    const result = items.map((item) => {
+      requireRepository(store, item.repositoryId);
+      const key = `${item.repositoryId}:${item.capturedDate}`;
+      if (!byDay.has(key) || byDay.get(key).capturedAt < item.capturedAt) byDay.set(key, item);
+      return byDay.get(key);
+    });
+    store.snapshots = [...byDay.values()];
+    return result;
+  }
+  function putRun(store, item) {
+    const index = store.runs.findIndex((run) => run.id === item.id);
+    if (index === -1) store.runs.push(item);
+    else {
+      const existing = store.runs[index];
+      if (["startedAt", "trigger", "timeZone", "localDate", "sequence"].some((key) => existing[key] !== item[key])) fail("RADAR_INVALID_INPUT", "运行身份不可更改。");
+      if (existing.status !== "running" && JSON.stringify(existing) !== JSON.stringify(item)) fail("RADAR_INVALID_INPUT", "已结束的运行不可更改。");
+      store.runs[index] = item;
+    }
+    return item;
+  }
+  function retain(store, referenceDate) {
+    checked(z.string().date(), referenceDate);
+    const cutoff = new Date(Date.parse(`${referenceDate}T00:00:00.000Z`) - RADAR_RETENTION_DAYS * 86_400_000).toISOString().slice(0, 10);
+    const protectedIds = new Set(store.repositories.filter((item) => item.preservedAt).map((item) => item.id));
+    const aggregates = new Map(store.monthlyAggregates.map((item) => [`${item.repositoryId}:${item.month}`, item]));
+    const retained = [];
+    for (const item of store.snapshots) {
+      if (item.capturedDate >= cutoff || protectedIds.has(item.repositoryId)) { retained.push(item); continue; }
+      const month = item.capturedDate.slice(0, 7), key = `${item.repositoryId}:${month}`;
+      const aggregate = aggregates.get(key);
+      if (!aggregate) aggregates.set(key, { repositoryId: item.repositoryId, month, observedDates: [item.capturedDate], first: item, last: item });
+      else {
+        aggregate.observedDates = [...new Set([...aggregate.observedDates, item.capturedDate])].sort();
+        if (item.capturedDate < aggregate.first.capturedDate || (item.capturedDate === aggregate.first.capturedDate && item.capturedAt > aggregate.first.capturedAt)) aggregate.first = item;
+        if (item.capturedDate > aggregate.last.capturedDate || (item.capturedDate === aggregate.last.capturedDate && item.capturedAt > aggregate.last.capturedAt)) aggregate.last = item;
+      }
+    }
+    const aggregatedSnapshots = store.snapshots.length - retained.length;
+    store.snapshots = retained; store.monthlyAggregates = [...aggregates.values()];
+    store.retention.lastAppliedDate = referenceDate;
+    return { aggregatedSnapshots, retainedSnapshots: retained.length };
+  }
+
+  async function getDashboard({ period = "day", state: selectedState = "all", focus = "all", timeZone: selectedTimeZone, rank = rankRadar } = {}) {
+    checked(z.enum(["day", "week", "month"]), period);
+    checked(z.union([z.literal("all"), radarDecisionStatusSchema]), selectedState);
+    checked(z.enum(["all", "agent", "ai-coding", "rag-knowledge", "ai-productivity"]), focus);
+    const store = await getState();
+    const zone = checked(radarTimeZoneSchema, selectedTimeZone ?? store.schedule.timeZone);
+    const queriedAt = clock();
+    const snapshots = store.snapshots.filter((item) => item.capturedAt <= queriedAt);
+    const lastDataAt = snapshots.reduce((latest, item) => !latest || item.capturedAt > latest ? item.capturedAt : latest, null);
+    const asOf = lastDataAt ?? queriedAt;
+    const decisions = new Map(store.decisions.map((item) => [item.repositoryId, item]));
+    const decisionFor = (id) => decisions.get(id) ?? { repositoryId: id, status: "unread", updatedAt: null };
+    const counts = Object.fromEntries(["all", ...radarDecisionStatusSchema.options].map((key) => [key, 0]));
+    for (const item of store.repositories) { const status = decisionFor(item.id).status; counts[status]++; if (status !== "ignored") counts.all++; }
+    const repositories = store.repositories.filter((item) => {
+      const status = decisionFor(item.id).status;
+      return (selectedState === "all" ? status !== "ignored" : status === selectedState) &&
+        (focus === "all" || classifyRadarFocus(item).directions.includes(focus));
+    });
+    const ids = new Set(repositories.map((item) => item.id));
+    const ranked = rank({ repositories, snapshots: snapshots.filter((item) => ids.has(item.repositoryId)), period, preferences: store.preferences, now: new Date(asOf), timeZone: zone });
+    const lists = Object.fromEntries(Object.entries(ranked).map(([key, entries]) => [key, entries.map((entry) => ({ ...entry, decision: decisionFor(entry.repositoryId) }))]));
+    const orderedRuns = [...store.runs].sort((a, b) => b.sequence - a.sequence || b.startedAt.localeCompare(a.startedAt) || b.id.localeCompare(a.id));
+    const projectRun = (run) => run ? { ...run, errors: run.errors.map((error) => safeRadarError(error)) } : null;
+    const run = projectRun(orderedRuns[0]);
+    const lastSuccessfulRun = projectRun(orderedRuns.find((item) => item.status === "success"));
+    return { period, timeZone: zone, localDate: radarLocalDate(asOf, zone), filters: { state: selectedState, focus }, counts, eligibleCount: repositories.length, lists,
+      freshness: { queriedAt, asOf: lastDataAt, lastDataAt, lastSuccessAt: store.schedule.lastSuccessAt,
+        stale: !lastDataAt || radarLocalDate(lastDataAt, zone) !== radarLocalDate(queriedAt, zone) || ["failed", "partial"].includes(run?.status) },
+      run, lastSuccessfulRun, coverage: run?.collection ?? null, retryAt: store.collection.retryAt,
+      errors: run?.errors ?? [], schedule: store.schedule };
+  }
+
   return Object.freeze({
     id: "ai-radar", schemaVersion: 1, optionalForImport: true,
-    getState, exportState: getState, validateImport: validatedImport, stageImport,
+    getState, getDashboard, exportState: getState, validateImport: validatedImport, stageImport,
+    beginCollection(input) {
+      return mutate((store) => {
+        const run = checked(radarRunSchema, { ...input, sequence: store.collection.sequence + 1 });
+        if (run.status !== "running" || store.runs.some((item) => item.id === run.id)) fail("RADAR_INVALID_INPUT", "采集必须以新的运行开始。");
+        store.collection.sequence = run.sequence;
+        store.schedule.lastAttemptAt = !store.schedule.lastAttemptAt || run.startedAt > store.schedule.lastAttemptAt ? run.startedAt : store.schedule.lastAttemptAt;
+        return putRun(store, run);
+      });
+    },
+    commitCollection({ repositories, run: inputRun, control }) {
+      return mutate((store) => {
+        const items = checked(z.array(radarRepositorySchema).max(10_000), repositories);
+        const run = checked(radarRunSchema, inputRun);
+        const nextControl = checked(radarCollectionControlSchema, control);
+        const started = store.runs.find((item) => item.id === run.id);
+        if (!started || run.status === "running" || run.repositoryCount !== items.length ||
+            items.some((item) => item.observedAt < run.startedAt || item.observedAt > run.finishedAt) ||
+            (run.status === "success" && (run.errors.length || run.collection?.partial))) fail("RADAR_INVALID_INPUT", "采集提交格式无效。");
+        mergeRepositories(store, items);
+        mergeSnapshots(store, items.map((item) => checked(radarSnapshotSchema, {
+          repositoryId: item.id, stars: item.stars, forks: item.forks, openIssues: item.openIssues,
+          capturedAt: item.observedAt, capturedDate: radarLocalDate(item.observedAt, run.timeZone), timeZone: run.timeZone,
+        })));
+        putRun(store, run);
+        if (run.sequence >= store.collection.appliedSequence) {
+          store.collection = { ...store.collection, ...nextControl, appliedSequence: run.sequence };
+        }
+        if (run.status === "success" && (!store.schedule.lastSuccessAt || run.startedAt > store.schedule.lastSuccessAt)) store.schedule.lastSuccessAt = run.startedAt;
+        if (items.length) retain(store, radarLocalDate(run.finishedAt, run.timeZone));
+        return run;
+      });
+    },
     async replaceState(value) {
       const transaction = await stageImport(value);
       try { await transaction.commit(); } finally { await transaction.cleanup(); }
@@ -269,15 +403,7 @@ export function createRadarRepository({ directory, now = () => new Date(), timeZ
     upsertRepositories(input) {
       return mutate((store) => {
         const items = checked(z.array(radarRepositorySchema).max(10_000), input);
-        const byId = new Map(store.repositories.map((item) => [item.id, item]));
-        for (const item of items) {
-          const existing = byId.get(item.id);
-          if (existing && existing.observedAt >= item.observedAt) continue;
-          // A remote observation can never erase local history protection.
-          byId.set(item.id, { ...item, preservedAt: existing?.preservedAt ?? item.preservedAt });
-        }
-        store.repositories = [...byId.values()];
-        return items.map((item) => byId.get(item.id));
+        return mergeRepositories(store, items);
       });
     },
     recordSnapshots(input, capturedAt, snapshotTimeZone = timeZone) {
@@ -285,31 +411,15 @@ export function createRadarRepository({ directory, now = () => new Date(), timeZ
         const observedAt = checked(timestampSchema, capturedAt);
         checked(radarTimeZoneSchema, snapshotTimeZone);
         const items = checked(z.array(radarSnapshotInputSchema).max(10_000), input);
-        const byDay = new Map(store.snapshots.map((item) => [`${item.repositoryId}:${item.capturedDate}`, item]));
-        const result = [];
-        for (const item of items) {
-          requireRepository(store, item.repositoryId);
-          const value = checked(radarSnapshotSchema, { ...item, capturedAt: observedAt, capturedDate: radarLocalDate(observedAt, snapshotTimeZone), timeZone: snapshotTimeZone });
-          const key = `${item.repositoryId}:${value.capturedDate}`;
-          if (!byDay.has(key) || byDay.get(key).capturedAt < value.capturedAt) byDay.set(key, value);
-          result.push(byDay.get(key));
-        }
-        store.snapshots = [...byDay.values()];
-        return result;
+        return mergeSnapshots(store, items.map((item) => checked(radarSnapshotSchema, {
+          ...item, capturedAt: observedAt, capturedDate: radarLocalDate(observedAt, snapshotTimeZone), timeZone: snapshotTimeZone,
+        })));
       });
     },
     recordRun(input) {
       return mutate((store) => {
         const item = checked(radarRunSchema, input);
-        const index = store.runs.findIndex((run) => run.id === item.id);
-        if (index === -1) store.runs.push(item);
-        else {
-          const existing = store.runs[index];
-          if (existing.startedAt !== item.startedAt || existing.trigger !== item.trigger || existing.timeZone !== item.timeZone || existing.localDate !== item.localDate) fail("RADAR_INVALID_INPUT", "运行身份不可更改。");
-          if (existing.status !== "running" && JSON.stringify(existing) !== JSON.stringify(item)) fail("RADAR_INVALID_INPUT", "已结束的运行不可更改。");
-          store.runs[index] = item;
-        }
-        return item;
+        return putRun(store, item);
       });
     },
     setDecision(repositoryId, status) {
@@ -354,29 +464,7 @@ export function createRadarRepository({ directory, now = () => new Date(), timeZ
       });
     },
     applyRetention(referenceDate = radarLocalDate(clock(), timeZone)) {
-      return mutate((store) => {
-        checked(z.string().date(), referenceDate);
-        const cutoff = new Date(Date.parse(`${referenceDate}T00:00:00.000Z`) - RADAR_RETENTION_DAYS * 86_400_000).toISOString().slice(0, 10);
-        const protectedIds = new Set(store.repositories.filter((item) => item.preservedAt).map((item) => item.id));
-        const aggregates = new Map(store.monthlyAggregates.map((item) => [`${item.repositoryId}:${item.month}`, item]));
-        const retained = [];
-        for (const item of store.snapshots) {
-          if (item.capturedDate >= cutoff || protectedIds.has(item.repositoryId)) { retained.push(item); continue; }
-          const month = item.capturedDate.slice(0, 7), key = `${item.repositoryId}:${month}`;
-          const aggregate = aggregates.get(key);
-          if (!aggregate) aggregates.set(key, { repositoryId: item.repositoryId, month, observedDates: [item.capturedDate], first: item, last: item });
-          else {
-            aggregate.observedDates = [...new Set([...aggregate.observedDates, item.capturedDate])].sort();
-            if (item.capturedDate < aggregate.first.capturedDate || (item.capturedDate === aggregate.first.capturedDate && item.capturedAt > aggregate.first.capturedAt)) aggregate.first = item;
-            if (item.capturedDate > aggregate.last.capturedDate || (item.capturedDate === aggregate.last.capturedDate && item.capturedAt > aggregate.last.capturedAt)) aggregate.last = item;
-          }
-        }
-        const aggregatedSnapshots = store.snapshots.length - retained.length;
-        store.snapshots = retained;
-        store.monthlyAggregates = [...aggregates.values()];
-        store.retention.lastAppliedDate = referenceDate;
-        return { aggregatedSnapshots, retainedSnapshots: retained.length };
-      });
+      return mutate((store) => retain(store, referenceDate));
     },
   });
 }

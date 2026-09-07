@@ -26,6 +26,65 @@ async function fixture(t) {
 const snapshot = (repositoryId = 101, stars = 100) => ({ repositoryId, stars, forks: null, openIssues: null });
 const isCode = (code) => (error) => error.code === code;
 
+test("dashboard filters before all three cutoffs, excludes ignored by default and does not mutate", async (t) => {
+  const { radar } = await fixture(t);
+  await radar.upsertRepositories(Array.from({ length: 15 }, (_, index) => syntheticRepository(index + 1, {
+    stars: 1000 - index, focusAreas: index === 14 ? [] : ["agent"], topics: index === 14 ? ["rag"] : ["agents"],
+  })));
+  await radar.setDecision(14, "saved"); await radar.setDecision(13, "ignored");
+  const before = await radar.getState();
+  const normal = await radar.getDashboard({ period: "day" });
+  assert.equal(normal.lists.established.length, 8); assert.equal(normal.counts.all, 14); assert.equal(normal.counts.ignored, 1);
+  assert.ok(normal.lists.relevant.every((entry) => entry.repositoryId !== 13));
+  const saved = await radar.getDashboard({ state: "saved" });
+  assert.equal(saved.lists.established[0].repositoryId, 14); assert.equal(saved.lists.rising[0].decision.status, "saved");
+  assert.deepEqual(saved.filters, { state: "saved", focus: "all" });
+  assert.equal((await radar.getDashboard({ state: "ignored" })).lists.established[0].repositoryId, 13);
+  assert.equal((await radar.getDashboard({ focus: "rag-knowledge" })).lists.relevant[0].repositoryId, 15);
+  await assert.rejects(radar.getDashboard({ period: "year" }), isCode("RADAR_INVALID_INPUT"));
+  await assert.rejects(radar.getDashboard({ state: "deleted" }), isCode("RADAR_INVALID_INPUT"));
+  assert.deepEqual(await radar.getState(), before);
+});
+
+test("collection commit rejects invalid payload atomically and older completion cannot regress metadata or control", async (t) => {
+  const { radar } = await fixture(t);
+  const start = (id, at) => ({ id, trigger: "manual", startedAt: at, finishedAt: null, status: "running", localDate: "2026-09-02", timeZone, repositoryCount: 0, errors: [] });
+  const old = await radar.beginCollection(start(runId, "2026-09-02T00:00:00.000Z"));
+  const recent = await radar.beginCollection(start("00000000-0000-4000-8000-000000000002", instant));
+  const finish = (run) => ({ ...run, finishedAt: instant, status: "success", repositoryCount: 1 });
+  const control = { retryAt: null, detailCursorId: 2, detailsFirst: true };
+  await radar.commitCollection({ repositories: [syntheticRepository(101, { stars: 200 })], run: finish(recent), control });
+  const before = await radar.getState();
+  await assert.rejects(radar.commitCollection({ repositories: [syntheticRepository(101, { stars: -1 })], run: finish(old), control }));
+  assert.deepEqual(await radar.getState(), before);
+  await radar.commitCollection({ repositories: [syntheticRepository(101, { stars: 10, observedAt: "2026-09-02T00:00:00.000Z" })], run: finish(old), control: { ...control, detailCursorId: 1, detailsFirst: false } });
+  const after = await radar.getState();
+  assert.equal(after.repositories[0].stars, 200); assert.equal(after.snapshots[0].stars, 200);
+  assert.equal(after.collection.detailCursorId, 2); assert.equal(after.schedule.lastSuccessAt, instant);
+});
+
+test("dashboard selected schedule timezone counts real observations at the durable as-of instant", async (t) => {
+  const { radar } = await fixture(t);
+  await radar.upsertRepositories([syntheticRepository()]);
+  await radar.recordSnapshots([snapshot(101, 80)], "2026-09-01T15:30:00.000Z", "UTC");
+  await radar.recordSnapshots([snapshot(101, 100)], "2026-09-01T16:30:00.000Z", "UTC");
+  // Persisted UTC day has one row; the selected local date must come from its actual instant.
+  const board = await radar.getDashboard();
+  assert.equal(board.timeZone, timeZone); assert.equal(board.localDate, "2026-09-02");
+  assert.equal(board.lists.rising[0].coverage.observedDays, 1);
+  assert.equal(board.lists.rising[0].latest.effectiveDate, "2026-09-02");
+});
+
+test("dashboard future imported observations do not move the usable as-of anchor", async (t) => {
+  const { radar } = await fixture(t);
+  await radar.upsertRepositories([syntheticRepository()]);
+  await radar.recordSnapshots([snapshot(101, 100)], instant, timeZone);
+  await radar.recordSnapshots([snapshot(101, 999)], "2099-01-01T00:00:00.000Z", timeZone);
+  const dashboard = await radar.getDashboard();
+  assert.equal(dashboard.freshness.asOf, instant);
+  assert.equal(dashboard.lists.rising[0].currentStars, 100);
+});
+
 test("absent reads and export return disabled local schedule without creating files or locks", async (t) => {
   const { directory, radar } = await fixture(t);
   assert.equal((await radar.getState()).version, 1);

@@ -53,12 +53,20 @@ export const radarSnapshotSchema = radarSnapshotInputSchema.extend({ capturedAt:
     context.addIssue({ code: z.ZodIssueCode.custom, message: "snapshot date must match observation time zone" });
   }
 });
+export const radarCollectionCoverageSchema = z.object({
+  discoveredCount: count, trackedCount: count, detailRequestedCount: count, observedCount: count,
+  failedCount: count, deferredCount: count, truncated: z.boolean(), partial: z.boolean(), retryAt: nullableTimestamp,
+}).strict();
+export const radarCollectionControlSchema = z.object({
+  retryAt: nullableTimestamp, detailCursorId: repositoryId.nullable(), detailsFirst: z.boolean(),
+}).strict();
 export const radarRunSchema = z.object({
   id: z.string().uuid(), trigger: z.enum(["manual", "schedule", "startup"]),
   startedAt: timestamp, finishedAt: nullableTimestamp,
   status: z.enum(["running", "success", "partial", "failed", "skipped"]),
   localDate: date, timeZone: radarTimeZoneSchema, repositoryCount: count,
   errors: z.array(z.object({ code: z.string().min(1).max(100).regex(/^[A-Za-z0-9_-]+$/), message: safeText(500) }).strict()).max(100),
+  sequence: count.default(0), collection: radarCollectionCoverageSchema.nullable().default(null),
 }).strict().superRefine((item, context) => {
   if ((item.status === "running") !== (item.finishedAt === null) || (item.finishedAt && item.finishedAt < item.startedAt)) {
     context.addIssue({ code: z.ZodIssueCode.custom, message: "run timestamps disagree with status" });
@@ -101,6 +109,8 @@ export const radarStoreSchema = z.object({
   preferences: z.array(radarPreferenceSchema).max(20_000), schedule: radarScheduleSchema,
   retention: z.object({ dailyDays: z.literal(RADAR_RETENTION_DAYS), lastAppliedDate: date.nullable() }).strict(),
   monthlyAggregates: z.array(aggregateSchema).max(120_000),
+  collection: radarCollectionControlSchema.extend({ sequence: count, appliedSequence: count }).strict()
+    .default({ retryAt: null, detailCursorId: null, detailsFirst: false, sequence: 0, appliedSequence: 0 }),
 }).strict().superRefine((store, context) => {
   const issue = (field, index, message) => context.addIssue({ code: z.ZodIssueCode.custom, path: [field, index], message });
   const unique = (field, key) => {

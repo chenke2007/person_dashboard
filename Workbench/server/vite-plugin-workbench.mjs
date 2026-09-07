@@ -53,7 +53,10 @@ import { createKnowledgeRoutes } from "./knowledge-chat/routes.mjs";
 import { ProjectRepositoryError, createProjectRepository } from "./projects/project-repository.mjs";
 import { createProjectRoutes } from "./projects/project-routes.mjs";
 import { emptyProjectStore, projectStoreSchema } from "./projects/project-schema.mjs";
+import { createGitHubRadarClient } from "./ai-radar/github-client.mjs";
+import { createRadarCollector } from "./ai-radar/radar-collector.mjs";
 import { createRadarRepository } from "./ai-radar/radar-repository.mjs";
+import { createRadarScheduler } from "./ai-radar/radar-scheduler.mjs";
 import { createWorkspaceBackup } from "./workspace-state/workspace-backup.mjs";
 import { createWorkspaceRegistry } from "./workspace-state/workspace-registry.mjs";
 import { createWorkspaceRoutes } from "./workspace-state/workspace-routes.mjs";
@@ -830,6 +833,7 @@ export function workbenchApiPlugin({
   knowledgeOptions = {},
   projectDirectory = null,
   radarDirectory = null,
+  radarOptions = {},
   appDataRoot = process.env.LOCALAPPDATA || path.join(os.homedir(), ".local", "share"),
   hosted = process.env.VITE_WORKBENCH_HOSTED === "true",
 } = {}) {
@@ -851,6 +855,11 @@ export function workbenchApiPlugin({
     .digest("hex");
   const workspaceRegistryDirectory = path.join(appDataRoot, "PersonalAIWorkbench");
   const registry = projectDirectory ? null : createWorkspaceRegistry({ directory: workspaceRegistryDirectory });
+  const radarMutable = !hosted && !projectReadOnly;
+  const createScheduler = radarOptions.createScheduler ?? createRadarScheduler;
+  const createCollector = radarOptions.createCollector ?? createRadarCollector;
+  const createGitHubClient = radarOptions.createGitHubClient ?? createGitHubRadarClient;
+  const radarNow = radarOptions.now ?? (() => new Date());
   let workspacePromise = null;
   async function currentWorkspace({ create = !projectReadOnly } = {}) {
     if (projectDirectory) {
@@ -915,6 +924,140 @@ export function workbenchApiPlugin({
     })();
     return radarRepositoryPromise;
   }
+  let radarContextPromise = null;
+  async function radarContext({ create = false } = {}) {
+    if (radarContextPromise) {
+      const existing = await radarContextPromise;
+      if (existing || !create) return existing;
+    }
+    const initializing = (async () => {
+      const workspace = await currentWorkspace({ create });
+      if (!workspace) return null;
+      const repository = await radarRepository();
+      const store = !registry ? repository : new Proxy({}, {
+        get(_target, property) {
+          return async (...args) => registry.withBoundWorkspace(
+            { fingerprint: vaultFingerprint, workspaceId: workspace.workspaceId },
+            () => repository[property](...args),
+          );
+        },
+      });
+      return { repository, store, workspace };
+    })();
+    radarContextPromise = initializing;
+    const context = await initializing;
+    if (!context && radarContextPromise === initializing) radarContextPromise = null;
+    return context;
+  }
+  let githubRadarClient = null;
+  function radarGithub() {
+    githubRadarClient ??= radarOptions.github ?? createGitHubClient({
+      token: process.env.WORKBENCH_GITHUB_TOKEN || null,
+      now: radarNow,
+    });
+    return githubRadarClient;
+  }
+  let radarLifecyclePromise = null;
+  async function radarLifecycle({ create = false } = {}) {
+    if (!radarMutable) return null;
+    if (radarLifecyclePromise) {
+      const existing = await radarLifecyclePromise;
+      if (existing || !create) return existing;
+    }
+    const initializing = (async () => {
+      const context = await radarContext({ create });
+      if (!context) return null;
+      let collector = null;
+      let collectorTimeZone = null;
+      const collect = async (input) => {
+        const currentSchedule = await context.store.getSchedule();
+        if (!collector || collectorTimeZone !== currentSchedule.timeZone) {
+          collectorTimeZone = currentSchedule.timeZone;
+          collector = createCollector({
+            github: radarGithub(),
+            repository: context.store,
+            now: radarNow,
+            timeZone: collectorTimeZone,
+          });
+        }
+        return collector.collect(input);
+      };
+      const scheduler = createScheduler({
+        collect,
+        store: context.store,
+        now: radarNow,
+        setTimeoutImpl: radarOptions.setTimeoutImpl,
+        clearTimeoutImpl: radarOptions.clearTimeoutImpl,
+      });
+      return { ...context, scheduler };
+    })();
+    radarLifecyclePromise = initializing;
+    const lifecycle = await initializing;
+    if (!lifecycle && radarLifecyclePromise === initializing) radarLifecyclePromise = null;
+    return lifecycle;
+  }
+  async function startRadarLifecycle() {
+    const lifecycle = await radarLifecycle();
+    if (lifecycle) await lifecycle.scheduler.start();
+  }
+  async function stopRadarLifecycle() {
+    const lifecycle = radarLifecyclePromise;
+    if (lifecycle) await (await lifecycle)?.scheduler.stop();
+  }
+  async function updateRadarSchedule(patch) {
+    if (!radarMutable) {
+      const error = new Error("AI Radar scheduling is unavailable in this workspace.");
+      error.code = "RADAR_READ_ONLY";
+      error.status = 403;
+      throw error;
+    }
+    const hadLifecycle = Boolean(radarLifecyclePromise);
+    const lifecycle = await radarLifecycle({ create: true });
+    if (!hadLifecycle) await lifecycle.scheduler.start();
+    const previous = await lifecycle.store.getSchedule();
+    const timeZoneChanged = patch?.timeZone !== undefined && patch.timeZone !== previous.timeZone;
+    if (!timeZoneChanged) {
+      const updated = await lifecycle.store.updateSchedule(patch);
+      await lifecycle.scheduler.refreshSchedule();
+      return updated;
+    }
+
+    await lifecycle.scheduler.stop();
+    let updated;
+    try {
+      updated = await lifecycle.store.updateSchedule(patch);
+    } catch (error) {
+      await lifecycle.scheduler.start();
+      throw error;
+    }
+    radarLifecyclePromise = null;
+    await startRadarLifecycle();
+    return updated;
+  }
+  const radarApi = Object.freeze({
+    capabilities: Object.freeze({ read: !hosted, collect: radarMutable, schedule: radarMutable }),
+    async getScheduler() {
+      const lifecycle = await radarLifecycle({ create: true });
+      return lifecycle?.scheduler ?? null;
+    },
+    async getStore({ create = false } = {}) {
+      return (await radarContext({ create }))?.store ?? null;
+    },
+    updateSchedule: updateRadarSchedule,
+  });
+  const workspaceRouteRegistry = registry && radarMutable ? Object.freeze({
+    ...registry,
+    async confirmRebind(options) {
+      const previousLifecycle = radarLifecyclePromise;
+      await stopRadarLifecycle();
+      try {
+        return await registry.confirmRebind(options);
+      } catch (error) {
+        if (previousLifecycle) await (await previousLifecycle)?.scheduler.start();
+        throw error;
+      }
+    },
+  }) : registry;
   const projects = new Proxy({}, {
     get(_target, property) {
       return async (...args) => {
@@ -954,7 +1097,7 @@ export function workbenchApiPlugin({
   }
   const workspaceRoutes = createWorkspaceRoutes({
     getBackup: workspaceBackup,
-    registry,
+    registry: workspaceRouteRegistry,
     currentFingerprint: vaultFingerprint,
     readOnly: projectReadOnly,
     hosted,
@@ -963,7 +1106,10 @@ export function workbenchApiPlugin({
       workspacePromise = null;
       projectRepositoryPromise = null;
       radarRepositoryPromise = null;
+      radarContextPromise = null;
+      radarLifecyclePromise = null;
       workspaceBackupPromise = null;
+      await startRadarLifecycle();
     },
   });
   const knowledge = createKnowledgeRoutes({ vaultRoot, getIndex: currentIndex, notifyPaths: (paths) => vaultSync.refresh({ reason: "knowledge-create", paths }), ...knowledgeOptions });
@@ -1126,7 +1272,9 @@ export function workbenchApiPlugin({
 
   return {
     name: "personal-kb-workbench-api",
+    api: Object.freeze({ radar: radarApi }),
     async closeBundle() {
+      await stopRadarLifecycle();
       await knowledge.close();
       await vaultSync.close();
       await readerExplanations.close?.();
@@ -1134,8 +1282,10 @@ export function workbenchApiPlugin({
     async configureServer(server) {
       vaultSync.attachWatcher(server.watcher);
       server.httpServer?.once("close", () => {
+        void stopRadarLifecycle();
         void vaultSync.close();
       });
+      await startRadarLifecycle();
       server.middlewares.use(async (req, res, next) => {
         const url = new URL(req.url || "/", "http://127.0.0.1");
         if (!url.pathname.startsWith("/api/")) return next();

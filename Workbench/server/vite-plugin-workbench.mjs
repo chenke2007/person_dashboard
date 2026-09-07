@@ -936,6 +936,7 @@ export function workbenchApiPlugin({
       const repository = await radarRepository();
       const store = !registry ? repository : new Proxy({}, {
         get(_target, property) {
+          if (property === "then") return undefined;
           return async (...args) => registry.withBoundWorkspace(
             { fingerprint: vaultFingerprint, workspaceId: workspace.workspaceId },
             () => repository[property](...args),
@@ -1011,13 +1012,12 @@ export function workbenchApiPlugin({
       error.status = 403;
       throw error;
     }
-    const hadLifecycle = Boolean(radarLifecyclePromise);
     const lifecycle = await radarLifecycle({ create: true });
-    if (!hadLifecycle) await lifecycle.scheduler.start();
     const previous = await lifecycle.store.getSchedule();
     const timeZoneChanged = patch?.timeZone !== undefined && patch.timeZone !== previous.timeZone;
     if (!timeZoneChanged) {
       const updated = await lifecycle.store.updateSchedule(patch);
+      await lifecycle.scheduler.start();
       await lifecycle.scheduler.refreshSchedule();
       return updated;
     }

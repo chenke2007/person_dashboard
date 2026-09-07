@@ -406,6 +406,80 @@ test("plugin schedule helper replaces the timezone-bound collector lifecycle", a
   assert.deepEqual(fixture.events.slice(0, 3), [["start", 0], ["stop", 0], ["start", 1]]);
 });
 
+test("manual lifecycle creation followed by same-timezone enable starts catch-up and a timer", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "workbench-radar-manual-enable-"));
+  const vaultRoot = path.join(root, "vault");
+  const appDataRoot = path.join(root, "app-data");
+  const timers = createTimers();
+  let discoveries = 0;
+  await mkdir(vaultRoot, { recursive: true });
+  const plugin = workbenchApiPlugin({
+    vaultRoot,
+    appDataRoot,
+    radarOptions: {
+      now: () => new Date("2026-09-02T23:00:00.000Z"),
+      setTimeoutImpl: timers.setTimeoutImpl,
+      clearTimeoutImpl: timers.clearTimeoutImpl,
+      github: {
+        async discoverCandidates() {
+          discoveries += 1;
+          return discoveries === 1
+            ? {
+                repositories: [],
+                errors: [{ fullName: null, code: "GITHUB_HTTP_ERROR", message: "GitHub request failed.", retryAt: null }],
+                partial: true,
+                retryAt: null,
+                truncated: false,
+              }
+            : { repositories: [], errors: [], partial: false, retryAt: null, truncated: false };
+        },
+        async getRepositories() {
+          return { repositories: [], errors: [], partial: false, retryAt: null, truncated: false };
+        },
+      },
+    },
+  });
+  await plugin.configureServer({
+    watcher: { on() {}, off() {} },
+    httpServer: null,
+    middlewares: { use() {} },
+    config: { logger: { error() {} } },
+  });
+  t.after(async () => {
+    await plugin.closeBundle();
+    await rm(root, { recursive: true, force: true });
+  });
+
+  // Anchor the schedule to a fixed zone so catch-up decisions never depend on the dev machine timezone.
+  const store = await plugin.api.radar.getStore({ create: true });
+  await store.updateSchedule({ timeZone: "Etc/UTC" });
+
+  const scheduler = await plugin.api.radar.getScheduler();
+  const manual = await scheduler.runNow();
+  assert.equal(manual.run.trigger, "manual");
+  assert.equal(manual.run.status, "failed");
+  assert.equal(timers.size, 0);
+
+  await plugin.api.radar.updateSchedule({ enabled: true });
+
+  const state = await store.getState();
+  assert.deepEqual(state.runs.map(({ trigger, status }) => ({ trigger, status })), [
+    { trigger: "manual", status: "failed" },
+    { trigger: "startup", status: "success" },
+  ]);
+  assert.equal(timers.size, 1);
+  assert.equal((await scheduler.getStatus()).nextRunAt, "2026-09-03T08:00:00.000Z");
+});
+
+test("radar store returned by getStore is not a thenable proxy", async (t) => {
+  const fixture = await pluginLifecycleFixture(t);
+
+  const store = await fixture.plugin.api.radar.getStore({ create: true });
+
+  assert.equal(typeof store.then, "undefined");
+  assert.equal(await store, store);
+});
+
 test("plugin stops the old scheduler before workspace rebind and starts a replacement", async (t) => {
   const fixture = await pluginLifecycleFixture(t);
   const registryDirectory = path.join(fixture.appDataRoot, "PersonalAIWorkbench");

@@ -57,6 +57,7 @@ import { createGitHubRadarClient } from "./ai-radar/github-client.mjs";
 import { createRadarCollector } from "./ai-radar/radar-collector.mjs";
 import { createRadarRepository } from "./ai-radar/radar-repository.mjs";
 import { createRadarScheduler } from "./ai-radar/radar-scheduler.mjs";
+import { createRadarRoutes } from "./ai-radar/radar-routes.mjs";
 import { createWorkspaceBackup } from "./workspace-state/workspace-backup.mjs";
 import { createWorkspaceRegistry } from "./workspace-state/workspace-registry.mjs";
 import { createWorkspaceRoutes } from "./workspace-state/workspace-routes.mjs";
@@ -1045,6 +1046,56 @@ export function workbenchApiPlugin({
     },
     updateSchedule: updateRadarSchedule,
   });
+  const radarRouteStore = async ({ create = false } = {}) => {
+    const store = await radarApi.getStore({ create });
+    if (!store) {
+      const error = new Error("AI 雷达当前不可用。");
+      error.code = "RADAR_UNAVAILABLE";
+      error.status = 404;
+      throw error;
+    }
+    return store;
+  };
+  const radarRoutes = createRadarRoutes({
+    readOnly: !radarMutable,
+    repository: {
+      async getDashboard(options) {
+        const store = await radarApi.getStore();
+        return store ? store.getDashboard(options) : null;
+      },
+      async setDecision(repositoryId, status) {
+        return (await radarRouteStore({ create: true })).setDecision(repositoryId, status);
+      },
+      async addPreference(input) {
+        return (await radarRouteStore({ create: true })).addPreference(input);
+      },
+      async revertPreference(id) {
+        return (await radarRouteStore({ create: true })).revertPreference(id);
+      },
+      async resetPreferences() {
+        return (await radarRouteStore({ create: true })).resetPreferences();
+      },
+    },
+    scheduler: {
+      async getStatus() {
+        const lifecycle = radarLifecyclePromise ? await radarLifecyclePromise : null;
+        return lifecycle ? lifecycle.scheduler.getStatus() : null;
+      },
+      async runNow() {
+        const lifecycle = await radarLifecycle({ create: true });
+        if (!lifecycle) {
+          const error = new Error("AI 雷达当前不可用。");
+          error.code = "RADAR_UNAVAILABLE";
+          error.status = 404;
+          throw error;
+        }
+        return lifecycle.scheduler.runNow();
+      },
+      async updateSchedule(patch) {
+        return updateRadarSchedule(patch);
+      },
+    },
+  });
   const workspaceRouteRegistry = registry && radarMutable ? Object.freeze({
     ...registry,
     async confirmRebind(options) {
@@ -1295,6 +1346,7 @@ export function workbenchApiPlugin({
           assertLocalMutationRequest(req);
           if (workspaceRoutes.matches(req, url)) return await workspaceRoutes.handle(req, res, url, json);
           if (projectRoutes.matches(req, url)) return await projectRoutes.handle(req, res, url);
+          if (radarRoutes.matches(req, url)) return await radarRoutes.handle(req, res, url);
           if (readOnly && (!['GET', 'HEAD'].includes(req.method) || /^\/api\/(?:wiki-ingest|workflows|reader-explanations)(?:\/|$)/.test(url.pathname))) {
             return json(res, 403, { error: { code: "VAULT_READ_ONLY", message: "当前知识库为只读接入，不允许写入、执行脚本或启动 AI 工作流。" } });
           }

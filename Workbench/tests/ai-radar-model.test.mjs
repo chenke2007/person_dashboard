@@ -1,8 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 
 import { projectRadarDashboard, RADAR_LISTS } from "../src/lib/ai-radar-model.js";
 import { rankRadar } from "../shared/ai-radar-ranking.mjs";
+import { createRadarRepository } from "../server/ai-radar/radar-repository.mjs";
 
 const RADAR_NOW = new Date("2026-09-02T12:00:00.000Z");
 
@@ -288,6 +292,53 @@ test("the model leaves real ranked payloads and entries untouched", () => {
   projectRadarDashboard(base, { period: "day", list: "established" });
 
   assert.deepEqual(base, original);
+});
+
+test("focus filtering applies before the view limit even when the input list exceeds it", () => {
+  // 12 entries, matches at positions 3 and 9 (past the day limit of 8):
+  // a truncate-then-filter implementation would drop the position-9 match.
+  const list = Array.from({ length: 12 }, (_, index) => {
+    const id = index + 1;
+    const matches = id === 3 || id === 9;
+    return risingEntry(id, { repository: repository(id, { focusAreas: matches ? ["agent"] : [], topics: [] }) });
+  });
+  const base = payload({ lists: { rising: list, established: [], relevant: [] } });
+
+  const agents = projectRadarDashboard(base, { period: "day", list: "rising", focus: "agent" });
+
+  assert.equal(agents.viewLimit, 8);
+  assert.deepEqual(agents.cards.map((card) => card.repositoryId), [3, 9]);
+});
+
+test("server dashboard filtering flows through to the model projection", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "workbench-radar-model-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const radar = createRadarRepository({ directory: path.join(root, "ai-radar"), timeZone: "Etc/UTC" });
+  const repositories = Array.from({ length: 9 }, (_, index) => {
+    const id = index + 1;
+    const topicInferred = id === 9;
+    return repository(id, {
+      focusAreas: topicInferred ? [] : ["agent"],
+      topics: topicInferred ? ["rag"] : [],
+      stars: 1000 - index,
+      fullName: `synthetic/repo-${id}`,
+      htmlUrl: `https://github.com/synthetic/repo-${id}`,
+      defaultBranch: null,
+      description: `Synthetic repository ${id}`,
+    });
+  });
+  await radar.upsertRepositories(repositories);
+
+  const filtered = await radar.getDashboard({ period: "day", focus: "rag-knowledge" });
+  assert.deepEqual(filtered.lists.rising.map((entry) => entry.repositoryId), [9]);
+
+  const view = projectRadarDashboard(filtered, { period: "day", list: "rising", focus: "rag-knowledge" });
+  assert.deepEqual(view.cards.map((card) => card.repositoryId), [9]);
+
+  const overview = await radar.getDashboard({ period: "day" });
+  const plain = projectRadarDashboard(overview, { period: "day", list: "rising" });
+  assert.equal(plain.cards.length, 8);
+  assert.deepEqual(plain.cards.map((card) => card.repositoryId), [1, 2, 3, 4, 5, 6, 7, 8]);
 });
 
 test("the view preserves local observation dates, coverage, stale/asOf, and counts", () => {

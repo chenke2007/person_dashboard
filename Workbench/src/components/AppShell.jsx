@@ -10,6 +10,7 @@ import {
   IconHome,
   IconLibrary,
   IconMenu2,
+  IconRadar,
   IconRadar2,
   IconSearch,
   IconSettings,
@@ -35,6 +36,7 @@ const primaryNavigation = [
     ? [{ to: "/social-insights", label: "社媒洞察", icon: IconSocial }]
     : []),
   ...(localWorkbench ? [{ to: "/projects", label: "项目", icon: IconBriefcase }] : []),
+  ...(localWorkbench ? [{ to: "/ai-radar", label: "AI 雷达", icon: IconRadar }] : []),
   { to: "/topics", label: "灵感库", icon: IconBulb },
   { to: "/content", label: "内容中心", icon: IconClipboardList },
   { to: "/douyin", label: "抖音数据", icon: IconBrandTiktok },

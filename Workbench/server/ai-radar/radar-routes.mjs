@@ -102,6 +102,10 @@ export function createRadarRoutes({ repository, scheduler, readOnly = false } = 
           return sendJson(res, 200, await repository.setDecision(Number(decision[1]), body.status));
         }
 
+        if (method === "GET" && route === "/preferences") {
+          return sendJson(res, 200, await repository.listPreferences());
+        }
+
         if (method === "POST" && route === "/preferences") {
           return sendJson(res, 201, await repository.addPreference(await bodyJson(req)));
         }

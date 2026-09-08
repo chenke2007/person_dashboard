@@ -455,6 +455,11 @@ export function createRadarRepository({ directory, now = () => new Date(), timeZ
         return store.preferences;
       });
     },
+    listPreferences() {
+      return mutate((store) => store.preferences
+        .filter((preference) => preference.revertedAt === null)
+        .sort((left, right) => right.createdAt.localeCompare(left.createdAt) || right.id.localeCompare(left.id)));
+    },
     async getSchedule() { return (await getState()).schedule; },
     updateSchedule(patch) {
       return mutate((store) => {

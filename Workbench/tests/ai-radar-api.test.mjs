@@ -52,6 +52,10 @@ function fakeRepository(overrides = {}) {
       calls.push(["resetPreferences"]);
       return [];
     },
+    async listPreferences() {
+      calls.push(["listPreferences"]);
+      return [];
+    },
   };
   return Object.assign(repository, overrides);
 }
@@ -348,6 +352,21 @@ test("read-only mode still serves reads", async () => {
   assert.equal(status.status, 200);
 });
 
+test("GET /api/ai-radar/preferences lists active reversible preferences", async () => {
+  const preferences = [
+    { id: "11111111-2222-4333-8444-555555555555", repositoryId: null, kind: "topic", value: "agents", direction: "less", createdAt: "2026-09-02T01:00:00.000Z", revertedAt: null },
+  ];
+  const calls = [];
+  const repository = fakeRepository({ listPreferences: async () => { calls.push("listPreferences"); return preferences; } });
+  const routes = routeFixture({ repository });
+
+  const response = await request(routes, "GET", "/api/ai-radar/preferences");
+
+  assert.equal(response.status, 200);
+  assert.deepEqual(response.body, preferences);
+  assert.deepEqual(calls, ["listPreferences"]);
+});
+
 test("unknown radar routes and method mismatches return 404", async () => {
   const routes = routeFixture();
 
@@ -610,6 +629,7 @@ test("radar browser client emits exact request methods, urls, and JSON bodies", 
   await api.collectRadar();
   await api.updateRadarSchedule({ enabled: true, time: "08:00", timeZone: "Etc/UTC" });
   await api.setRadarDecision(9876, "saved");
+  await api.loadRadarPreferences();
   await api.addRadarPreference({ repositoryId: null, kind: "topic", value: "agents", direction: "less" });
   await api.revertRadarPreference("11111111-2222-4333-8444-555555555555");
   await api.resetRadarPreferences();
@@ -625,6 +645,7 @@ test("radar browser client emits exact request methods, urls, and JSON bodies", 
     { url: "/api/ai-radar/collect", method: "POST", body: {} },
     { url: "/api/ai-radar/schedule", method: "PATCH", body: { enabled: true, time: "08:00", timeZone: "Etc/UTC" } },
     { url: "/api/ai-radar/repositories/9876/decision", method: "PUT", body: { status: "saved" } },
+    { url: "/api/ai-radar/preferences", method: "GET", body: undefined },
     { url: "/api/ai-radar/preferences", method: "POST", body: { repositoryId: null, kind: "topic", value: "agents", direction: "less" } },
     { url: "/api/ai-radar/preferences/11111111-2222-4333-8444-555555555555/revert", method: "POST", body: {} },
     { url: "/api/ai-radar/preferences", method: "DELETE", body: {} },

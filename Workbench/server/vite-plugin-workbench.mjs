@@ -1070,6 +1070,9 @@ export function workbenchApiPlugin({
       async resetPreferences() {
         return (await radarRouteStore({ create: true })).resetPreferences();
       },
+      async listPreferences() {
+        return (await radarRouteStore()).listPreferences();
+      },
     },
     scheduler: {
       async getStatus() {

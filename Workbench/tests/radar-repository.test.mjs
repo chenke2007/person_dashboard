@@ -190,6 +190,24 @@ test("records runs, sticky decision preservation, reversible preferences and val
   await assert.rejects(radar.addPreference({ repositoryId: 404, kind: "topic", value: "agents", direction: "more" }));
 });
 
+test("lists only active preferences newest first and drops reverted ones", async (t) => {
+  const root = await mkdtemp(path.join(await realpath(os.tmpdir()), "workbench-radar-pref-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  let tick = Date.parse(instant);
+  const radar = createRadarRepository({ directory: path.join(root, "ai-radar"), now: () => new Date((tick += 1000)), timeZone });
+  await radar.upsertRepositories([syntheticRepository()]);
+  const first = await radar.addPreference({ repositoryId: 101, kind: "topic", value: "agents", direction: "less" });
+  const second = await radar.addPreference({ repositoryId: 101, kind: "language", value: "JavaScript", direction: "less" });
+  const third = await radar.addPreference({ repositoryId: 101, kind: "topic", value: "rag", direction: "more" });
+  await radar.revertPreference(third.id);
+
+  const active = await radar.listPreferences();
+
+  assert.deepEqual(active.map((preference) => preference.id), [second.id, first.id]);
+  assert.ok(active.every((preference) => preference.revertedAt === null));
+  assert.equal(active.some((preference) => preference.id === third.id), false);
+});
+
 test("retention aggregates actual old observations but preserves saved history and the 400 day boundary", async (t) => {
   const { radar } = await fixture(t);
   await radar.upsertRepositories([syntheticRepository(), syntheticRepository(102)]);

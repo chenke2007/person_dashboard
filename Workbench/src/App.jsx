@@ -13,6 +13,7 @@ import { OverviewPage } from "./pages/OverviewPage";
 import { SystemPage } from "./pages/SystemPage";
 import { TopicsPage } from "./pages/TopicsPage";
 import { ProjectsPage } from "./pages/ProjectsPage";
+import { AiRadarPage } from "./pages/AiRadarPage";
 import { ProjectPage } from "./pages/ProjectPage";
 import { SocialInsightsPage, SocialTrendDetailPage } from "./pages/SocialInsightsPage";
 import { useVaultSync } from "./hooks/useVaultSync";
@@ -152,6 +153,7 @@ export function App() {
           <Route path="/system" element={<SystemPage />} />
           {localWorkbench ? <Route path="/projects" element={<ProjectsPage />} /> : null}
           {localWorkbench ? <Route path="/projects/:projectId" element={<ProjectPage onOpenDocument={openDocument} />} /> : null}
+{localWorkbench ? <Route path="/ai-radar" element={<AiRadarPage />} /> : null}
           <Route path="*" element={<Navigate replace to="/" />} />
         </Routes>
       </AppShell>

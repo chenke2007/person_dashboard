@@ -30,6 +30,9 @@ secrets.*.json
 *.sqlite3-*
 *.log
 
+# Vite cache and isolated browser-verification scratch (retained, never committed).
+.vite/
+
 Workbench/config/attention.local.json
 个人知识库/10_raw/my-thoughts/reading-notes/*
 !个人知识库/10_raw/my-thoughts/reading-notes/.gitkeep

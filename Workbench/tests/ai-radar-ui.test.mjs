@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { readFile } from "node:fs/promises";
 import { Window } from "happy-dom";
 import React from "react";
+import { renderToStaticMarkup } from "react-dom/server";
 
 const filename = fileURLToPath(new URL("./ai-radar-ui-render.cjs", import.meta.url));
 const result = await build({
@@ -134,6 +135,50 @@ pageCompiled.paths = Module._nodeModulePaths(fileURLToPath(new URL(".", import.m
 pageCompiled.require = createRequire(import.meta.url);
 pageCompiled._compile(pageBuild.outputFiles[0].text, pageFilename);
 
+// Mounted + static harness for the overview radar panel. Exposes the pure
+// projection, the presentational panel, and a self-loading wrapper (the hook
+// wired to the presentational component) so the independent load, failure
+// retention and retry can be verified under a controllable fetch.
+const overviewFilename = fileURLToPath(new URL("./ai-radar-ui-overview.cjs", import.meta.url));
+const overviewBuild = await build({
+  stdin: {
+    contents: `
+      import React from "react";
+      import { AiRadarOverview, projectRadarOverview, useRadarOverview } from "../src/components/ai-radar/AiRadarOverview";
+      export { AiRadarOverview, projectRadarOverview };
+      export function SelfOverview({ onOpenRadar }) {
+        const { model, loading, error, refreshError, retry } = useRadarOverview();
+        return React.createElement(AiRadarOverview, {
+          model, loading, error, refreshError,
+          onRetry: retry,
+          onOpenRadar: onOpenRadar || (() => {}),
+        });
+      }
+    `,
+    resolveDir: fileURLToPath(new URL(".", import.meta.url)),
+    loader: "jsx",
+  },
+  bundle: true,
+  platform: "node",
+  format: "cjs",
+  jsx: "automatic",
+  packages: "external",
+  plugins: [
+    {
+      name: "ignore-css",
+      setup(buildContext) {
+        buildContext.onLoad({ filter: /\.css$/ }, () => ({ contents: "", loader: "js" }));
+      },
+    },
+  ],
+  write: false,
+});
+const overviewCompiled = new Module(overviewFilename);
+overviewCompiled.filename = overviewFilename;
+overviewCompiled.paths = Module._nodeModulePaths(fileURLToPath(new URL(".", import.meta.url)));
+overviewCompiled.require = createRequire(import.meta.url);
+overviewCompiled._compile(overviewBuild.outputFiles[0].text, overviewFilename);
+
 const { MemoryRouter } = await import("react-router-dom");
 
 function deferred() {
@@ -233,6 +278,30 @@ async function mountStatus(t, statusOverride, extraProps = {}) {
   return { container, root, renderSchedule };
 }
 
+// Mounts the self-loading overview radar panel under a controllable fetch and
+// records every (path, method). Resolves like mountPage so overview requests
+// (and only reads) can be asserted.
+async function mountOverview(t, fetchImpl) {
+  const entries = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (path, options = {}) => {
+    entries.push({ path: String(path), method: options.method || "GET" });
+    return Promise.resolve(fetchImpl(String(path), options));
+  };
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root = createRoot(container);
+  await act(() => {
+    root.render(React.createElement(overviewCompiled.exports.SelfOverview));
+  });
+  t.after(() => {
+    act(() => root.unmount());
+    container.remove();
+    globalThis.fetch = originalFetch;
+  });
+  return { container, root, entries };
+}
+
 function card(overrides = {}) {
   return {
     repositoryId: 1,
@@ -300,6 +369,19 @@ function props(overrides = {}) {
 }
 
 const viewHtml = (overrides = {}) => compiled.exports.renderView(props(overrides));
+
+const overviewHtml = (model, extra = {}) =>
+  renderToStaticMarkup(
+    React.createElement(overviewCompiled.exports.AiRadarOverview, {
+      model,
+      loading: false,
+      error: null,
+      refreshError: null,
+      onRetry: () => {},
+      onOpenRadar: () => {},
+      ...extra,
+    }),
+  );
 
 test("radar page renders title, periods, lists and local observation optics", () => {
   const html = viewHtml();
@@ -1040,4 +1122,154 @@ test("server radar capability (WORKBENCH_PROJECTS_READ_ONLY) disables page mutat
   assert.doesNotMatch(container.textContent, /减少类似推荐/);
   assert.doesNotMatch(container.textContent, />撤销</);
   assert.doesNotMatch(container.textContent, />重置全部</);
+});
+
+// ---------------------------------------------------------------------------
+// Task 8 — Overview daily picks
+// ---------------------------------------------------------------------------
+function relevantEntry(id, fullName, patch = {}) {
+  return {
+    repositoryId: id,
+    repository: { fullName, htmlUrl: `https://github.com/${fullName}`, description: `Synthetic ${fullName}.`, language: "TypeScript", topics: ["agent"], license: "MIT", archived: false, fork: false, stars: 10 + id, pushedAt: null, updatedAt: null },
+    currentStars: 10 + id,
+    observedStarDelta: id,
+    status: "incomplete",
+    coverage: { observedDays: 1, expectedDays: 1, missingDays: 0, complete: true },
+    reasons: [`synthetic ${fullName}`],
+    decision: { status: "unread", updatedAt: null },
+    ...patch,
+  };
+}
+
+function relevantDashboard(count, { unread = count, stale = false } = {}) {
+  const relevant = Array.from({ length: count }, (_, i) => relevantEntry(i + 1, `synthetic/radar-${i + 1}`));
+  return {
+    period: "day",
+    timeZone: "Etc/UTC",
+    localDate: "2026-09-02",
+    filters: { state: "all", focus: "all" },
+    counts: { all: count, unread, saved: 0, summarized: 0, queued: 0, learning: 0, completed: 0, ignored: 0 },
+    eligibleCount: count,
+    lists: { rising: [], established: [], relevant },
+    freshness: { queriedAt: "2026-09-02T01:00:00.000Z", asOf: "2026-09-02T01:00:00.000Z", lastDataAt: "2026-09-02T01:00:00.000Z", lastSuccessAt: "2026-09-02T01:00:00.000Z", stale },
+    coverage: null,
+    retryAt: null,
+    errors: [],
+    run: null,
+    schedule: null,
+  };
+}
+
+test("overview projects at most three day/relevant picks preserving server order", () => {
+  const model = overviewCompiled.exports.projectRadarOverview(relevantDashboard(6));
+  assert.equal(model.cardCount, 3, "only three picks are projected");
+  assert.deepEqual(model.cards.map((c) => c.fullName), ["synthetic/radar-1", "synthetic/radar-2", "synthetic/radar-3"], "server order is kept and capped at three");
+  const html = overviewHtml(model);
+  assert.match(html, /synthetic\/radar-1/);
+  assert.match(html, /synthetic\/radar-3/);
+  assert.doesNotMatch(html, /synthetic\/radar-4/);
+});
+
+test("overview shows fewer than three picks at their actual count, never fabricated", () => {
+  const model = overviewCompiled.exports.projectRadarOverview(relevantDashboard(1));
+  assert.equal(model.cardCount, 1, "one pick stays one pick");
+  const html = overviewHtml(model);
+  assert.match(html, /synthetic\/radar-1/);
+  assert.doesNotMatch(html, /synthetic\/radar-2/);
+});
+
+test("overview empty state does not invent recommendations", () => {
+  const model = overviewCompiled.exports.projectRadarOverview(relevantDashboard(0));
+  assert.equal(model.empty, true);
+  const html = overviewHtml(model);
+  assert.match(html, /尚未积累/);
+  assert.doesNotMatch(html, /synthetic\/radar/);
+  assert.doesNotMatch(html, /repositoryId/);
+  assert.doesNotMatch(html, /collection-empty">[\s\S]*synthetic/);
+});
+
+test("overview shows unread count, update time and a /ai-radar entry point", () => {
+  const model = overviewCompiled.exports.projectRadarOverview(relevantDashboard(3, { unread: 5 }));
+  assert.equal(model.unreadCount, 5);
+  const html = overviewHtml(model);
+  assert.match(html, /5 条未处理/);
+  assert.match(html, /查看完整雷达/);
+  assert.match(html, /更新于/);
+});
+
+test("overview only reads radar over GET and never triggers collection", async (t) => {
+  const dash = deferred();
+  const { entries } = await mountOverview(t, (path) => {
+    if (path === "/api/ai-radar?period=day") return dash.promise;
+    return jsonResponse({});
+  });
+  await act(async () => { dash.resolve(jsonResponse(relevantDashboard(2))); });
+  await settle();
+  assert.ok(entries.length >= 1, "the overview issues a radar read");
+  let radarFetch = 0;
+  for (const entry of entries) {
+    assert.equal(entry.method, "GET", "overview must be read-only");
+    if (entry.path.startsWith("/api/ai-radar")) radarFetch++;
+  }
+  assert.equal(radarFetch, 1, "one day/relevant read, no collect/schedule mutations");
+});
+
+test("overview keeps old picks when a refresh fails, flags them stale and recovers on retry", async (t) => {
+  const deferreds = [deferred(), deferred(), deferred()];
+  let fetchCount = 0;
+  const { container } = await mountOverview(t, (path) => {
+    if (path === "/api/ai-radar?period=day") {
+      const idx = fetchCount;
+      fetchCount += 1;
+      return (deferreds[idx] ??= deferred()).promise;
+    }
+    return jsonResponse({});
+  });
+
+  // Initial load succeeds with three picks, no error.
+  await act(async () => { deferreds[0].resolve(jsonResponse(relevantDashboard(3))); });
+  await settle();
+  assert.match(container.textContent, /synthetic\/radar-1/, "initial picks render");
+  assert.doesNotMatch(container.textContent, /刷新失败|雷达数据加载失败/);
+
+  // A refresh (visibility change) re-fetches and fails; old picks must remain.
+  await act(async () => { document.dispatchEvent(new Event("visibilitychange")); });
+  await act(async () => { deferreds[1].reject(new Error("radar down")); });
+  await settle();
+
+  assert.match(container.textContent, /synthetic\/radar-1/, "old picks remain after a refresh failure");
+  assert.match(container.textContent, /刷新失败/, "a refresh failure is surfaced");
+  assert.match(container.textContent, /radar down/, "the failure reason is surfaced");
+  assert.match(container.textContent, /可能不是最新/, "retained data is flagged stale");
+  const retryBtn = [...container.querySelectorAll("button")].find((b) => b.textContent === "重试");
+  assert.ok(retryBtn, "a retry action is available on refresh failure");
+
+  // Retry reloads successfully and clears the error while picks stay visible.
+  await act(() => retryBtn.click());
+  await act(async () => { deferreds[2].resolve(jsonResponse(relevantDashboard(2, { unread: 2 }))); });
+  await settle();
+  assert.doesNotMatch(container.textContent, /刷新失败|radar down/, "a successful retry clears the refresh error");
+  assert.match(container.textContent, /synthetic\/radar-1/, "picks reload after retry");
+});
+
+test("a failed first load of the overview radar is an explicit error, not a fake kept state", async (t) => {
+  const fail = deferred();
+  const { container } = await mountOverview(t, (path) => {
+    if (path === "/api/ai-radar?period=day") return fail.promise;
+    return jsonResponse({});
+  });
+  await act(async () => { fail.reject(new Error("radar unavailable")); });
+  await settle();
+
+  assert.match(container.textContent, /雷达数据加载失败/, "the first-load failure is explicit");
+  assert.match(container.textContent, /radar unavailable/, "the reason is surfaced");
+  assert.doesNotMatch(container.textContent, /正在显示上次成功数据/, "no kept data claim when nothing was ever loaded");
+  assert.ok([...container.querySelectorAll("button")].some((b) => b.textContent === "重试"), "retry is available on first-load failure");
+});
+
+test("overview radar panel is gated behind the local workbench build", async () => {
+  const source = await readFile(new URL("../src/pages/OverviewPage.jsx", import.meta.url), "utf8");
+  assert.match(source, /localWorkbench\s*=\s*import\.meta\.env\.VITE_WORKBENCH_HOSTED\s*!==\s*"true"/);
+  assert.match(source, /\{localWorkbench \?\s*\(?[\s\S]*?<AiRadarOverview/);
+  assert.match(source, /useRadarOverview\(\)/);
 });

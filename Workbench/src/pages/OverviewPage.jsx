@@ -8,6 +8,10 @@ import { KnowledgeGraph } from "../components/KnowledgeGraph";
 import { MetricStat } from "../components/MetricStat";
 import { loadGraph, loadOverview } from "../lib/api";
 import { formatCompactDate } from "../lib/format";
+import { AiRadarOverview, useRadarOverview } from "../components/ai-radar/AiRadarOverview";
+import "../components/ai-radar/ai-radar.css";
+
+const localWorkbench = import.meta.env.VITE_WORKBENCH_HOSTED !== "true";
 
 const prefersReducedMotion = () =>
   typeof window !== "undefined" &&
@@ -32,6 +36,13 @@ export function OverviewPage({ onOpenDocument }) {
   const [overview, setOverview] = useState(null);
   const [graph, setGraph] = useState(null);
   const rootRef = useRef(null);
+  const {
+    model: radarModel,
+    loading: radarLoading,
+    error: radarError,
+    refreshError: radarRefreshError,
+    retry: retryRadar,
+  } = useRadarOverview();
 
   useEffect(() => {
     let cancelled = false;
@@ -226,6 +237,16 @@ export function OverviewPage({ onOpenDocument }) {
               )}
             </div>
           </section>
+        {localWorkbench ? (
+          <AiRadarOverview
+            model={radarModel}
+            loading={radarLoading}
+            error={radarError}
+            refreshError={radarRefreshError}
+            onOpenRadar={() => navigate("/ai-radar")}
+            onRetry={retryRadar}
+          />
+        ) : null}
         </div>
 
         <div className="overview-stack">

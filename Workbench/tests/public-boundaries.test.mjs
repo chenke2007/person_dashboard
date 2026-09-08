@@ -42,3 +42,18 @@ test("demo mode only activates through the explicit marker", async (t) => {
   );
   assert.equal((await buildVaultIndex(vaultRoot)).demoMode, true);
 });
+
+test("the overview radar panel is gated behind the local workbench build and never mutates", async (t) => {
+  const source = await fs.readFile(
+    path.join(import.meta.dirname, "../src/pages/OverviewPage.jsx"),
+    "utf8",
+  );
+  // The panel is only rendered for the local workbench build; a hosted build
+  // (VITE_WORKBENCH_HOSTED === "true") must not surface it.
+  assert.match(source, /localWorkbench = import\.meta\.env\.VITE_WORKBENCH_HOSTED !== "true"/, "hosted detection is wired");
+  assert.match(source, /\{\s*localWorkbench \?\s*\(?[\s\S]*?<AiRadarOverview/, "the radar panel is gated behind localWorkbench");
+  assert.match(source, /useRadarOverview\(\)/, "the overview wires the read-only radar hook");
+  // Opening the overview only reads radar; it never triggers collection or
+  // schedules work, so it cannot create scheduler tasks or mutate state.
+  assert.doesNotMatch(source, /collectRadar|updateRadarSchedule|setRadarDecision|revertRadarPreference|resetRadarPreferences/, "the overview issues no radar mutation");
+});

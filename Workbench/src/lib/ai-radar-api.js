@@ -40,10 +40,22 @@ export function describeRadarCollectResult(result) {
   };
 
   if (result?.persisted === true) {
+    // Only an explicit success run is a clean success. The collector can
+    // durably commit a run whose status is still "failed" or "partial", so the
+    // persisted flag alone must never be read as success.
+    if (result?.run?.status === "success") {
+      return { level: "success", message: "采集完成，数据已保存。" };
+    }
     if (result?.run?.status === "partial") {
       return { level: "partial", message: "部分成功：部分仓库未能采集，其余结果已保存。" };
     }
-    return { level: "success", message: "采集完成，数据已保存。" };
+    // Persisted but failed, or a missing/unknown run status: do not claim
+    // success. Surface the recorded error when present.
+    const failure = safeError(result?.error) || safeError(result?.run?.errors?.[0]);
+    if (failure) {
+      return { level: "failed", message: `采集失败：${failure}` };
+    }
+    return { level: "failed", message: "采集结果不完整，数据未能全部保存。" };
   }
 
   // Not persisted. The run recorded a completed-but-unpersisted failure, the

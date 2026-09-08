@@ -62,7 +62,7 @@ export function formatRadarError(error) {
   return null;
 }
 
-export function AiRadarStatus({ status, schedule, stale, readOnly, busy, actionErrors, actions, collectFeedback }) {
+export function AiRadarStatus({ status, schedule, stale, readOnly, busy, actionErrors, actions, collectFeedback, statusError, onRetryStatus }) {
   const timeZone = (schedule?.timeZone ?? prefixedZone()) || "UTC";
   const zones = new Set(RADAR_TIME_ZONES);
   if (timeZone) zones.add(timeZone);
@@ -70,7 +70,7 @@ export function AiRadarStatus({ status, schedule, stale, readOnly, busy, actionE
   const collectBusy = Boolean(busy?.collect);
   const collectError = actionErrors?.collect ?? null;
   const saveError = actionErrors?.save ?? null;
-  const statusError = formatRadarError(status?.error);
+  const statusScheduleError = formatRadarError(status?.error);
 
   const handleSave = async (event) => {
     event.preventDefault();
@@ -88,10 +88,18 @@ export function AiRadarStatus({ status, schedule, stale, readOnly, busy, actionE
         <span className={`radar-status__dot radar-status__dot--${status?.running ? "running" : "idle"}`} aria-hidden="true" />
         {status?.running ? <b>采集中</b> : <span>空闲</span>}
         <span className="radar-status__meta">上次成功：{status?.lastSuccessAt ? formatRadarTime(status.lastSuccessAt, timeZone) : "尚未成功采集"}</span>
-        {statusError ? <span className="radar-status__error">调度错误：{statusError}</span> : null}
+        {statusScheduleError ? <span className="radar-status__error">调度错误：{statusScheduleError}</span> : null}
       </div>
       {stale ? (
         <p className="radar-status__stale" role="status">数据可能不是最新，请稍后手动采集或等待下次调度。</p>
+      ) : null}
+      {statusError ? (
+        <div className="radar-message radar-message--error" role="alert">
+          <p>状态刷新失败：{statusError}，正在显示上次成功状态。</p>
+          {onRetryStatus ? (
+            <button onClick={() => onRetryStatus()} type="button">重试状态</button>
+          ) : null}
+        </div>
       ) : null}
       <form
         className="radar-settings"

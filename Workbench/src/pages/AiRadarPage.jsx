@@ -76,6 +76,10 @@ export function AiRadarView({
   loading,
   error,
   stale,
+  refreshError,
+  capabilitiesError,
+  statusError,
+  preferencesError,
   status,
   schedule,
   preferences,
@@ -93,15 +97,25 @@ export function AiRadarView({
         title="AI 雷达"
         description="发现值得关注的 AI 项目，用本地观测与现有命令形成可解释的日、周、月榜单。"
       />
+      {capabilitiesError ? (
+        <div className="radar-message radar-message--error" role="alert">
+          <p>无法确认雷达权限：{capabilitiesError}。已停用修改操作以保安全。</p>
+          {actions?.onRetryCapabilities ? (
+            <button onClick={() => actions.onRetryCapabilities()} type="button">重试</button>
+          ) : null}
+        </div>
+      ) : null}
       <AiRadarStatus
         actionErrors={actionErrors}
         actions={actions}
         busy={busy}
         collectFeedback={collectFeedback}
+        onRetryStatus={actions?.onRetryAux}
         readOnly={readOnly}
         schedule={schedule}
         stale={stale}
         status={status}
+        statusError={statusError}
       />
       <AiRadarFilters filter={filter} onChangeFilter={onChangeFilter} />
       {error ? (
@@ -119,6 +133,14 @@ export function AiRadarView({
         <div className="radar-empty">
           <h2>当前筛选下暂无雷达记录</h2>
           <p>本地观测仍在积累时不会编造数据；可稍后查看，或调整周期、状态与方向筛选。</p>
+        </div>
+      ) : null}
+      {refreshError ? (
+        <div className="radar-message radar-message--error" role="alert">
+          <p>榜单刷新失败：{refreshError}，正在显示上次成功数据。</p>
+          {actions?.onRetry ? (
+            <button onClick={() => actions.onRetry()} type="button">重试</button>
+          ) : null}
         </div>
       ) : null}
       {!error && cards.length ? (
@@ -147,7 +169,14 @@ export function AiRadarView({
             ) : null}
           </header>
           {actionErrors?.reset ? <p className="radar-card__error" role="alert">{actionErrors.reset}</p> : null}
-          {preferences?.length ? (
+          {preferencesError ? (
+            <div className="radar-message radar-message--error" role="alert">
+              <p>推荐偏好读取失败：{preferencesError}，正在显示上次成功数据。</p>
+              {actions?.onRetryAux ? (
+                <button onClick={() => actions.onRetryAux()} type="button">重试</button>
+              ) : null}
+            </div>
+          ) : preferences?.length ? (
             <ul className="radar-preferences__list">
               {preferences.map((preference) => {
                 const kindLabel = KIND_LABELS[preference.kind] ?? preference.kind;
@@ -181,20 +210,28 @@ export function AiRadarView({
 
 export function AiRadarPage() {
   const [radarCapabilities, setRadarCapabilities] = useState(null);
-  // Radar mutation capability comes from the server (collect/schedule), which
-  // is independent of Vault read-only. Fall back to the build-time Vault flag
-  // until the capability response arrives; the server remains the arbiter.
-  const radarReadOnly = radarCapabilities ? radarCapabilities.collect !== true : import.meta.env.VITE_WORKBENCH_READ_ONLY === "true";
-  useEffect(() => {
-    loadRadarCapabilities().then((body) => setRadarCapabilities(body?.capabilities ?? null)).catch(() => {});
+  const [capabilitiesError, setCapabilitiesError] = useState(null);
+  // Radar mutation capability comes from the server (collect/schedule), which is
+  // independent of Vault read-only. While capabilities are pending or failed, the
+  // page stays conservative (read-only) — a failed/pending capability request must
+  // never fall back to writable. The server remains the arbiter.
+  const radarReadOnly = radarCapabilities ? radarCapabilities.collect !== true : true;
+  const loadCaps = useCallback(() => {
+    loadRadarCapabilities()
+      .then((body) => { setRadarCapabilities(body?.capabilities ?? null); setCapabilitiesError(null); })
+      .catch((error) => setCapabilitiesError(error?.message ?? "无法读取雷达权限信息"));
   }, []);
+  useEffect(() => { void loadCaps(); }, [loadCaps]);
   const [searchParams, setSearchParams] = useSearchParams();
   const filter = useMemo(() => radarFilterFromSearch(searchParams), [searchParams]);
   const [dashboard, setDashboard] = useState(null);
   const [dashboardError, setDashboardError] = useState(null);
+  const [refreshError, setRefreshError] = useState(null);
   const [loading, setLoading] = useState(true);
   const [status, setStatus] = useState(null);
+  const [statusError, setStatusError] = useState(null);
   const [preferences, setPreferences] = useState([]);
+  const [preferencesError, setPreferencesError] = useState(null);
   const [busy, setBusy] = useState({ collect: false, save: false, decision: null, lessLike: null, revert: null, reset: false });
   const [actionErrors, setActionErrors] = useState({ collect: null, save: null, decision: {}, lessLike: {}, revert: {}, reset: null });
   const [collectFeedback, setCollectFeedback] = useState(null);
@@ -202,11 +239,35 @@ export function AiRadarPage() {
   useEffect(() => { filterRef.current = filter; }, [filter]);
   const loaderRef = useRef(null);
   const [dashboardQuery, setDashboardQuery] = useState(null);
+  const dashboardQueryRef = useRef(null);
 
   const applyDashboard = useCallback((value, error, query) => {
+    const q = query ?? null;
+    if (error) {
+      // A failed query whose data we never displayed (initial load with no
+      // cache, or a different filter than the board on screen) is a fatal
+      // error. A failed *refresh of the currently displayed filter* must keep
+      // the last good board and only surface a refresh error + stale marker.
+      const current = dashboardQueryRef.current;
+      const matchesCurrent = Boolean(current) && current.period === q?.period && current.state === q?.state && current.focus === q?.focus;
+      if (matchesCurrent) {
+        setRefreshError(error.message);
+        setLoading(false);
+        return;
+      }
+      setDashboard(null);
+      setDashboardQuery(null);
+      dashboardQueryRef.current = null;
+      setDashboardError(error.message);
+      setRefreshError(null);
+      setLoading(false);
+      return;
+    }
     setDashboard(value);
-    setDashboardQuery(query ?? null);
-    setDashboardError(error ? error.message : null);
+    setDashboardQuery(q);
+    dashboardQueryRef.current = q;
+    setDashboardError(null);
+    setRefreshError(null);
     setLoading(false);
   }, []);
 
@@ -222,8 +283,12 @@ export function AiRadarPage() {
   }, [reloadFor, filter.period, filter.state, filter.focus]);
 
   const refreshExtras = useCallback(() => Promise.all([
-    loadRadarStatus().then(setStatus).catch(() => {}),
-    loadRadarPreferences().then(setPreferences).catch(() => {}),
+    loadRadarStatus()
+      .then((body) => { setStatus(body); setStatusError(null); })
+      .catch((error) => setStatusError(error?.message ?? "状态读取失败")),
+    loadRadarPreferences()
+      .then((body) => { setPreferences(body); setPreferencesError(null); })
+      .catch((error) => setPreferencesError(error?.message ?? "偏好读取失败")),
   ]), []);
   useEffect(() => { void refreshExtras(); }, [refreshExtras]);
 
@@ -248,7 +313,7 @@ export function AiRadarPage() {
     () => (currentDashboard ? projectRadarDashboard(currentDashboard, { period: filter.period, list: filter.list, state: filter.state, focus: filter.focus }) : null),
     [currentDashboard, filter],
   );
-  const stale = currentDashboard?.freshness?.stale === true;
+  const stale = currentDashboard?.freshness?.stale === true || Boolean(refreshError);
   const schedule = dashboard?.schedule ?? null;
 
   const onChangeFilter = useCallback((patch) => {
@@ -362,23 +427,29 @@ export function AiRadarPage() {
     onResetPreferences,
     onUpdateSchedule,
     onRetry: retry,
-  }), [onCollect, onDecide, onLessLike, onRevertPreference, onResetPreferences, onUpdateSchedule, retry]);
+    onRetryCapabilities: loadCaps,
+    onRetryAux: refreshExtras,
+  }), [onCollect, onDecide, onLessLike, onRevertPreference, onResetPreferences, onUpdateSchedule, retry, loadCaps, refreshExtras]);
 
   return (
     <AiRadarView
       actionErrors={actionErrors}
       actions={actions}
       busy={busy}
+      capabilitiesError={capabilitiesError}
       collectFeedback={collectFeedback}
       error={dashboardError}
       filter={filter}
       loading={loading}
       onChangeFilter={onChangeFilter}
       preferences={preferences}
+      preferencesError={preferencesError}
       readOnly={radarReadOnly}
+      refreshError={refreshError}
       schedule={schedule}
       stale={stale}
       status={status}
+      statusError={statusError}
       view={view}
     />
   );

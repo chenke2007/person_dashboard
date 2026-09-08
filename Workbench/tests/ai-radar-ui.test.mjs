@@ -545,6 +545,7 @@ test("schedule error falls back to code when message is absent", async (t) => {
 test("collect result distinguishes success, partial, failed and not-persisted outcomes", async () => {
   const { describeRadarCollectResult } = await import("../src/lib/ai-radar-api.js");
 
+  // Only persisted:true with an explicit success run is a clean success.
   assert.deepEqual(describeRadarCollectResult({ persisted: true, run: { status: "success" } }), { level: "success", message: "采集完成，数据已保存。" });
   assert.deepEqual(describeRadarCollectResult({ persisted: true, run: { status: "partial" } }), { level: "partial", message: "部分成功：部分仓库未能采集，其余结果已保存。" });
 
@@ -556,6 +557,57 @@ test("collect result distinguishes success, partial, failed and not-persisted ou
   assert.deepEqual(describeRadarCollectResult({ persisted: false, run: { status: "skipped", errors: [{ code: "RADAR_COOLDOWN", message: "cooldown" }] } }), { level: "failed", message: "采集被暂缓：cooldown" });
   // Not persisted with no error shape at all.
   assert.deepEqual(describeRadarCollectResult({ persisted: false, run: null, error: null }), { level: "failed", message: "采集失败，数据未能保存。" });
+});
+
+test("collect result treats a persisted run marked failed as failure, never fake success", async () => {
+  const { describeRadarCollectResult } = await import("../src/lib/ai-radar-api.js");
+
+  // The collector can durably commit a run whose status is still "failed"
+  // (all requests failed / nothing observed), and the routes forward
+  // persisted:true together with that failed run. A persisted flag alone must
+  // not be read as success.
+  const failed = describeRadarCollectResult({
+    persisted: true,
+    run: {
+      status: "failed",
+      repositoryCount: 0,
+      errors: [{ code: "RADAR_DETAIL_FAILED", message: "rate limited" }],
+    },
+  });
+  assert.equal(failed.level, "failed");
+  assert.match(failed.message, /采集失败/);
+  assert.match(failed.message, /rate limited/);
+
+  // Persisted with a missing/unknown run status cannot claim success either.
+  const unknown = describeRadarCollectResult({ persisted: true, run: null });
+  assert.equal(unknown.level, "failed");
+  assert.deepEqual(describeRadarCollectResult({ persisted: true }), { level: "failed", message: "采集结果不完整，数据未能全部保存。" });
+});
+
+test("collect result interprets the real collector failure shape the routes forward", async () => {
+  // The collect endpoint answers 200 forwarding the collector result verbatim.
+  // This mirrors the collector total-failure path: commit succeeds but zero
+  // items were observed, so run.status is "failed" with persisted:true.
+  const { describeRadarCollectResult } = await import("../src/lib/ai-radar-api.js");
+  const real = describeRadarCollectResult({
+    persisted: true,
+    run: {
+      id: "00000000-0000-4000-8000-000000000002",
+      trigger: "manual",
+      startedAt: "2026-09-02T01:00:00.000Z",
+      finishedAt: "2026-09-02T01:00:01.000Z",
+      status: "failed",
+      localDate: "2026-09-02",
+      timeZone: "Etc/UTC",
+      repositoryCount: 0,
+      errors: [{ code: "RADAR_DISCOVERY_FAILED", message: "discovery down" }],
+      sequence: 1,
+      collection: null,
+    },
+  });
+  assert.equal(real.level, "failed");
+  assert.match(real.message, /采集失败/);
+  assert.match(real.message, /discovery down/);
 });
 
 test("collect failure feedback renders and the page stays operable", async (t) => {
@@ -589,6 +641,7 @@ test("collection completion refreshes the current filter, never the stale one; o
   const collect = deferred();
 
   const { container, entries, clickTab } = await mountPage(t, (path, options) => {
+    if (path === "/api/ai-radar/capabilities") return jsonResponse({ capabilities: { read: true, collect: true, schedule: true } });
     if (path === "/api/ai-radar/status") return jsonResponse({ running: false, lastAttemptAt: null, lastSuccessAt: null, nextRunAt: null, error: null });
     if (path === "/api/ai-radar/preferences") return jsonResponse([]);
     if (path === "/api/ai-radar/collect") return collect.promise;
@@ -610,21 +663,21 @@ test("collection completion refreshes the current filter, never the stale one; o
   await clickTab("每周");
 
   // B's dashboard request resolves with B data.
-  weekDashB(0).resolve(jsonResponse(radarDashboard({ period: "week", marker: "weekrepo" })));
+  await act(async () => { weekDashB(0).resolve(jsonResponse(radarDashboard({ period: "week", marker: "weekrepo" }))); });
   await settle();
   assert.match(container.textContent, /weekrepo/);
   assert.doesNotMatch(container.textContent, /dayrepo/);
 
   // Collection ends with HTTP 200 success. The page must refresh the *current*
   // filter (week), issuing a fresh week dashboard request, not a stale day one.
-  collect.resolve(jsonResponse({ persisted: true, run: { status: "success" }, error: null }));
+  await act(async () => { collect.resolve(jsonResponse({ persisted: true, run: { status: "success" }, error: null })); });
   await settle();
   assert.ok(weekFetchCount >= 2, `expected a post-collect week refresh, got ${weekFetchCount} week fetches`);
 
   // The late stale A (day) response must never overwrite B.
-  weekDashB(1).resolve(jsonResponse(radarDashboard({ period: "week", marker: "weekrepo" })));
+  await act(async () => { weekDashB(1).resolve(jsonResponse(radarDashboard({ period: "week", marker: "weekrepo" }))); });
   await settle();
-  dayDash.resolve(jsonResponse(radarDashboard({ period: "day", marker: "dayrepo" })));
+  await act(async () => { dayDash.resolve(jsonResponse(radarDashboard({ period: "day", marker: "dayrepo" }))); });
   await settle();
 
   // Final URL stays on week, and the visible card is B's, never A's.
@@ -648,7 +701,7 @@ test("pending filter change never shows the previous period's data under the new
   });
 
   // A (day) loads and renders.
-  dayDash.resolve(jsonResponse(radarDashboard({ period: "day", marker: "dayrepo" })));
+  await act(async () => { dayDash.resolve(jsonResponse(radarDashboard({ period: "day", marker: "dayrepo" }))); });
   await settle();
   assert.match(container.textContent, /dayrepo/);
 
@@ -659,10 +712,192 @@ test("pending filter change never shows the previous period's data under the new
   assert.doesNotMatch(container.textContent, /weekrepo/);
 
   // Once B arrives, only B shows.
-  weekDash.resolve(jsonResponse(radarDashboard({ period: "week", marker: "weekrepo" })));
+  await act(async () => { weekDash.resolve(jsonResponse(radarDashboard({ period: "week", marker: "weekrepo" }))); });
   await settle();
   assert.match(container.textContent, /weekrepo/);
   assert.doesNotMatch(container.textContent, /dayrepo/);
+});
+
+test("refreshing the same filter on failure keeps the last board, flags it stale and recovers on retry", async (t) => {
+  // A same-filter refresh (e.g. after a mutation) can fail while old data still
+  // exists. The board must survive, showing a refresh error, a stale marker and
+  // a working retry — never a blank page pretending nothing went wrong.
+  const dayDash = [deferred(), deferred(), deferred()];
+  let dayFetchCount = 0;
+  const collect = deferred();
+  const { container } = await mountPage(t, (path, options) => {
+    if (path === "/api/ai-radar/capabilities") return jsonResponse({ capabilities: { read: true, collect: true, schedule: true } });
+    if (path === "/api/ai-radar/status") return jsonResponse({ running: false, lastAttemptAt: null, lastSuccessAt: null, nextRunAt: null, error: null });
+    if (path === "/api/ai-radar/preferences") return jsonResponse([]);
+    if (path === "/api/ai-radar/collect") return collect.promise;
+    if (path === "/api/ai-radar?period=day") {
+      const index = dayFetchCount;
+      dayFetchCount += 1;
+      return (dayDash[index] ??= deferred()).promise;
+    }
+    return jsonResponse({});
+  });
+
+  // Initial load succeeds and renders the board.
+  await act(async () => { dayDash[0].resolve(jsonResponse(radarDashboard({ period: "day", marker: "dayrepo" }))); });
+  await settle();
+  assert.match(container.textContent, /dayrepo/);
+
+  // A mutation (collect) triggers a same-filter refresh, which then fails.
+  await act(() => { [...container.querySelectorAll("button")].find((b) => b.textContent === "立即采集").click(); });
+  await act(async () => { collect.resolve(jsonResponse({ persisted: true, run: { status: "success" }, error: null })); });
+  await settle();
+  await act(async () => { dayDash[1].reject(new Error("dashboard down")); });
+  await settle();
+
+  // The last good board stays visible; the failure is surfaced, not swallowed.
+  assert.match(container.textContent, /dayrepo/, "old board must remain after a same-filter refresh failure");
+  assert.match(container.textContent, /刷新失败/, "a refresh failure must not be hidden");
+  assert.match(container.textContent, /可能不是最新/, "kept data must be flagged as stale");
+  const refreshRetry = [...container.querySelectorAll("button")].find((b) => b.textContent === "重试");
+  assert.ok(refreshRetry, "a retry action must be available on refresh failure");
+
+  // Retry reloads the same filter successfully and clears the refresh error.
+  await act(async () => { dayDash[2].resolve(jsonResponse(radarDashboard({ period: "day", marker: "dayrepo2" }))); });
+  await act(() => refreshRetry.click());
+  await settle();
+  assert.doesNotMatch(container.textContent, /刷新失败/, "a successful retry clears the refresh error");
+  assert.match(container.textContent, /dayrepo2/, "retry renders the freshly loaded board");
+});
+
+test("a failed first load with no cached board is a fatal error, not kept data", async (t) => {
+  // When the very first load for the current filter fails with no cached board,
+  // it must be a clear fatal empty state — not a silent wait or stale reuse.
+  const dayDash = deferred();
+  const { container } = await mountPage(t, (path, options) => {
+    if (path === "/api/ai-radar/capabilities") return jsonResponse({ capabilities: { read: true, collect: true, schedule: true } });
+    if (path === "/api/ai-radar/status") return jsonResponse({ running: false, lastAttemptAt: null, lastSuccessAt: null, nextRunAt: null, error: null });
+    if (path === "/api/ai-radar/preferences") return jsonResponse([]);
+    if (path === "/api/ai-radar?period=day") return dayDash.promise;
+    return jsonResponse({});
+  });
+
+  await act(async () => { dayDash.reject(new Error("radar unavailable")); });
+  await settle();
+  assert.match(container.textContent, /加载失败/);
+  assert.match(container.textContent, /radar unavailable/);
+  assert.ok([...container.querySelectorAll("button")].some((b) => b.textContent === "重试"), "retry must be available on a fatal load failure");
+});
+
+test("status refresh failure keeps the last status, surfaces an error with retry and recovers", async (t) => {
+  let statusCount = 0;
+  const dayDash = deferred();
+  const collect = deferred();
+  const prefDash = deferred();
+  const { container } = await mountPage(t, (path, options) => {
+    if (path === "/api/ai-radar/capabilities") return jsonResponse({ capabilities: { read: true, collect: true, schedule: true } });
+    if (path === "/api/ai-radar/status") {
+      statusCount += 1;
+      if (statusCount === 1) return jsonResponse({ running: false, lastAttemptAt: null, lastSuccessAt: "2026-09-02T01:00:00.000Z", nextRunAt: null, error: null });
+      return Promise.reject(new Error("status down"));
+    }
+    if (path === "/api/ai-radar/preferences") return prefDash.promise;
+    if (path === "/api/ai-radar?period=day") return dayDash.promise;
+    return jsonResponse({});
+  });
+
+  await act(async () => {
+    dayDash.resolve(jsonResponse(radarDashboard({ period: "day", marker: "dayrepo" })));
+    prefDash.resolve(jsonResponse([]));
+  });
+  await settle();
+  assert.match(container.textContent, /2026-09-02/, "last successful status must remain visible");
+
+  // A refresh (after collection) re-fetches status, which then fails.
+  await act(() => { [...container.querySelectorAll("button")].find((b) => b.textContent === "立即采集").click(); });
+  await act(async () => { collect.resolve(jsonResponse({ persisted: true, run: { status: "success" }, error: null })); });
+  await settle();
+  await settle();
+  assert.match(container.textContent, /状态刷新失败/, "a status refresh failure must not be hidden");
+  assert.match(container.textContent, /status down/, "the status failure reason must be surfaced");
+  assert.match(container.textContent, /2026-09-02/, "the last successful status values stay while flagged stale");
+});
+
+test("preferences refresh failure keeps last preferences, never fakes an empty list, and exposes retry", async (t) => {
+  let prefFetchCount = 0;
+  const dayDash = deferred();
+  const collect = deferred();
+  const statusDash = deferred();
+  const prefFail = deferred();
+  const { container } = await mountPage(t, (path, options) => {
+    if (path === "/api/ai-radar/capabilities") return jsonResponse({ capabilities: { read: true, collect: true, schedule: true } });
+    if (path === "/api/ai-radar/status") return statusDash.promise;
+    if (path === "/api/ai-radar/preferences") {
+      prefFetchCount += 1;
+      if (prefFetchCount === 1) return jsonResponse([{ id: "11111111-2222-4333-8444-555555555555", repositoryId: null, kind: "topic", value: "agents", direction: "less", createdAt: "2026-09-02T01:00:00.000Z", revertedAt: null }]);
+      return prefFail.promise;
+    }
+    if (path === "/api/ai-radar?period=day") return dayDash.promise;
+    return jsonResponse({});
+  });
+
+  await act(async () => {
+    dayDash.resolve(jsonResponse(radarDashboard({ period: "day", marker: "dayrepo" })));
+    statusDash.resolve(jsonResponse({ running: false, lastAttemptAt: null, lastSuccessAt: null, nextRunAt: null, error: null }));
+  });
+  await settle();
+  assert.match(container.textContent, /类似主题：agents/, "last successful preferences stay visible");
+
+  await act(() => { [...container.querySelectorAll("button")].find((b) => b.textContent === "立即采集").click(); });
+  await act(async () => { collect.resolve(jsonResponse({ persisted: true, run: { status: "success" }, error: null })); });
+  await settle();
+  await act(async () => { prefFail.reject(new Error("prefs down")); });
+  await settle();
+  assert.match(container.textContent, /偏好.*失败|偏好读取失败/, "a preferences refresh failure must be surfaced");
+  assert.match(container.textContent, /prefs down/, "the preferences failure reason must be surfaced");
+});
+
+test("capability request failure keeps the radar conservative read-only, never silently writable", async (t) => {
+  const dayDash = deferred();
+  const capsFail = deferred();
+  const { container } = await mountPage(t, (path, options) => {
+    if (path === "/api/ai-radar/capabilities") return capsFail.promise;
+    if (path === "/api/ai-radar/status") return jsonResponse({ running: false, lastAttemptAt: null, lastSuccessAt: null, nextRunAt: null, error: null });
+    if (path === "/api/ai-radar/preferences") return jsonResponse([]);
+    if (path === "/api/ai-radar?period=day") return dayDash.promise;
+    return jsonResponse({});
+  });
+  await act(async () => { dayDash.resolve(jsonResponse(radarDashboard({ period: "day", marker: "dayrepo" }))); });
+  await settle();
+  await act(async () => { capsFail.reject(new Error("caps down")); });
+  await settle();
+
+  // A failed capability fetch must not let mutations fall back to writable.
+  assert.match(container.textContent, /dayrepo/, "reads stay usable");
+  assert.doesNotMatch(container.textContent, />立即采集</);
+  assert.doesNotMatch(container.textContent, />保存设置</);
+  assert.ok([...container.querySelectorAll("input")].some((i) => i.disabled), "mutations must stay disabled on a capability failure");
+  assert.match(container.textContent, /无法确认雷达权限/, "the capability failure must be surfaced");
+});
+
+test("a pending capability response keeps mutations disabled until the server answers", async (t) => {
+  const dayDash = deferred();
+  const caps = deferred();
+  const { container } = await mountPage(t, (path, options) => {
+    if (path === "/api/ai-radar/capabilities") return caps.promise;
+    if (path === "/api/ai-radar/status") return jsonResponse({ running: false, lastAttemptAt: null, lastSuccessAt: null, nextRunAt: null, error: null });
+    if (path === "/api/ai-radar/preferences") return jsonResponse([]);
+    if (path === "/api/ai-radar?period=day") return dayDash.promise;
+    return jsonResponse({});
+  });
+  await act(async () => { dayDash.resolve(jsonResponse(radarDashboard({ period: "day", marker: "dayrepo" }))); });
+  await settle();
+
+  // While capabilities are unresolved the page must be conservative (disabled),
+  // not optimistically writable.
+  assert.equal([...container.querySelectorAll("button")].some((b) => b.textContent === "立即采集"), false, "mutations must be disabled while capability is pending");
+  assert.ok([...container.querySelectorAll("input")].some((i) => i.disabled), "mutations must be disabled while capability is pending");
+
+  // Once the server confirms writable, mutations become available.
+  await act(async () => { caps.resolve(jsonResponse({ capabilities: { read: true, collect: true, schedule: true } })); });
+  await settle();
+  assert.ok([...container.querySelectorAll("button")].some((b) => b.textContent === "立即采集"), "collect becomes available once capability confirms writable");
+  assert.ok([...container.querySelectorAll("button")].some((b) => b.textContent === "保存设置"), "schedule becomes available once capability confirms writable");
 });
 
 test("server radar capability (WORKBENCH_PROJECTS_READ_ONLY) disables page mutations even when Vault is writable", async (t) => {
@@ -674,7 +909,7 @@ test("server radar capability (WORKBENCH_PROJECTS_READ_ONLY) disables page mutat
     if (path === "/api/ai-radar?period=day") return dayDash.promise;
     return jsonResponse({});
   });
-  dayDash.resolve(jsonResponse(radarDashboard({ period: "day", marker: "dayrepo" })));
+  await act(async () => { dayDash.resolve(jsonResponse(radarDashboard({ period: "day", marker: "dayrepo" }))); });
   await settle();
   await settle();
 

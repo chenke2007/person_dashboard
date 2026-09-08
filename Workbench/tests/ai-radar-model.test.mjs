@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { projectRadarDashboard } from "../src/lib/ai-radar-model.js";
+import { projectRadarDashboard, RADAR_LISTS } from "../src/lib/ai-radar-model.js";
+import { rankRadar } from "../shared/ai-radar-ranking.mjs";
+
+const RADAR_NOW = new Date("2026-09-02T12:00:00.000Z");
 
 function repository(id, overrides = {}) {
   return {
@@ -69,6 +72,18 @@ function relevantEntry(id, overrides = {}) {
     decision: { repositoryId: id, status: "unread", updatedAt: null },
     ...overrides,
   };
+}
+
+function rankedPayload({ repositories, period = "day" } = {}) {
+  const lists = rankRadar({
+    repositories,
+    snapshots: [],
+    period,
+    preferences: [],
+    now: RADAR_NOW,
+    timeZone: "Etc/UTC",
+  });
+  return { period, timeZone: "Etc/UTC", localDate: "2026-09-02", lists };
 }
 
 function payload(overrides = {}) {
@@ -202,6 +217,77 @@ test("focus filtering keeps only repositories carrying the selected direction", 
 
   const all = projectRadarDashboard(base, { period: "day", list: "rising", focus: "all" });
   assert.equal(all.cards.length, 3);
+});
+
+test("focus filtering follows the server classifier for topic-inferred directions in every list", () => {
+  const repositories = [
+    repository(1, { focusAreas: [], topics: ["rag"] }),
+    repository(2, { focusAreas: [], topics: ["agent"] }),
+    repository(3, { focusAreas: ["ai-productivity"], topics: [] }),
+    repository(4, { focusAreas: [], topics: [] }),
+  ];
+  const base = rankedPayload({ repositories });
+
+  for (const list of RADAR_LISTS) {
+    const rag = projectRadarDashboard(base, { period: "day", list, focus: "rag-knowledge" });
+    assert.deepEqual(rag.cards.map((card) => card.repositoryId), [1], `list=${list}`);
+
+    const agent = projectRadarDashboard(base, { period: "day", list, focus: "agent" });
+    assert.deepEqual(agent.cards.map((card) => card.repositoryId), [2], `list=${list}`);
+
+    const productivity = projectRadarDashboard(base, { period: "day", list, focus: "ai-productivity" });
+    assert.deepEqual(productivity.cards.map((card) => card.repositoryId), [3], `list=${list}`);
+  }
+});
+
+test("focus filtering follows the server classifier for text-inferred directions in every list", () => {
+  const repositories = [
+    repository(1, { focusAreas: [], topics: [], fullName: "synthetic-lab/agent-tool", description: "RAG knowledge base" }),
+    repository(2, { focusAreas: [], topics: [], fullName: "synthetic-lab/plain-util", description: "General utility." }),
+  ];
+  const base = rankedPayload({ repositories });
+
+  for (const list of RADAR_LISTS) {
+    const agent = projectRadarDashboard(base, { period: "day", list, focus: "agent" });
+    assert.deepEqual(agent.cards.map((card) => card.repositoryId), [1], `list=${list}`);
+
+    const rag = projectRadarDashboard(base, { period: "day", list, focus: "rag-knowledge" });
+    assert.deepEqual(rag.cards.map((card) => card.repositoryId), [1], `list=${list}`);
+  }
+});
+
+test("focus filtering runs before the view limit and keeps the server's ranked order", () => {
+  // rankRadar caps each list at the period limit (day = 8), so only ids
+  // 12..5 reach the model; among them the agent classification keeps 9 and 5.
+  const repositories = Array.from({ length: 12 }, (_, index) =>
+    repository(index + 1, { focusAreas: index % 4 === 0 ? ["agent"] : [], topics: [] }));
+  const base = rankedPayload({ repositories });
+  assert.deepEqual(
+    base.lists.established.map((entry) => entry.repositoryId),
+    [12, 11, 10, 9, 8, 7, 6, 5],
+  );
+
+  const view = projectRadarDashboard(base, { period: "day", list: "established", focus: "agent" });
+
+  assert.equal(view.viewLimit, 8);
+  assert.equal(view.cards.length, 2);
+  assert.deepEqual(view.cards.map((card) => card.repositoryId), [9, 5]);
+});
+
+test("the model leaves real ranked payloads and entries untouched", () => {
+  const repositories = [
+    repository(1, { focusAreas: [], topics: ["rag"] }),
+    repository(2, { focusAreas: ["agent"], topics: [] }),
+    repository(3, { focusAreas: [], topics: [] }),
+  ];
+  const base = rankedPayload({ repositories });
+  const original = structuredClone(base);
+
+  projectRadarDashboard(base, { period: "day", list: "rising", focus: "agent" });
+  projectRadarDashboard(base, { period: "day", list: "relevant", state: "saved", focus: "rag-knowledge" });
+  projectRadarDashboard(base, { period: "day", list: "established" });
+
+  assert.deepEqual(base, original);
 });
 
 test("the view preserves local observation dates, coverage, stale/asOf, and counts", () => {

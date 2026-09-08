@@ -118,6 +118,46 @@ async function rawRequest(routes, method, url, raw) {
   return { status, body: JSON.parse(payload) };
 }
 
+// Splits a UTF-8 body into Buffer chunks with boundaries guaranteed to cut
+// through multi-byte code points (after the first byte of the first non-ASCII
+// character, then in irregular three-byte slices that break inside 4-byte
+// emoji sequences).
+function splitMidCodepoint(raw) {
+  const buffer = Buffer.from(raw, "utf8");
+  const chunks = [];
+  let start = 0;
+  for (let index = 0; index < buffer.length; index++) {
+    if (buffer[index] >= 0x80) {
+      chunks.push(buffer.subarray(0, index + 1));
+      start = index + 1;
+      break;
+    }
+  }
+  if (chunks.length === 0) return [buffer];
+  for (let index = start; index < buffer.length; index += 3) {
+    chunks.push(buffer.subarray(index, Math.min(index + 3, buffer.length)));
+  }
+  return chunks;
+}
+
+async function chunkedRequest(routes, method, url, raw) {
+  const chunks = splitMidCodepoint(raw);
+  const req = {
+    method,
+    url,
+    headers: { "content-type": "application/json" },
+    async *[Symbol.asyncIterator]() { for (const chunk of chunks) yield chunk; },
+  };
+  let status = 0;
+  let payload = null;
+  const res = {
+    writeHead(value) { status = value; },
+    end(value) { payload = value; },
+  };
+  await routes.handle(req, res, new URL(url, "http://127.0.0.1"));
+  return { status, body: payload === null ? null : JSON.parse(payload) };
+}
+
 function routeFixture({ repository, scheduler, readOnly = false } = {}) {
   return createRadarRoutes({
     repository: repository ?? fakeRepository(),
@@ -340,6 +380,27 @@ test("invalid JSON bodies and oversized bodies are rejected safely", async () =>
   assert.deepEqual(oversized.body.error, { code: "RADAR_REQUEST_TOO_LARGE", message: "请求内容超过容量限制。" });
 });
 
+test("multibyte bodies split across Buffer boundaries decode exactly like a single chunk", async () => {
+  const repository = fakeRepository();
+  const scheduler = fakeScheduler();
+  const routes = routeFixture({ repository, scheduler });
+
+  const value = "深思熟虑 🤖 智能体助手（中文+emoji）";
+  const preference = { kind: "topic", value, direction: "more", repositoryId: null };
+  const created = await chunkedRequest(routes, "POST", "/api/ai-radar/preferences", JSON.stringify(preference));
+  assert.equal(created.status, 201);
+  assert.equal(created.body.value, value);
+  assert.equal(created.body.kind, "topic");
+  assert.equal(created.body.direction, "more");
+  assert.deepEqual(repository.calls.at(-1)[1], preference);
+
+  const note = "调度说明：支持中文与 emoji 🚀 同值解析";
+  const patch = { enabled: true, time: "08:00", timeZone: "Etc/UTC", note };
+  const scheduled = await chunkedRequest(routes, "PATCH", "/api/ai-radar/schedule", JSON.stringify(patch));
+  assert.equal(scheduled.status, 200);
+  assert.deepEqual(scheduler.calls.at(-1)[1], patch);
+});
+
 test("internal failures never leak GitHub details, tokens, or absolute paths", async () => {
   const repository = fakeRepository({
     async getDashboard() {
@@ -361,6 +422,49 @@ test("internal failures never leak GitHub details, tokens, or absolute paths", a
   assert.equal(serialized.includes("x-rate-limit"), false);
   assert.equal(serialized.includes("AppData"), false);
   assert.equal(serialized.includes("C:\\"), false);
+});
+
+test("malicious exceptions smuggling code/status never leak original messages or headers", async () => {
+  const repository = fakeRepository({
+    async getDashboard() {
+      const hostile = new Error("raw x-rate-limit header, ghp_abcdefghijklmnopqrstuvwxyz and C:\\Users\\owner\\AppData leaked");
+      hostile.code = "RADAR_INTERNAL_ERROR";
+      hostile.status = 418;
+      hostile.headers = { "x-ratelimit-reset": "1700000000", authorization: "Bearer ghp_secret" };
+      hostile.path = "C:\\Users\\owner\\AppData\\Local\\PersonalAIWorkbench\\ai-radar";
+      throw hostile;
+    },
+  });
+  const routes = routeFixture({ repository });
+
+  const response = await request(routes, "GET", "/api/ai-radar?period=day");
+  const serialized = JSON.stringify(response.body);
+
+  assert.equal(response.status, 500);
+  assert.deepEqual(response.body.error, { code: "RADAR_INTERNAL_ERROR", message: "雷达服务暂时不可用。" });
+  assert.equal(serialized.includes("ghp_"), false);
+  assert.equal(serialized.includes("authorization"), false);
+  assert.equal(serialized.includes("x-ratelimit"), false);
+  assert.equal(serialized.includes("AppData"), false);
+  assert.equal(serialized.includes("C:\\"), false);
+});
+
+test("ad-hoc errors wearing known code/status are still mapped to the fixed internal error", async () => {
+  const repository = fakeRepository({
+    async getDashboard() {
+      const hostile = new Error("C:\\Vault\\private note content");
+      hostile.code = "RADAR_INVALID_INPUT";
+      hostile.status = 400;
+      throw hostile;
+    },
+  });
+  const routes = routeFixture({ repository });
+
+  const response = await request(routes, "GET", "/api/ai-radar?period=day");
+
+  assert.equal(response.status, 500);
+  assert.deepEqual(response.body.error, { code: "RADAR_INTERNAL_ERROR", message: "雷达服务暂时不可用。" });
+  assert.equal(JSON.stringify(response.body).includes("Vault"), false);
 });
 
 test("repository 404s remain safe 404 responses", async () => {

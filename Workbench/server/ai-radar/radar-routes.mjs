@@ -1,19 +1,11 @@
 import { RadarRepositoryError } from "./radar-repository.mjs";
+import { RadarRoutesError } from "./radar-errors.mjs";
 
 const ROOT = "/api/ai-radar";
 const DECISION = /^\/repositories\/([1-9]\d*)\/decision$/;
 const PREFERENCE_REVERT = /^\/preferences\/([0-9a-f-]{36})\/revert$/;
 const MUTATION_METHODS = ["POST", "PUT", "PATCH", "DELETE"];
 const MAX_BODY_BYTES = 256 * 1024;
-
-class RadarRoutesError extends Error {
-  constructor(code, message, status = 400) {
-    super(message);
-    this.name = "RadarRoutesError";
-    this.code = code;
-    this.status = status;
-  }
-}
 
 function sendJson(res, status, value) {
   res.writeHead(status, {
@@ -25,13 +17,17 @@ function sendJson(res, status, value) {
 }
 
 async function bodyJson(req, maximum = MAX_BODY_BYTES) {
-  let raw = "";
+  const chunks = [];
+  let bytes = 0;
   for await (const chunk of req) {
-    raw += chunk;
-    if (Buffer.byteLength(raw, "utf8") > maximum) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    bytes += buffer.length;
+    if (bytes > maximum) {
       throw new RadarRoutesError("RADAR_REQUEST_TOO_LARGE", "请求内容超过容量限制。", 413);
     }
+    chunks.push(buffer);
   }
+  const raw = Buffer.concat(chunks).toString("utf8");
   if (!raw.trim()) return {};
   try {
     return JSON.parse(raw);
@@ -42,19 +38,10 @@ async function bodyJson(req, maximum = MAX_BODY_BYTES) {
 
 function publicError(error) {
   if (error instanceof RadarRepositoryError || error instanceof RadarRoutesError) {
-    return { code: error.code, message: error.message };
+    const status = Number.isInteger(error.status) && error.status >= 400 && error.status <= 599 ? error.status : 500;
+    return { code: error.code, message: error.message, status };
   }
-  // Tagged safe errors raised by the plugin wrapper carry only a fixed message.
-  if (
-    typeof error?.code === "string" &&
-    typeof error?.message === "string" &&
-    Number.isInteger(error?.status) &&
-    error.status >= 400 &&
-    error.status <= 599
-  ) {
-    return { code: error.code, message: error.message };
-  }
-  return { code: "RADAR_INTERNAL_ERROR", message: "雷达服务暂时不可用。" };
+  return { code: "RADAR_INTERNAL_ERROR", message: "雷达服务暂时不可用。", status: 500 };
 }
 
 export function createRadarRoutes({ repository, scheduler, readOnly = false } = {}) {
@@ -130,7 +117,8 @@ export function createRadarRoutes({ repository, scheduler, readOnly = false } = 
 
         throw new RadarRoutesError("RADAR_ROUTE_NOT_FOUND", "雷达操作不存在。", 404);
       } catch (error) {
-        sendJson(res, error?.status || 500, { error: publicError(error) });
+        const safe = publicError(error);
+        sendJson(res, safe.status, { error: { code: safe.code, message: safe.message } });
       }
     },
   };

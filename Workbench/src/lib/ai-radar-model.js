@@ -1,3 +1,5 @@
+import { classifyRadarFocus } from "../../shared/ai-radar-ranking.mjs";
+
 export const RADAR_PERIODS = Object.freeze(["day", "week", "month"]);
 export const RADAR_LISTS = Object.freeze(["rising", "established", "relevant"]);
 export const RADAR_STATES = Object.freeze(["all", "unread", "saved", "summarized", "queued", "learning", "completed", "ignored"]);
@@ -71,8 +73,10 @@ export function projectRadarDashboard(payload, { period = "day", list = "rising"
     const status = entry?.decision?.status ?? "unread";
     if (view.state !== "all" && status !== view.state) continue;
     if (view.focus !== "all") {
-      const focusAreas = entry?.repository?.focusAreas;
-      if (!Array.isArray(focusAreas) || !focusAreas.includes(view.focus)) continue;
+      // Reuse the server-authoritative classifier so explicit directions,
+      // topic aliases, and text patterns never diverge between layers.
+      const directions = classifyRadarFocus(entry?.repository ?? entry).directions;
+      if (!directions.includes(view.focus)) continue;
     }
     cards.push(projectCard(entry));
   }

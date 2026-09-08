@@ -58,6 +58,7 @@ import { createRadarCollector } from "./ai-radar/radar-collector.mjs";
 import { createRadarRepository } from "./ai-radar/radar-repository.mjs";
 import { createRadarScheduler } from "./ai-radar/radar-scheduler.mjs";
 import { createRadarRoutes } from "./ai-radar/radar-routes.mjs";
+import { RadarRoutesError } from "./ai-radar/radar-errors.mjs";
 import { createWorkspaceBackup } from "./workspace-state/workspace-backup.mjs";
 import { createWorkspaceRegistry } from "./workspace-state/workspace-registry.mjs";
 import { createWorkspaceRoutes } from "./workspace-state/workspace-routes.mjs";
@@ -1008,10 +1009,7 @@ export function workbenchApiPlugin({
   }
   async function updateRadarSchedule(patch) {
     if (!radarMutable) {
-      const error = new Error("AI Radar scheduling is unavailable in this workspace.");
-      error.code = "RADAR_READ_ONLY";
-      error.status = 403;
-      throw error;
+      throw new RadarRoutesError("RADAR_READ_ONLY", "AI Radar scheduling is unavailable in this workspace.", 403);
     }
     const lifecycle = await radarLifecycle({ create: true });
     const previous = await lifecycle.store.getSchedule();
@@ -1049,10 +1047,7 @@ export function workbenchApiPlugin({
   const radarRouteStore = async ({ create = false } = {}) => {
     const store = await radarApi.getStore({ create });
     if (!store) {
-      const error = new Error("AI 雷达当前不可用。");
-      error.code = "RADAR_UNAVAILABLE";
-      error.status = 404;
-      throw error;
+      throw new RadarRoutesError("RADAR_UNAVAILABLE", "AI 雷达当前不可用。", 404);
     }
     return store;
   };
@@ -1084,10 +1079,7 @@ export function workbenchApiPlugin({
       async runNow() {
         const lifecycle = await radarLifecycle({ create: true });
         if (!lifecycle) {
-          const error = new Error("AI 雷达当前不可用。");
-          error.code = "RADAR_UNAVAILABLE";
-          error.status = 404;
-          throw error;
+          throw new RadarRoutesError("RADAR_UNAVAILABLE", "AI 雷达当前不可用。", 404);
         }
         return lifecycle.scheduler.runNow();
       },

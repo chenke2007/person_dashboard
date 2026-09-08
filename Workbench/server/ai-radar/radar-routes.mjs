@@ -44,8 +44,9 @@ function publicError(error) {
   return { code: "RADAR_INTERNAL_ERROR", message: "雷达服务暂时不可用。", status: 500 };
 }
 
-export function createRadarRoutes({ repository, scheduler, readOnly = false } = {}) {
+export function createRadarRoutes({ repository, scheduler, readOnly = false, capabilities = null } = {}) {
   if (!repository || !scheduler) throw new TypeError("radar repository and scheduler are required");
+  const caps = capabilities ?? Object.freeze({ read: true, collect: !readOnly, schedule: !readOnly });
   return {
     matches(_req, url) {
       return url.pathname === ROOT || url.pathname.startsWith(`${ROOT}/`);
@@ -76,6 +77,10 @@ export function createRadarRoutes({ repository, scheduler, readOnly = false } = 
             return sendJson(res, 200, { running: false, lastAttemptAt: null, lastSuccessAt: null, nextRunAt: null, error: null });
           }
           return sendJson(res, 200, status);
+        }
+
+        if (method === "GET" && route === "/capabilities") {
+          return sendJson(res, 200, { capabilities: caps });
         }
 
         if (method === "POST" && route === "/collect") {

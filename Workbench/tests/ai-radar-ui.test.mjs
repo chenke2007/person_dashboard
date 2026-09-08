@@ -98,13 +98,136 @@ statusCompiled.paths = Module._nodeModulePaths(fileURLToPath(new URL(".", import
 statusCompiled.require = createRequire(import.meta.url);
 statusCompiled._compile(statusBuild.outputFiles[0].text, statusFilename);
 
-// Renders AiRadarStatus with the given schedule and returns helpers to re-render.
-async function mountStatus(t) {
+// Mounted full-page harness: runs AiRadarPage under a router against a
+// controllable fetch so filter changes, collection, and out-of-order dashboard
+// responses can be reproduced deterministically.
+const pageFilename = fileURLToPath(new URL("./ai-radar-ui-page.cjs", import.meta.url));
+const pageBuild = await build({
+  stdin: {
+    contents: `
+      export { AiRadarPage } from "../src/pages/AiRadarPage.jsx";
+    `,
+    resolveDir: fileURLToPath(new URL(".", import.meta.url)),
+    loader: "jsx",
+  },
+  bundle: true,
+  platform: "node",
+  format: "cjs",
+  jsx: "automatic",
+  packages: "external",
+  define: {
+    "import.meta.env": "{}",
+  },
+  plugins: [
+    {
+      name: "ignore-css",
+      setup(buildContext) {
+        buildContext.onLoad({ filter: /\.css$/ }, () => ({ contents: "", loader: "js" }));
+      },
+    },
+  ],
+  write: false,
+});
+const pageCompiled = new Module(pageFilename);
+pageCompiled.filename = pageFilename;
+pageCompiled.paths = Module._nodeModulePaths(fileURLToPath(new URL(".", import.meta.url)));
+pageCompiled.require = createRequire(import.meta.url);
+pageCompiled._compile(pageBuild.outputFiles[0].text, pageFilename);
+
+const { MemoryRouter } = await import("react-router-dom");
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+  return { promise, resolve, reject };
+}
+
+// Flushes the promise chain from a resolved fetch through React's async
+// scheduler so state updates from controlled responses actually paint.
+async function settle() {
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  await act(async () => {});
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  await act(async () => {});
+}
+
+function jsonResponse(body, status = 200) {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    headers: { get: (name) => (String(name).toLowerCase() === "content-type" ? "application/json" : ""), has: () => false },
+    json: async () => body,
+    text: async () => JSON.stringify(body),
+  };
+}
+
+function radarDashboard({ period = "day", marker }) {
+  return {
+    period,
+    timeZone: "Etc/UTC",
+    localDate: "2026-09-02",
+    filters: { state: "all", focus: "all" },
+    counts: { all: 1, unread: 1, saved: 0, summarized: 0, queued: 0, learning: 0, completed: 0, ignored: 0 },
+    eligibleCount: 1,
+    lists: {
+      rising: [{
+        repositoryId: 101,
+        repository: { fullName: `synthetic-lab/${marker}`, htmlUrl: `https://github.com/synthetic-lab/${marker}`, description: `Synthetic ${marker} repo.`, language: "TypeScript", topics: ["agent"], license: "MIT", archived: false, fork: false, stars: 50, pushedAt: null, updatedAt: null },
+        currentStars: 50,
+        observedStarDelta: 2,
+        status: "incomplete",
+        coverage: { observedDays: 1, expectedDays: 1, missingDays: 0, complete: true },
+        reasons: [`synthetic ${marker}`],
+        decision: { status: "unread", updatedAt: null },
+      }],
+      established: [],
+      relevant: [],
+    },
+    freshness: { queriedAt: "2026-09-02T01:00:00.000Z", asOf: "2026-09-02T01:00:00.000Z", lastDataAt: "2026-09-02T01:00:00.000Z", lastSuccessAt: "2026-09-02T01:00:00.000Z", stale: false },
+    coverage: null,
+    retryAt: null,
+    errors: [],
+    run: { id: "00000000-0000-4000-8000-000000000001", trigger: "startup", startedAt: "2026-09-02T01:00:00.000Z", finishedAt: "2026-09-02T01:00:01.000Z", status: "success", localDate: "2026-09-02", timeZone: "Etc/UTC", repositoryCount: 1, errors: [], sequence: 1, collection: null },
+    schedule: { enabled: true, time: "08:00", timeZone: "Etc/UTC", lastAttemptAt: null, lastSuccessAt: null, nextRunAt: "2026-09-03T08:00:00.000Z" },
+  };
+}
+
+// Mounts AiRadarPage under a router. `fetchImpl` receives (path, options) and
+// must return a thenable resolving to a Response-like object. Returns helpers
+// plus `entries` recording every fetch(path, method).
+async function mountPage(t, fetchImpl) {
+  const entries = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (path, options = {}) => {
+    entries.push({ path: String(path), method: options.method || "GET" });
+    return Promise.resolve(fetchImpl(String(path), options));
+  };
   const container = document.createElement("div");
   document.body.append(container);
   const root = createRoot(container);
-  const renderSchedule = async (schedule) => {
-    await act(() => { root.render(React.createElement(statusCompiled.exports.AiRadarStatus, statusCompiled.exports.statusProps(schedule))); });
+  await act(() => {
+    root.render(React.createElement(MemoryRouter, { initialEntries: ["/ai-radar?period=day"] }, React.createElement(pageCompiled.exports.AiRadarPage)));
+  });
+  t.after(() => {
+    act(() => root.unmount());
+    container.remove();
+    globalThis.fetch = originalFetch;
+  });
+  const clickTab = async (text) => {
+    const button = [...container.querySelectorAll("button")].find((b) => b.textContent === text);
+    await act(() => button.click());
+  };
+  return { container, entries, clickTab };
+}
+
+// Renders AiRadarStatus with the given schedule and returns helpers to re-render.
+async function mountStatus(t, statusOverride, extraProps = {}) {
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root = createRoot(container);
+  const renderSchedule = async (schedule, status = statusOverride) => {
+    await act(() => { root.render(React.createElement(statusCompiled.exports.AiRadarStatus, { ...statusCompiled.exports.statusProps(schedule, status), ...extraProps })); });
   };
   t.after(() => { act(() => root.unmount()); container.remove(); });
   return { container, root, renderSchedule };
@@ -209,6 +332,33 @@ test("state and focus filters expose labelled selections anchored to the search 
   assert.match(html, /value="rag-knowledge"/);
   assert.match(html, /value="saved"/);
   assert.match(html, /AI 应用与生产力/);
+});
+
+test("observed star delta renders positive, zero, negative and missing values honestly", () => {
+  const mixed = viewHtml({
+    view: view({
+      cards: [
+        card({ repositoryId: 11, observedStarDelta: 4 }),
+        card({ repositoryId: 12, observedStarDelta: 0 }),
+        card({ repositoryId: 13, observedStarDelta: -5 }),
+        card({ repositoryId: 14, observedStarDelta: null }),
+      ],
+    }),
+  });
+  // Positive gains get a leading plus; zero and negative must never render "+0"/"+-5".
+  assert.match(mixed, />\+4</);
+  assert.match(mixed, />数据积累中</);
+  assert.doesNotMatch(mixed, />\+0</);
+  assert.doesNotMatch(mixed, />\+\-5/);
+
+  const onlyNegative = viewHtml({ view: view({ cards: [card({ repositoryId: 15, observedStarDelta: -5 })] }) });
+  assert.match(onlyNegative, />\-5</);
+
+  const onlyZero = viewHtml({ view: view({ cards: [card({ repositoryId: 16, observedStarDelta: 0 })] }) });
+  assert.match(onlyZero, />0</);
+
+  const onlyMissing = viewHtml({ view: view({ cards: [card({ repositoryId: 17, observedStarDelta: null })] }) });
+  assert.match(onlyMissing, /数据积累中/);
 });
 
 test("empty state does not invent repository data", () => {
@@ -359,4 +509,185 @@ test("schedule form reflects persisted values once they arrive after the initial
   assert.equal(container.querySelector('input[name="time"]').value, "23:30");
   assert.equal(container.querySelector('select[name="timeZone"]').value, "Asia/Shanghai");
   assert.ok([...container.querySelectorAll("button")].some((b) => b.textContent === "立即采集"));
+});
+
+test("schedule error renders safe {code,message} text instead of leaking the raw object", async (t) => {
+  const { container, renderSchedule } = await mountStatus(t, {
+    running: false,
+    lastAttemptAt: null,
+    lastSuccessAt: null,
+    nextRunAt: null,
+    error: { code: "RADAR_SCHEDULER_RUN_FAILED", message: "AI Radar collection failed." },
+  });
+  await renderSchedule({ enabled: true, time: "08:00", timeZone: "Etc/UTC" });
+
+  const text = container.textContent;
+  assert.match(text, /调度错误/);
+  assert.match(text, /AI Radar collection failed\./);
+  assert.doesNotMatch(text, /\[object Object\]/);
+  // The page must stay operable around the error: the collect and save buttons remain.
+  assert.ok([...container.querySelectorAll("button")].some((b) => b.textContent === "立即采集"));
+  assert.ok([...container.querySelectorAll("button")].some((b) => b.textContent === "保存设置"));
+});
+
+test("schedule error falls back to code when message is absent", async (t) => {
+  const { container, renderSchedule } = await mountStatus(t, {
+    running: false,
+    lastAttemptAt: null,
+    lastSuccessAt: null,
+    nextRunAt: null,
+    error: { code: "RADAR_SCHEDULER_RUN_FAILED", message: "" },
+  });
+  await renderSchedule({ enabled: true, time: "08:00", timeZone: "Etc/UTC" });
+  assert.match(container.textContent, /RADAR_SCHEDULER_RUN_FAILED/);
+});
+
+test("collect result distinguishes success, partial, failed and not-persisted outcomes", async () => {
+  const { describeRadarCollectResult } = await import("../src/lib/ai-radar-api.js");
+
+  assert.deepEqual(describeRadarCollectResult({ persisted: true, run: { status: "success" } }), { level: "success", message: "采集完成，数据已保存。" });
+  assert.deepEqual(describeRadarCollectResult({ persisted: true, run: { status: "partial" } }), { level: "partial", message: "部分成功：部分仓库未能采集，其余结果已保存。" });
+
+  // HTTP 200 business failure: scheduler-level error object.
+  assert.deepEqual(describeRadarCollectResult({ persisted: false, error: { code: "RADAR_SCHEDULER_RUN_FAILED", message: "AI Radar collection failed." } }), { level: "failed", message: "采集失败：AI Radar collection failed." });
+  // Not persisted with a failed run carrying an errors[] entry.
+  assert.deepEqual(describeRadarCollectResult({ persisted: false, run: { status: "failed", errors: [{ code: "RADAR_PERSISTENCE_FAILED", message: "persist" }] } }), { level: "failed", message: "采集失败：persist" });
+  // Cooldown/skip is surfaced as a guarded retry message, not fake success.
+  assert.deepEqual(describeRadarCollectResult({ persisted: false, run: { status: "skipped", errors: [{ code: "RADAR_COOLDOWN", message: "cooldown" }] } }), { level: "failed", message: "采集被暂缓：cooldown" });
+  // Not persisted with no error shape at all.
+  assert.deepEqual(describeRadarCollectResult({ persisted: false, run: null, error: null }), { level: "failed", message: "采集失败，数据未能保存。" });
+});
+
+test("collect failure feedback renders and the page stays operable", async (t) => {
+  const { container, renderSchedule } = await mountStatus(t, undefined, {
+    actionErrors: { collect: "采集失败：AI Radar collection failed.", save: null },
+    collectFeedback: null,
+  });
+  await renderSchedule({ enabled: true, time: "08:00", timeZone: "Etc/UTC" });
+
+  assert.match(container.textContent, /采集失败：AI Radar collection failed\./);
+  // Failure must not take the page down: manual collect and save remain usable.
+  assert.ok([...container.querySelectorAll("button")].some((b) => b.textContent === "立即采集"));
+  assert.ok([...container.querySelectorAll("button")].some((b) => b.textContent === "保存设置"));
+  // Failed collection must not fake a successful status line.
+  assert.doesNotMatch(container.textContent, /采集完成/);
+});
+
+test("collect success and partial feedback render as a non-error note", async (t) => {
+  const { container, renderSchedule } = await mountStatus(t, undefined, {
+    actionErrors: { collect: null, save: null },
+    collectFeedback: { level: "partial", message: "部分成功：部分仓库未能采集，其余结果已保存。" },
+  });
+  await renderSchedule({ enabled: true, time: "08:00", timeZone: "Etc/UTC" });
+  assert.match(container.textContent, /部分成功/);
+});
+
+test("collection completion refreshes the current filter, never the stale one; out-of-order B wins", async (t) => {
+  const dayDash = deferred();
+  const weekDeferreds = [deferred(), deferred()];
+  let weekFetchCount = 0;
+  const collect = deferred();
+
+  const { container, entries, clickTab } = await mountPage(t, (path, options) => {
+    if (path === "/api/ai-radar/status") return jsonResponse({ running: false, lastAttemptAt: null, lastSuccessAt: null, nextRunAt: null, error: null });
+    if (path === "/api/ai-radar/preferences") return jsonResponse([]);
+    if (path === "/api/ai-radar/collect") return collect.promise;
+    if (path === "/api/ai-radar?period=day") return dayDash.promise;
+    if (path === "/api/ai-radar?period=week") {
+      const index = weekFetchCount;
+      weekFetchCount += 1;
+      const existing = weekDeferreds[index] ??= deferred();
+      return existing.promise;
+    }
+    return jsonResponse({});
+  });
+
+  const weekDashB = (index) => weekDeferreds[index];
+
+  // Filter A (day) starts collecting.
+  await clickTab("立即采集");
+  // Switch to filter B (week) while A's collection is still in flight.
+  await clickTab("每周");
+
+  // B's dashboard request resolves with B data.
+  weekDashB(0).resolve(jsonResponse(radarDashboard({ period: "week", marker: "weekrepo" })));
+  await settle();
+  assert.match(container.textContent, /weekrepo/);
+  assert.doesNotMatch(container.textContent, /dayrepo/);
+
+  // Collection ends with HTTP 200 success. The page must refresh the *current*
+  // filter (week), issuing a fresh week dashboard request, not a stale day one.
+  collect.resolve(jsonResponse({ persisted: true, run: { status: "success" }, error: null }));
+  await settle();
+  assert.ok(weekFetchCount >= 2, `expected a post-collect week refresh, got ${weekFetchCount} week fetches`);
+
+  // The late stale A (day) response must never overwrite B.
+  weekDashB(1).resolve(jsonResponse(radarDashboard({ period: "week", marker: "weekrepo" })));
+  await settle();
+  dayDash.resolve(jsonResponse(radarDashboard({ period: "day", marker: "dayrepo" })));
+  await settle();
+
+  // Final URL stays on week, and the visible card is B's, never A's.
+  const activeTab = [...container.querySelectorAll("button")].find((b) => b.getAttribute("aria-pressed") === "true");
+  assert.equal(activeTab.textContent, "每周");
+  assert.match(container.textContent, /weekrepo/);
+  assert.doesNotMatch(container.textContent, /dayrepo/);
+  const weekRequests = entries.filter((e) => e.path === "/api/ai-radar?period=week");
+  assert.ok(weekRequests.length >= 2, "final request params must belong to B (week)");
+});
+
+test("pending filter change never shows the previous period's data under the new one", async (t) => {
+  const dayDash = deferred();
+  const weekDash = deferred();
+  const { container, clickTab } = await mountPage(t, (path) => {
+    if (path === "/api/ai-radar/status") return jsonResponse({ running: false, lastAttemptAt: null, lastSuccessAt: null, nextRunAt: null, error: null });
+    if (path === "/api/ai-radar/preferences") return jsonResponse([]);
+    if (path === "/api/ai-radar?period=day") return dayDash.promise;
+    if (path === "/api/ai-radar?period=week") return weekDash.promise;
+    return jsonResponse({});
+  });
+
+  // A (day) loads and renders.
+  dayDash.resolve(jsonResponse(radarDashboard({ period: "day", marker: "dayrepo" })));
+  await settle();
+  assert.match(container.textContent, /dayrepo/);
+
+  // Switch to week while its response is still pending. The old day board must
+  // not be repainted as the "week" board.
+  await clickTab("每周");
+  assert.doesNotMatch(container.textContent, /dayrepo/, "stale day board must not masquerade as the week board");
+  assert.doesNotMatch(container.textContent, /weekrepo/);
+
+  // Once B arrives, only B shows.
+  weekDash.resolve(jsonResponse(radarDashboard({ period: "week", marker: "weekrepo" })));
+  await settle();
+  assert.match(container.textContent, /weekrepo/);
+  assert.doesNotMatch(container.textContent, /dayrepo/);
+});
+
+test("server radar capability (WORKBENCH_PROJECTS_READ_ONLY) disables page mutations even when Vault is writable", async (t) => {
+  const dayDash = deferred();
+  const { container } = await mountPage(t, (path) => {
+    if (path === "/api/ai-radar/capabilities") return jsonResponse({ capabilities: { read: true, collect: false, schedule: false } });
+    if (path === "/api/ai-radar/status") return jsonResponse({ running: false, lastAttemptAt: null, lastSuccessAt: null, nextRunAt: null, error: null });
+    if (path === "/api/ai-radar/preferences") return jsonResponse([]);
+    if (path === "/api/ai-radar?period=day") return dayDash.promise;
+    return jsonResponse({});
+  });
+  dayDash.resolve(jsonResponse(radarDashboard({ period: "day", marker: "dayrepo" })));
+  await settle();
+  await settle();
+
+  // The Vault is writable (import.meta.env.VITE_WORKBENCH_READ_ONLY is false),
+  // yet the server capability says radar mutations are off: controls must hide
+  // and reads must remain usable.
+  assert.match(container.textContent, /dayrepo/);
+  assert.doesNotMatch(container.textContent, />立即采集</);
+  assert.doesNotMatch(container.textContent, />保存设置</);
+  assert.ok([...container.querySelectorAll("input")].some((i) => i.disabled), "schedule inputs must be disabled in read-only radar");
+  assert.ok(Boolean(container.querySelector("select")?.disabled), "schedule timezone select must be disabled in read-only radar");
+  assert.doesNotMatch(container.textContent, /aria-label="收藏/);
+  assert.doesNotMatch(container.textContent, /减少类似推荐/);
+  assert.doesNotMatch(container.textContent, />撤销</);
+  assert.doesNotMatch(container.textContent, />重置全部</);
 });

@@ -1053,6 +1053,7 @@ export function workbenchApiPlugin({
   };
   const radarRoutes = createRadarRoutes({
     readOnly: !radarMutable,
+    capabilities: radarApi.capabilities,
     repository: {
       async getDashboard(options) {
         const store = await radarApi.getStore();

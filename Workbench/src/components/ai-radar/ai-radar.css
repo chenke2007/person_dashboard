@@ -45,6 +45,7 @@
 .radar-card__actions button{border:1px solid #d8d2c5;border-radius:9px;background:#fff;color:#222;min-height:36px;padding:0 12px;font:inherit;font-size:12px;cursor:pointer}
 .radar-card__actions button:hover:not(:disabled){border-color:#4a8c78}
 .radar-card__error{color:#b14f49;font-size:12px;margin:8px 0 0;width:100%}
+.radar-card__note{color:#4a8c78;font-size:12px;margin:8px 0 0;width:100%}
 .radar-message{border:1px dashed #cfc8bb;border-radius:18px;padding:44px;text-align:center;color:#68726d;background:rgba(255,255,255,.55)}
 .radar-message--error{border-color:#e5c2be;background:#fdf5f4}
 .radar-message--error p{margin:0 0 12px}

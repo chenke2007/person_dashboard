@@ -17,6 +17,7 @@ export const loadRadar = ({ period = "day", state, focus } = {}) => {
   return request(`/api/ai-radar${query ? `?${query}` : ""}`, { method: "GET" });
 };
 export const loadRadarStatus = () => request("/api/ai-radar/status", { method: "GET" });
+export const loadRadarCapabilities = () => request("/api/ai-radar/capabilities", { method: "GET" });
 export const collectRadar = () => command("/api/ai-radar/collect", "POST");
 export const updateRadarSchedule = (patch) => command("/api/ai-radar/schedule", "PATCH", patch);
 export const setRadarDecision = (repositoryId, status) => command(`/api/ai-radar/repositories/${encodeURIComponent(repositoryId)}/decision`, "PUT", { status });
@@ -24,3 +25,35 @@ export const loadRadarPreferences = () => request("/api/ai-radar/preferences", {
 export const addRadarPreference = (input) => command("/api/ai-radar/preferences", "POST", input);
 export const revertRadarPreference = (id) => command(`/api/ai-radar/preferences/${encodeURIComponent(id)}/revert`, "POST");
 export const resetRadarPreferences = () => command("/api/ai-radar/preferences", "DELETE");
+
+// The collect endpoint answers HTTP 200 even for business failures, carrying
+// `{ persisted, run, error }`. Interpret that shape into an explicit outcome so
+// the UI can distinguish success, partial and failed collection instead of
+// treating every 200 as success. Returns { level, message }.
+export function describeRadarCollectResult(result) {
+  const safeError = (error) => {
+    if (!error) return null;
+    if (typeof error === "string") return error.trim() || null;
+    if (typeof error?.message === "string" && error.message.trim()) return error.message.trim();
+    if (typeof error?.code === "string" && error.code.trim()) return error.code.trim();
+    return null;
+  };
+
+  if (result?.persisted === true) {
+    if (result?.run?.status === "partial") {
+      return { level: "partial", message: "部分成功：部分仓库未能采集，其余结果已保存。" };
+    }
+    return { level: "success", message: "采集完成，数据已保存。" };
+  }
+
+  // Not persisted. The run recorded a completed-but-unpersisted failure, the
+  // collector hit a cooldown/skip, or the scheduler itself failed.
+  const failure = safeError(result?.error) || safeError(result?.run?.errors?.[0]);
+  if (failure) {
+    if (result?.run?.status === "skipped") {
+      return { level: "failed", message: `采集被暂缓：${failure}` };
+    }
+    return { level: "failed", message: `采集失败：${failure}` };
+  }
+  return { level: "failed", message: "采集失败，数据未能保存。" };
+}

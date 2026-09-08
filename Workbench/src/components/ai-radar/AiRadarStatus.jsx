@@ -52,7 +52,17 @@ function prefixedZone() {
   }
 }
 
-export function AiRadarStatus({ status, schedule, stale, readOnly, busy, actionErrors, actions }) {
+// The status endpoint reports scheduler failures as {code, message}. Render a
+// safe, user-facing string from that shape — never the raw object.
+export function formatRadarError(error) {
+  if (!error) return null;
+  if (typeof error === "string") return error.trim() || null;
+  if (typeof error?.message === "string" && error.message.trim()) return error.message.trim();
+  if (typeof error?.code === "string" && error.code.trim()) return error.code.trim();
+  return null;
+}
+
+export function AiRadarStatus({ status, schedule, stale, readOnly, busy, actionErrors, actions, collectFeedback }) {
   const timeZone = (schedule?.timeZone ?? prefixedZone()) || "UTC";
   const zones = new Set(RADAR_TIME_ZONES);
   if (timeZone) zones.add(timeZone);
@@ -60,6 +70,7 @@ export function AiRadarStatus({ status, schedule, stale, readOnly, busy, actionE
   const collectBusy = Boolean(busy?.collect);
   const collectError = actionErrors?.collect ?? null;
   const saveError = actionErrors?.save ?? null;
+  const statusError = formatRadarError(status?.error);
 
   const handleSave = async (event) => {
     event.preventDefault();
@@ -77,7 +88,7 @@ export function AiRadarStatus({ status, schedule, stale, readOnly, busy, actionE
         <span className={`radar-status__dot radar-status__dot--${status?.running ? "running" : "idle"}`} aria-hidden="true" />
         {status?.running ? <b>采集中</b> : <span>空闲</span>}
         <span className="radar-status__meta">上次成功：{status?.lastSuccessAt ? formatRadarTime(status.lastSuccessAt, timeZone) : "尚未成功采集"}</span>
-        {status?.error ? <span className="radar-status__error">调度错误：{status.error}</span> : null}
+        {statusError ? <span className="radar-status__error">调度错误：{statusError}</span> : null}
       </div>
       {stale ? (
         <p className="radar-status__stale" role="status">数据可能不是最新，请稍后手动采集或等待下次调度。</p>
@@ -109,6 +120,7 @@ export function AiRadarStatus({ status, schedule, stale, readOnly, busy, actionE
         </div>
         {saveError ? <p className="radar-card__error" role="alert">{saveError}</p> : null}
         {collectError ? <p className="radar-card__error" role="alert">{collectError}</p> : null}
+        {collectFeedback ? <p className={`radar-card__note radar-card__note--${collectFeedback.level}`} role="status">{collectFeedback.message}</p> : null}
         {!readOnly ? (
           <div className="radar-settings__actions">
             <button disabled={collectBusy} onClick={() => actions.onCollect()} type="button">

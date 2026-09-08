@@ -8,7 +8,9 @@ import { RADAR_FOCUSES, RADAR_LISTS, RADAR_PERIODS, RADAR_STATES, projectRadarDa
 import {
   addRadarPreference,
   collectRadar,
+  describeRadarCollectResult,
   loadRadar,
+  loadRadarCapabilities,
   loadRadarPreferences,
   loadRadarStatus,
   resetRadarPreferences,
@@ -42,7 +44,8 @@ export function radarFilterToSearch(filter = {}) {
 
 // Loads the server dashboard per period/state/focus and delivers to `onChange`
 // only the outcome of the newest request, so a slow older response can never
-// overwrite a newer filter's result.
+// overwrite a newer filter's result. The filter that produced each value is
+// passed back so callers can bind a view to the exact query that generated it.
 export function createRadarDashboardLoader(loadDashboard, onChange) {
   let sequence = 0;
   return Object.freeze({
@@ -52,11 +55,11 @@ export function createRadarDashboardLoader(loadDashboard, onChange) {
       return Promise.resolve(loadDashboard(filter)).then(
         (value) => {
           if (current !== sequence) return null;
-          onChange(value);
+          onChange(value, undefined, filter);
           return value;
         },
         (error) => {
-          if (current === sequence) onChange(null, error);
+          if (current === sequence) onChange(null, error, filter);
           return Promise.reject(error);
         },
       );
@@ -79,6 +82,7 @@ export function AiRadarView({
   readOnly,
   busy,
   actionErrors,
+  collectFeedback,
   actions,
 }) {
   const cards = view && !view.empty && Array.isArray(view.cards) ? view.cards : [];
@@ -93,6 +97,7 @@ export function AiRadarView({
         actionErrors={actionErrors}
         actions={actions}
         busy={busy}
+        collectFeedback={collectFeedback}
         readOnly={readOnly}
         schedule={schedule}
         stale={stale}
@@ -175,7 +180,14 @@ export function AiRadarView({
 }
 
 export function AiRadarPage() {
-  const radarReadOnly = import.meta.env.VITE_WORKBENCH_READ_ONLY === "true";
+  const [radarCapabilities, setRadarCapabilities] = useState(null);
+  // Radar mutation capability comes from the server (collect/schedule), which
+  // is independent of Vault read-only. Fall back to the build-time Vault flag
+  // until the capability response arrives; the server remains the arbiter.
+  const radarReadOnly = radarCapabilities ? radarCapabilities.collect !== true : import.meta.env.VITE_WORKBENCH_READ_ONLY === "true";
+  useEffect(() => {
+    loadRadarCapabilities().then((body) => setRadarCapabilities(body?.capabilities ?? null)).catch(() => {});
+  }, []);
   const [searchParams, setSearchParams] = useSearchParams();
   const filter = useMemo(() => radarFilterFromSearch(searchParams), [searchParams]);
   const [dashboard, setDashboard] = useState(null);
@@ -185,37 +197,58 @@ export function AiRadarPage() {
   const [preferences, setPreferences] = useState([]);
   const [busy, setBusy] = useState({ collect: false, save: false, decision: null, lessLike: null, revert: null, reset: false });
   const [actionErrors, setActionErrors] = useState({ collect: null, save: null, decision: {}, lessLike: {}, revert: {}, reset: null });
+  const [collectFeedback, setCollectFeedback] = useState(null);
+  const filterRef = useRef(filter);
+  useEffect(() => { filterRef.current = filter; }, [filter]);
   const loaderRef = useRef(null);
+  const [dashboardQuery, setDashboardQuery] = useState(null);
 
-  const queryKey = `${filter.period}|${filter.state}|${filter.focus}`;
-  const reload = useCallback(() => {
-    const loader = loaderRef.current ??= createRadarDashboardLoader(loadRadar, (value, error) => {
-      setDashboard(value);
-      setDashboardError(error ? error.message : null);
-      setLoading(false);
-    });
-    setLoading(true);
-    void loader.load({ period: filter.period, state: filter.state, focus: filter.focus }).catch(() => {});
-  }, [filter.period, filter.state, filter.focus]);
-
-  useEffect(() => { reload(); }, [reload]);
-
-  const refreshExtras = useCallback(() => {
-    void loadRadarStatus().then(setStatus).catch(() => {});
-    void loadRadarPreferences().then(setPreferences).catch(() => {});
+  const applyDashboard = useCallback((value, error, query) => {
+    setDashboard(value);
+    setDashboardQuery(query ?? null);
+    setDashboardError(error ? error.message : null);
+    setLoading(false);
   }, []);
-  useEffect(() => { refreshExtras(); }, [refreshExtras]);
 
+  const reloadFor = useCallback((query) => {
+    const loader = loaderRef.current ??= createRadarDashboardLoader(loadRadar, applyDashboard);
+    setLoading(true);
+    return loader.load({ period: query.period, state: query.state, focus: query.focus }).catch(() => {});
+  }, [applyDashboard]);
+
+  // Reflect filter changes from the URL (period/state/focus each require a re-query).
+  useEffect(() => {
+    void reloadFor({ period: filter.period, state: filter.state, focus: filter.focus });
+  }, [reloadFor, filter.period, filter.state, filter.focus]);
+
+  const refreshExtras = useCallback(() => Promise.all([
+    loadRadarStatus().then(setStatus).catch(() => {}),
+    loadRadarPreferences().then(setPreferences).catch(() => {}),
+  ]), []);
+  useEffect(() => { void refreshExtras(); }, [refreshExtras]);
+
+  // Refreshes the *current* filter (never the one captured when an action
+  // started) and waits for the actual reload to settle before resolving.
   const refreshAfter = useCallback(async () => {
-    reload();
-    refreshExtras();
-  }, [reload, refreshExtras]);
+    const query = filterRef.current;
+    await Promise.all([reloadFor(query), refreshExtras()]);
+  }, [reloadFor, refreshExtras]);
 
+  const retry = useCallback(() => reloadFor(filterRef.current), [reloadFor]);
+
+  // Bind the view to the exact query that produced the dashboard, so a pending
+  // filter change never shows the previous period's data under the new one.
+  const dashboardMatches =
+    Boolean(dashboardQuery) &&
+    dashboardQuery.period === filter.period &&
+    dashboardQuery.state === filter.state &&
+    dashboardQuery.focus === filter.focus;
+  const currentDashboard = dashboardMatches ? dashboard : null;
   const view = useMemo(
-    () => (dashboard ? projectRadarDashboard(dashboard, { period: filter.period, list: filter.list, state: filter.state, focus: filter.focus }) : null),
-    [dashboard, filter],
+    () => (currentDashboard ? projectRadarDashboard(currentDashboard, { period: filter.period, list: filter.list, state: filter.state, focus: filter.focus }) : null),
+    [currentDashboard, filter],
   );
-  const stale = dashboard?.freshness?.stale === true;
+  const stale = currentDashboard?.freshness?.stale === true;
   const schedule = dashboard?.schedule ?? null;
 
   const onChangeFilter = useCallback((patch) => {
@@ -234,8 +267,15 @@ export function AiRadarPage() {
   const onCollect = useCallback(async () => {
     setBusy((b) => ({ ...b, collect: true }));
     setActionErrors((e) => ({ ...e, collect: null }));
+    setCollectFeedback(null);
     try {
-      await collectRadar();
+      const result = await collectRadar();
+      const outcome = describeRadarCollectResult(result);
+      if (outcome.level === "success" || outcome.level === "partial") {
+        setCollectFeedback({ level: outcome.level, message: outcome.message });
+      } else {
+        setActionErrors((e) => ({ ...e, collect: outcome.message }));
+      }
       await refreshAfter();
     } catch (error) {
       setActionErrors((e) => ({ ...e, collect: error?.message ?? "采集失败，请重试。" }));
@@ -321,14 +361,15 @@ export function AiRadarPage() {
     onRevertPreference,
     onResetPreferences,
     onUpdateSchedule,
-    onRetry: reload,
-  }), [onCollect, onDecide, onLessLike, onRevertPreference, onResetPreferences, onUpdateSchedule, reload]);
+    onRetry: retry,
+  }), [onCollect, onDecide, onLessLike, onRevertPreference, onResetPreferences, onUpdateSchedule, retry]);
 
   return (
     <AiRadarView
       actionErrors={actionErrors}
       actions={actions}
       busy={busy}
+      collectFeedback={collectFeedback}
       error={dashboardError}
       filter={filter}
       loading={loading}

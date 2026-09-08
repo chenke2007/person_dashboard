@@ -40,7 +40,7 @@ export function AiRadarCard({ card, readOnly, busy, actionErrors, onDecide, onLe
         </div>
         <div>
           <dt>本地观测</dt>
-          <dd>{delta === null ? "数据积累中" : `+${delta}`}</dd>
+          <dd>{delta === null ? "数据积累中" : delta > 0 ? `+${delta}` : delta}</dd>
         </div>
         {coverageCopy ? (
           <div>

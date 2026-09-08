@@ -181,6 +181,16 @@ test("GET /api/ai-radar passes period/state/focus to the repository dashboard qu
   assert.equal(response.body.localDate, "2026-09-02");
 });
 
+test("GET /api/ai-radar/capabilities reflects writable vs read-only radar capability", async () => {
+  const writable = await request(routeFixture({ readOnly: false }), "GET", "/api/ai-radar/capabilities");
+  assert.equal(writable.status, 200);
+  assert.deepEqual(writable.body.capabilities, { read: true, collect: true, schedule: true });
+
+  const readOnly = await request(routeFixture({ readOnly: true }), "GET", "/api/ai-radar/capabilities");
+  assert.equal(readOnly.status, 200);
+  assert.deepEqual(readOnly.body.capabilities, { read: true, collect: false, schedule: false });
+});
+
 test("GET /api/ai-radar defaults missing filters and rejects invalid periods safely", async () => {
   const repository = fakeRepository({
     async getDashboard(options) {
@@ -609,6 +619,63 @@ test("plugin hosted mode blocks radar mutations and reads safely", async (t) => 
   assert.equal(dashboard.body.error.code, "RADAR_UNAVAILABLE");
 });
 
+test("plugin WORKBENCH_PROJECTS_READ_ONLY gates radar mutations with capabilities and 403 while reads stay usable", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "workbench-radar-proj-ro-"));
+  const vaultRoot = path.join(root, "vault");
+  const appDataRoot = path.join(root, "app-data");
+  const middlewares = [];
+  await mkdir(vaultRoot, { recursive: true });
+  const plugin = workbenchApiPlugin({
+    vaultRoot,
+    appDataRoot,
+    projectReadOnly: true,
+    // Vault is intentionally writable: only the project/radar level is locked.
+    readOnly: false,
+  });
+  await plugin.configureServer({
+    watcher: { on() {}, off() {} },
+    httpServer: null,
+    middlewares: { use(handler) { middlewares.push(handler); } },
+    config: { logger: { error() {} } },
+  });
+  t.after(async () => {
+    await plugin.closeBundle();
+    await rm(root, { recursive: true, force: true });
+  });
+
+  async function via(method, url, body) {
+    const req = {
+      method,
+      url,
+      headers: { "content-type": "application/json" },
+      async *[Symbol.asyncIterator]() {
+        if (body !== undefined) yield JSON.stringify(body);
+      },
+    };
+    let status = 0;
+    let payload = null;
+    const res = {
+      writeHead(value) { status = value; },
+      end(value) { payload = value; },
+    };
+    await middlewares.at(-1)(req, res, () => {});
+    return { status, body: payload === null ? null : JSON.parse(payload) };
+  }
+
+  // The page learns radar mutation is off through the capability contract.
+  const caps = await via("GET", "/api/ai-radar/capabilities");
+  assert.equal(caps.status, 200);
+  assert.deepEqual(caps.body.capabilities, { read: true, collect: false, schedule: false });
+
+  // Mutations still return 403 regardless of what the page shows.
+  const collect = await via("POST", "/api/ai-radar/collect");
+  assert.equal(collect.status, 403);
+  assert.equal(collect.body.error.code, "RADAR_READ_ONLY");
+
+  const patch = await via("PATCH", "/api/ai-radar/schedule", { enabled: true });
+  assert.equal(patch.status, 403);
+});
+
 // Browser client contract -----------------------------------------------------
 
 test("radar browser client emits exact request methods, urls, and JSON bodies", async () => {
@@ -626,6 +693,7 @@ test("radar browser client emits exact request methods, urls, and JSON bodies", 
   await api.loadRadar({ period: "day" });
   await api.loadRadar({ period: "week", state: "saved", focus: "agent" });
   await api.loadRadarStatus();
+  await api.loadRadarCapabilities();
   await api.collectRadar();
   await api.updateRadarSchedule({ enabled: true, time: "08:00", timeZone: "Etc/UTC" });
   await api.setRadarDecision(9876, "saved");
@@ -642,6 +710,7 @@ test("radar browser client emits exact request methods, urls, and JSON bodies", 
     { url: "/api/ai-radar?period=day", method: "GET", body: undefined },
     { url: "/api/ai-radar?period=week&state=saved&focus=agent", method: "GET", body: undefined },
     { url: "/api/ai-radar/status", method: "GET", body: undefined },
+    { url: "/api/ai-radar/capabilities", method: "GET", body: undefined },
     { url: "/api/ai-radar/collect", method: "POST", body: {} },
     { url: "/api/ai-radar/schedule", method: "PATCH", body: { enabled: true, time: "08:00", timeZone: "Etc/UTC" } },
     { url: "/api/ai-radar/repositories/9876/decision", method: "PUT", body: { status: "saved" } },

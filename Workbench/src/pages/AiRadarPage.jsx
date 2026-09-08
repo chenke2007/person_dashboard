@@ -171,12 +171,13 @@ export function AiRadarView({
           {actionErrors?.reset ? <p className="radar-card__error" role="alert">{actionErrors.reset}</p> : null}
           {preferencesError ? (
             <div className="radar-message radar-message--error" role="alert">
-              <p>推荐偏好读取失败：{preferencesError}，正在显示上次成功数据。</p>
+              <p>推荐偏好读取失败：{preferencesError}{preferences?.length ? "，正在显示上次成功数据。" : "，本次暂无偏好数据可显示。"}</p>
               {actions?.onRetryAux ? (
                 <button onClick={() => actions.onRetryAux()} type="button">重试</button>
               ) : null}
             </div>
-          ) : preferences?.length ? (
+          ) : null}
+          {preferences?.length ? (
             <ul className="radar-preferences__list">
               {preferences.map((preference) => {
                 const kindLabel = KIND_LABELS[preference.kind] ?? preference.kind;

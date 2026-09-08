@@ -610,6 +610,43 @@ test("collect result interprets the real collector failure shape the routes forw
   assert.match(real.message, /discovery down/);
 });
 
+test("describeRadarCollectResult flags a REAL collector total-failure as failed", async (t) => {
+  // Do not hand-write the failure shape. Drive the actual createRadarCollector
+  // against a temporary repository and a synthetic failing GitHub adapter so the
+  // persisted:true + run.status:"failed" result passed to the UI interpreter is
+  // the genuine collector output, not a fabricated response.
+  const { createRadarRepository } = await import("../server/ai-radar/radar-repository.mjs");
+  const { createRadarCollector } = await import("../server/ai-radar/radar-collector.mjs");
+  const { mkdtemp, rm, realpath } = await import("node:fs/promises");
+  const os = await import("node:os");
+  const path = await import("node:path");
+
+  const directory = await mkdtemp(path.join(await realpath(os.tmpdir()), "radar-ui-collector-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const timeZone = "Asia/Shanghai";
+  const now = () => new Date("2026-09-02T16:30:00.000Z");
+  const repository = createRadarRepository({ directory, now, timeZone });
+  // Every discovery request throws, so the collector observes nothing but still
+  // durably commits the failed run (persisted:true), matching real total failure.
+  // A GITHUB_-prefixed code is what the real adapter produces and is preserved
+  // through sanitization, so the surfaced message mirrors genuine output.
+  const github = {
+    async discoverCandidates() { throw { code: "GITHUB_NETWORK_ERROR", message: "GitHub could not be reached." }; },
+    async getRepositories() { throw new Error("Unexpected detail work"); },
+  };
+  const collector = createRadarCollector({ github, repository, now, timeZone, focusAreas: ["agent"] });
+  const result = await collector.collect({ trigger: "manual" });
+
+  assert.equal(result.persisted, true, "the real collector durably commits the failed run");
+  assert.equal(result.run.status, "failed", "nothing observed means the durable run is failed");
+
+  const { describeRadarCollectResult } = await import("../src/lib/ai-radar-api.js");
+  const outcome = describeRadarCollectResult(result);
+  assert.equal(outcome.level, "failed");
+  assert.match(outcome.message, /采集失败/);
+  assert.match(outcome.message, /GitHub could not be reached/);
+});
+
 test("collect failure feedback renders and the page stays operable", async (t) => {
   const { container, renderSchedule } = await mountStatus(t, undefined, {
     actionErrors: { collect: "采集失败：AI Radar collection failed.", save: null },
@@ -850,6 +887,84 @@ test("preferences refresh failure keeps last preferences, never fakes an empty l
   await settle();
   assert.match(container.textContent, /偏好.*失败|偏好读取失败/, "a preferences refresh failure must be surfaced");
   assert.match(container.textContent, /prefs down/, "the preferences failure reason must be surfaced");
+});
+
+test("preferences refresh failure keeps the last-success list visible alongside the error, and retry recovers", async (t) => {
+  let prefFetchCount = 0;
+  let failPrefs = false;
+  const dayDash = deferred();
+  const collect = deferred();
+  const statusDash = deferred();
+  const prefFail = deferred();
+  const { container } = await mountPage(t, (path, options) => {
+    if (path === "/api/ai-radar/capabilities") return jsonResponse({ capabilities: { read: true, collect: true, schedule: true } });
+    if (path === "/api/ai-radar/status") return statusDash.promise;
+    if (path === "/api/ai-radar/preferences") {
+      prefFetchCount += 1;
+      if (prefFetchCount === 1 || !failPrefs) return jsonResponse([{ id: "11111111-2222-4333-8444-555555555555", repositoryId: null, kind: "topic", value: "agents", direction: "less", createdAt: "2026-09-02T01:00:00.000Z", revertedAt: null }]);
+      return prefFail.promise;
+    }
+    if (path === "/api/ai-radar?period=day") return dayDash.promise;
+    return jsonResponse({});
+  });
+
+  await act(async () => {
+    dayDash.resolve(jsonResponse(radarDashboard({ period: "day", marker: "dayrepo" })));
+    statusDash.resolve(jsonResponse({ running: false, lastAttemptAt: null, lastSuccessAt: null, nextRunAt: null, error: null }));
+  });
+  await settle();
+  assert.match(container.textContent, /类似主题：agents/, "last successful preferences start visible");
+
+  // A refresh (after collect) re-fetches preferences, which now fails while the
+  // previous list still exists. The failure and the retained list must show
+  // together — the list is never blanked by a failed refresh.
+  failPrefs = true;
+  await act(() => { [...container.querySelectorAll("button")].find((b) => b.textContent === "立即采集").click(); });
+  await act(async () => { collect.resolve(jsonResponse({ persisted: true, run: { status: "success" }, error: null })); });
+  await settle();
+  await act(async () => { prefFail.reject(new Error("prefs down")); });
+  await settle();
+
+  assert.match(container.textContent, /推荐偏好读取失败|偏好读取失败/, "a preferences refresh failure must be surfaced");
+  assert.match(container.textContent, /prefs down/, "the preferences failure reason must be surfaced");
+  assert.match(container.textContent, /类似主题：agents/, "the last-success list must stay visible alongside the failure");
+  assert.match(container.textContent, /正在显示上次成功数据/, "when data exists the kept-data claim applies");
+  const retryBtn = [...container.querySelectorAll("button")].find((b) => b.textContent === "重试");
+  assert.ok(retryBtn, "a retry action must be available on a preferences failure");
+
+  // Retry re-fetches successfully and clears the error while the list remains.
+  failPrefs = false;
+  await act(() => retryBtn.click());
+  await settle();
+  assert.doesNotMatch(container.textContent, /推荐偏好读取失败|偏好读取失败|prefs down/, "a successful retry clears the preferences error");
+  assert.match(container.textContent, /类似主题：agents/, "the list stays visible after recovery");
+});
+
+test("a failed first load of preferences with no prior data never claims last-success data", async (t) => {
+  const dayDash = deferred();
+  const statusDash = deferred();
+  const prefFail = deferred();
+  const { container } = await mountPage(t, (path, options) => {
+    if (path === "/api/ai-radar/capabilities") return jsonResponse({ capabilities: { read: true, collect: true, schedule: true } });
+    if (path === "/api/ai-radar/status") return statusDash.promise;
+    if (path === "/api/ai-radar/preferences") return prefFail.promise;
+    if (path === "/api/ai-radar?period=day") return dayDash.promise;
+    return jsonResponse({});
+  });
+
+  await act(async () => {
+    dayDash.resolve(jsonResponse(radarDashboard({ period: "day", marker: "dayrepo" })));
+    statusDash.resolve(jsonResponse({ running: false, lastAttemptAt: null, lastSuccessAt: null, nextRunAt: null, error: null }));
+  });
+  await act(async () => { prefFail.reject(new Error("prefs down")); });
+  await settle();
+
+  assert.match(container.textContent, /推荐偏好读取失败|偏好读取失败/, "the preferences failure must be surfaced");
+  assert.match(container.textContent, /prefs down/, "the preference failure reason must be surfaced");
+  // No prior data exists, so the page must not claim to be showing kept data.
+  assert.doesNotMatch(container.textContent, /正在显示上次成功数据/, "must not claim kept data when there is none");
+  // The honest empty state stays, never a fabricated list.
+  assert.match(container.textContent, /暂无偏好|暂无/, "with no data the empty preferences state stays visible");
 });
 
 test("capability request failure keeps the radar conservative read-only, never silently writable", async (t) => {

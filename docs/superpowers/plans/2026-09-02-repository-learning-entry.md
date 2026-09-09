@@ -234,3 +234,73 @@ createLearningRepository({ directory, now, makeId? })     // schemaVersion is im
 ## Acceptance reference (30 days)
 
 Record only local health counters (scheduled run coverage, failed run count, repos reviewed/saved, summaries generated, learning projects started); never commit real metrics. Success = review <10 min/day, ≥4 worthwhile repos, ≥1 started learning project.
+
+---
+
+# Checkpoint S2 — HTTP integration (Claude Step 13)
+
+S2 wiring of the frozen first-deliverable slice: `LearningService` + `LearningRoutes` over the existing `LearningWorkspaceRepository` (S1 store), tied to the bound workspace, merged into the radar read path, and registered as a first-class backup provider. **No UI, no model summaries, no course, no Wiki write.**
+
+## S2 scope boundary
+
+- S1 store already provides the full state machine, capacity, receipts, import invariants. S2 adds the HTTP/编排 layer only.
+- `preview`/`confirm` keep S1 token semantics; confirm does **not** re-read GitHub HEAD.
+- The learning store lives at the bound workspace's `learning` directory (beside `projects`, `ai-radar`).
+
+## HTTP contract (final)
+
+All mutations require `application/json`, same-origin (existing `assertLocalMutationRequest`), and a non-hosted, non-read-only workspace (else 403/404 before any access to the learning/radar store). Errors return `{ error: { code, message } }` (`LEARNING_*` codes from the store, plus route-level codes).
+
+| Method & path | Request body | Success response | Errors |
+|---|---|---|---|
+| `GET /api/learning/capabilities` | – | `{ capabilities: { read, create, edit, preview, confirm, activate, archive } }` | – |
+| `GET /api/learning` | `?includeArchived=1` | `{ workspaces: [...] }` (from `list`) | `LEARNING_STORAGE_CORRUPT` → `learningUnavailable` |
+| `GET /api/learning/:id` | – | `{ workspace }` | `WORKSPACE_NOT_FOUND` |
+| `POST /api/learning/drafts` | `{ repositoryId, mission: { goal, notes } }` | `{ workspace }` (pinned commit) | `LEARNING_DRAFT_EXISTS`(idempotent return ok), `LEARNING_REPOSITORY_NOT_FOUND`, GitHub failure → safe error, `LEARNING_STORAGE_CORRUPT` |
+| `PATCH /api/learning/:id/draft` | `{ expectedRevision, mission }` | `{ workspace }` | `REVISION_CONFLICT`, `LEARNING_INVALID_TRANSITION` |
+| `POST /api/learning/:id/preview` | – | `{ token, expiresAt, draftRevision, sourceCommitSha, sourceUrl, fullName, repositoryId, mission }` | `LEARNING_INVALID_TRANSITION` |
+| `POST /api/learning/confirm` | `{ token }` | `{ confirmed, workspace }` | `CONFIRM_TOKEN_INVALID`, `CONFIRM_TOKEN_*` |
+| `POST /api/learning/:id/activate` | `{ expectedRevision }` | `{ workspace, outcome }` | `ACTIVE_LIMIT_REACHED`(200 outcome), `REVISION_CONFLICT` |
+| `POST /api/learning/:id/archive` | – | `{ workspace }` | `WORKSPACE_NOT_FOUND` |
+
+### createDraft source resolution (never trust browser source)
+
+- Browser sends only `repositoryId` + `mission`.
+- Server reads the current radar store, resolves the repository by numeric `repositoryId` → gets `fullName`, derives `sourceUrl = https://github.com/<fullName>`, and calls `getHeadCommit({ fullName })` → `.sha` pins `sourceCommitSha`.
+- If a learning workspace for that `repositoryId` already exists, return the **existing** workspace without calling GitHub again (idempotent; not broken by transient GitHub unavailability).
+
+### Runtime capabilities (server-decided)
+
+- `read`: `!hosted`. Always true locally (draft/queued/active/archived listable, even read-only vaults can query).
+- `create/edit/preview/confirm/activate/archive`: `!hosted && !readOnly` (mutation requires a mutable workspace; read-only vault allowed read only).
+- Capabilities query never calls GitHub or any model.
+
+## Workspace binding & lock order
+
+- All learning mutations run `withBoundWorkspace({ fingerprint, workspaceId }, operation)` (registry lock, outer) **then** the learning store's own `learning.lock` (inner, via `createTicketLock`). Never re-enter the registry lock.
+- Slow work (`getHeadCommit`) runs **before** either lock. GitHub request is outside the registry/store locks.
+- The binding guard captures the expected binding, and the local commit happens inside the same guard; on rebind → `WORKSPACE_BINDING_CHANGED` (409), and the old-request data is never written into the new workspace.
+- `GET`/capabilities/export on a missing store stay read-only and **do not create** the learning directory.
+
+### Backup binding
+
+- `confirmImport` is wrapped once in `withBoundWorkspace` (the single binding guard coordinating all providers) at `vite-plugin-workbench.mjs:1061`. Each provider's `stageImport` takes only its own store lock — learning's `stageImport` must **not** acquire the registry lock.
+
+## Radar read merge (learning lifecycle into dashboard)
+
+- Seam: `getDashboard` gains an optional `learning` filter (`all|draft|queued|active|archived`) and an injected `learningState` map (`repositoryId → lifecycle state`), passed by the radar route wrapper which reads the learning store (read-time merge; **no write-back** to the radar decision).
+- The learning filter is applied to the `repositories` array **before** `rank` truncation (never truncate-then-filter).
+- Mapping: `draft→学习草稿, queued→学习队列, active→学习中, archived→学习已归档`. "学习已归档" is distinct from the radar repo's GitHub `archived` boolean.
+- If the learning store is corrupt, the radar read must **not** pretend "no learning projects": it surfaces a `learningStatus: "unavailable"` (and learning filters return an error/unavailable state), while the base radar lists still render their reliable data.
+- `counts`/`eligibleCount` continue to reflect radar decision status; learning-filter membership gates the lists (and a `learningAvailable` flag is surfaced), not the pre-existing radar decision counts.
+
+## Backup provider (app flow)
+
+- Add `learningRepository()` accessor in the plugin resolving `<stateRoot>/learning`, and add its provider to `createWorkspaceBackup({ providers: [projects, radar, learning] })` (alphabetical `learning` sorts before `projects`).
+- Restore via the single `withBoundWorkspace` around `confirmImport`; learning's `stageImport` takes only its own lock.
+- Verify: backup round-trip round-trips learning; old (learning-less) backup preserves learning; after restore old learning confirm tokens invalid; later-provider failure rolls back learning (with original authorization); rebound access prevents cross-workspace writes; read-only export of absent store creates no directory.
+
+## Test seams (S2)
+
+- `tests/learning-api.test.mjs`: real Vite plugin server (mirror `project-api.test.mjs` `startFixture`), temp real learning+radar+registry stores, synthetic GitHub at the external adapter seam, and **at least one test through the real plugin-started HTTP service** (not only the route handler). Covers: no-model full flow, note edit invalidates old preview, replay confirm, 4th queues, activate after freeing a slot, cross-site/read-only/hosted rejection, rebind race, learning filtering+limits, formal backup restore.
+- Radar merge covered via `tests/radar-learning-merge.test.mjs` (or within learning-api) using real stores.

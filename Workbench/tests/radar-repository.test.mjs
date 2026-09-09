@@ -38,7 +38,7 @@ test("dashboard filters before all three cutoffs, excludes ignored by default an
   assert.ok(normal.lists.relevant.every((entry) => entry.repositoryId !== 13));
   const saved = await radar.getDashboard({ state: "saved" });
   assert.equal(saved.lists.established[0].repositoryId, 14); assert.equal(saved.lists.rising[0].decision.status, "saved");
-  assert.deepEqual(saved.filters, { state: "saved", focus: "all" });
+  assert.deepEqual(saved.filters, { state: "saved", focus: "all", learning: "all" });
   assert.equal((await radar.getDashboard({ state: "ignored" })).lists.established[0].repositoryId, 13);
   assert.equal((await radar.getDashboard({ focus: "rag-knowledge" })).lists.relevant[0].repositoryId, 15);
   await assert.rejects(radar.getDashboard({ period: "year" }), isCode("RADAR_INVALID_INPUT"));

@@ -64,6 +64,7 @@ export function createRadarRoutes({ repository, scheduler, readOnly = false, cap
             period: url.searchParams.get("period") || "day",
             state: url.searchParams.get("state") || "all",
             focus: url.searchParams.get("focus") || "all",
+            learning: url.searchParams.get("learning") || "all",
           });
           if (dashboard === null || dashboard === undefined) {
             throw new RadarRoutesError("RADAR_UNAVAILABLE", "AI 雷达当前不可用。", 404);

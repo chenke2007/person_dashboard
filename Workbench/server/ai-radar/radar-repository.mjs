@@ -328,10 +328,13 @@ export function createRadarRepository({ directory, now = () => new Date(), timeZ
     return { aggregatedSnapshots, retainedSnapshots: retained.length };
   }
 
-  async function getDashboard({ period = "day", state: selectedState = "all", focus = "all", timeZone: selectedTimeZone, rank = rankRadar } = {}) {
+  async function getDashboard({ period = "day", state: selectedState = "all", focus = "all", timeZone: selectedTimeZone, rank = rankRadar, learning = "all", learningState = null, learningStatus = "ok" } = {}) {
     checked(z.enum(["day", "week", "month"]), period);
     checked(z.union([z.literal("all"), radarDecisionStatusSchema]), selectedState);
     checked(z.enum(["all", "agent", "ai-coding", "rag-knowledge", "ai-productivity"]), focus);
+    checked(z.enum(["all", "draft", "queued", "active", "archived"]), learning);
+    if (learningState !== null && !(learningState instanceof Map)) throw new TypeError("learningState must be a Map or null");
+    checked(z.enum(["ok", "unavailable"]), learningStatus);
     const store = await getState();
     const zone = checked(radarTimeZoneSchema, selectedTimeZone ?? store.schedule.timeZone);
     const queriedAt = clock();
@@ -342,19 +345,28 @@ export function createRadarRepository({ directory, now = () => new Date(), timeZ
     const decisionFor = (id) => decisions.get(id) ?? { repositoryId: id, status: "unread", updatedAt: null };
     const counts = Object.fromEntries(["all", ...radarDecisionStatusSchema.options].map((key) => [key, 0]));
     for (const item of store.repositories) { const status = decisionFor(item.id).status; counts[status]++; if (status !== "ignored") counts.all++; }
-    const repositories = store.repositories.filter((item) => {
+    // The learning-lifecycle filter is applied to the full pre-rank repository
+    // set, so it gates which repositories the leaderboards rank and truncate —
+    // never a post-truncation filter on already-sliced lists. Radar decision
+    // counts stay untouched (learning is a separate overlay, never written back
+    // to the radar decision), and eligibleCount keeps reflecting the radar
+    // decision/focus set rather than the learning overlay.
+    const decisionEligible = store.repositories.filter((item) => {
       const status = decisionFor(item.id).status;
-      return (selectedState === "all" ? status !== "ignored" : status === selectedState) &&
-        (focus === "all" || classifyRadarFocus(item).directions.includes(focus));
+      const matchesDecision = (selectedState === "all" ? status !== "ignored" : status === selectedState);
+      const matchesFocus = (focus === "all" || classifyRadarFocus(item).directions.includes(focus));
+      return matchesDecision && matchesFocus;
     });
+    const repositories = learning === "all" ? decisionEligible : decisionEligible.filter((item) => learningState?.get(item.id) === learning);
     const ids = new Set(repositories.map((item) => item.id));
     const ranked = rank({ repositories, snapshots: snapshots.filter((item) => ids.has(item.repositoryId)), period, preferences: store.preferences, now: new Date(asOf), timeZone: zone });
-    const lists = Object.fromEntries(Object.entries(ranked).map(([key, entries]) => [key, entries.map((entry) => ({ ...entry, decision: decisionFor(entry.repositoryId) }))]));
+    const learningFor = (id) => learningStatus === "unavailable" ? null : (learningState?.get(id) ?? null);
+    const lists = Object.fromEntries(Object.entries(ranked).map(([key, entries]) => [key, entries.map((entry) => ({ ...entry, decision: decisionFor(entry.repositoryId), learning: learningFor(entry.repositoryId) }))]));
     const orderedRuns = [...store.runs].sort((a, b) => b.sequence - a.sequence || b.startedAt.localeCompare(a.startedAt) || b.id.localeCompare(a.id));
     const projectRun = (run) => run ? { ...run, errors: run.errors.map((error) => safeRadarError(error)) } : null;
     const run = projectRun(orderedRuns[0]);
     const lastSuccessfulRun = projectRun(orderedRuns.find((item) => item.status === "success"));
-    return { period, timeZone: zone, localDate: radarLocalDate(asOf, zone), filters: { state: selectedState, focus }, counts, eligibleCount: repositories.length, lists,
+    return { period, timeZone: zone, localDate: radarLocalDate(asOf, zone), filters: { state: selectedState, focus, learning }, counts, eligibleCount: decisionEligible.length, lists, learningStatus,
       freshness: { queriedAt, asOf: lastDataAt, lastDataAt, lastSuccessAt: store.schedule.lastSuccessAt,
         stale: !lastDataAt || radarLocalDate(lastDataAt, zone) !== radarLocalDate(queriedAt, zone) || ["failed", "partial"].includes(run?.status) },
       run, lastSuccessfulRun, coverage: run?.collection ?? null, retryAt: store.collection.retryAt,

@@ -1,0 +1,135 @@
+import { LearningWorkspaceError } from "./learning-repository.mjs";
+
+// Deep orchestration over the S1 LearningWorkspaceRepository. Owns the parts of
+// the flow that cross an adapter seam (radar identity, GitHub head commit) and
+// the workspace-binding guard, so the HTTP layer stays a thin router and tests
+// can drive the whole no-model flow through one module.
+
+function fail(code, message, status = 400) {
+  throw new LearningWorkspaceError(code, message, status);
+}
+
+export class LearningServiceError extends LearningWorkspaceError {}
+
+export function createLearningService({
+  getLearning = null,
+  learning = null,
+  bound = (operation) => operation(),
+  resolveRepository = null,
+  getHeadCommit = null,
+  mutatable = true,
+  readable = true,
+  hosted = false,
+} = {}) {
+  if (!getLearning && !learning) throw new TypeError("learning repository is required");
+  if (learning && typeof learning !== "object") throw new TypeError("learning repository must be an object");
+  if (getLearning && typeof getLearning !== "function") throw new TypeError("getLearning must be a function");
+  if (typeof bound !== "function") throw new TypeError("learning service requires a bound wrapper");
+  if (resolveRepository !== null && typeof resolveRepository !== "function") throw new TypeError("resolveRepository must be a function or null");
+  if (getHeadCommit !== null && typeof getHeadCommit !== "function") throw new TypeError("getHeadCommit must be a function or null");
+
+  // Resolve the store lazily so hosted/read-only reads never bind or create a
+  // workspace before the capability gate has rejected the request.
+  const store = () => (getLearning ? getLearning() : Promise.resolve(learning));
+
+  const mutation = (operation) => {
+    if (hosted || !mutatable) {
+      fail("LEARNING_READ_ONLY", "当前工作区不允许修改学习项目。", 403);
+    }
+    return bound(operation);
+  };
+
+  function capabilities() {
+    return Object.freeze({
+      read: readable && !hosted,
+      create: !hosted && mutatable,
+      edit: !hosted && mutatable,
+      preview: !hosted && mutatable,
+      confirm: !hosted && mutatable,
+      activate: !hosted && mutatable,
+      archive: !hosted && mutatable,
+    });
+  }
+
+  async function list({ includeArchived = false } = {}) {
+    if (hosted) fail("LEARNING_UNAVAILABLE", "托管模式下学习数据不可用。", 404);
+    return (await store()).list({ includeArchived });
+  }
+
+  async function get(workspaceId) {
+    if (hosted) fail("LEARNING_UNAVAILABLE", "托管模式下学习数据不可用。", 404);
+    return (await store()).get(workspaceId);
+  }
+
+  async function createDraft({ repositoryId, mission }) {
+    if (hosted) fail("LEARNING_UNAVAILABLE", "托管模式下学习数据不可用。", 404);
+    if (!Number.isInteger(repositoryId) || repositoryId <= 0) {
+      fail("LEARNING_INVALID_INPUT", "学习工作区输入格式无效。");
+    }
+    // Idempotent path: an existing workspace for this repository is returned
+    // without touching GitHub, so transient GitHub unavailability never breaks
+    // the "already joined" case.
+    const existing = (await (await store()).list({ includeArchived: true })).workspaces.find((workspace) => workspace.repositoryId === repositoryId);
+    if (existing) return { workspace: existing };
+
+    if (!resolveRepository || !getHeadCommit) fail("LEARNING_SOURCE_UNAVAILABLE", "无法解析仓库来源。", 503);
+    const repository = await resolveRepository(repositoryId);
+    if (!repository) fail("LEARNING_REPOSITORY_NOT_FOUND", "雷达中不存在该仓库。", 404);
+    // Slow network work happens BEFORE the registry/store locks so the lock-held
+    // section never awaits GitHub.
+    let head;
+    try {
+      head = await getHeadCommit({ fullName: repository.fullName });
+    } catch (error) {
+      fail("LEARNING_GITHUB_UNAVAILABLE", "无法读取仓库最新提交，请稍后重试。", 503);
+    }
+    const sourceCommitSha = typeof head?.sha === "string" && /^[a-f0-9]{40}$/.test(head.sha) ? head.sha : null;
+    if (!sourceCommitSha) fail("LEARNING_GITHUB_UNAVAILABLE", "无法读取仓库最新提交，请稍后重试。", 503);
+
+    const workspace = await mutation(async () => (await store()).createDraft({
+      repositoryId,
+      fullName: repository.fullName,
+      sourceUrl: `https://github.com/${repository.fullName}`,
+      sourceCommitSha,
+      mission,
+    }));
+    // The store's createDraft already returns { workspace }; do not re-wrap.
+    return workspace;
+  }
+
+  async function editDraft({ workspaceId, expectedRevision, mission }) {
+    const result = await mutation(async () => (await store()).editDraft({ workspaceId, expectedRevision, mission }));
+    // The store's editDraft already returns { workspace }; do not re-wrap.
+    return result;
+  }
+
+  async function preview({ workspaceId }) {
+    const page = await mutation(async () => (await store()).preview({ workspaceId }));
+    const { workspace } = await (await store()).get(workspaceId);
+    return {
+      ...page,
+      repositoryId: workspace.repositoryId,
+      fullName: workspace.fullName,
+      sourceUrl: workspace.sourceUrl,
+    };
+  }
+
+  async function confirm({ token }) {
+    if (typeof token !== "string" || !token) fail("LEARNING_INVALID_INPUT", "确认凭证无效。");
+    const result = await mutation(async () => (await store()).confirm({ token }));
+    return { confirmed: result.confirmed, workspace: result.workspace };
+  }
+
+  async function activate({ workspaceId, expectedRevision }) {
+    const result = await mutation(async () => (await store()).activate({ workspaceId, expectedRevision }));
+    return { workspace: result.workspace, outcome: result.outcome };
+  }
+
+  async function archive({ workspaceId }) {
+    const result = await mutation(async () => (await store()).archive(workspaceId));
+    // The store's archive already returns { workspace }; do not re-wrap.
+    return result;
+  }
+
+  return Object.freeze({ capabilities, list, get, createDraft, editDraft, preview, confirm, activate, archive });
+}

@@ -59,6 +59,11 @@ import { createRadarRepository } from "./ai-radar/radar-repository.mjs";
 import { createRadarScheduler } from "./ai-radar/radar-scheduler.mjs";
 import { createRadarRoutes } from "./ai-radar/radar-routes.mjs";
 import { RadarRoutesError } from "./ai-radar/radar-errors.mjs";
+import { LearningWorkspaceError } from "./learning/learning-repository.mjs";
+import { createLearningRepository } from "./learning/learning-repository.mjs";
+import { createLearningService } from "./learning/learning-service.mjs";
+import { createLearningRoutes } from "./learning/learning-routes.mjs";
+import { WorkspaceRegistryError } from "./workspace-state/workspace-registry.mjs";
 import { createWorkspaceBackup } from "./workspace-state/workspace-backup.mjs";
 import { createWorkspaceRegistry } from "./workspace-state/workspace-registry.mjs";
 import { createWorkspaceRoutes } from "./workspace-state/workspace-routes.mjs";
@@ -926,6 +931,28 @@ export function workbenchApiPlugin({
     })();
     return radarRepositoryPromise;
   }
+  let learningRepositoryPromise = null;
+  function learningRepository({ create = true } = {}) {
+    learningRepositoryPromise ??= (async () => {
+      let resolvedDirectory = null;
+      const workspace = await currentWorkspace({ create });
+      if (!workspace) return null;
+      const stateRoot = workspace.storageLayout === "legacy"
+        ? path.join(workspaceRegistryDirectory, workspace.workspaceId)
+        : path.join(workspaceRegistryDirectory, "workspaces", workspace.workspaceId);
+      resolvedDirectory = path.join(stateRoot, "learning");
+      if (!create) {
+        try {
+          await lstat(resolvedDirectory);
+        } catch (error) {
+          if (error?.code === "ENOENT") return null;
+          throw error;
+        }
+      }
+      return createLearningRepository({ directory: resolvedDirectory, now: () => new Date() });
+    })();
+    return learningRepositoryPromise;
+  }
   let radarContextPromise = null;
   async function radarContext({ create = false } = {}) {
     if (radarContextPromise) {
@@ -1056,8 +1083,25 @@ export function workbenchApiPlugin({
     capabilities: radarApi.capabilities,
     repository: {
       async getDashboard(options) {
+        // Read-time merge of the learning lifecycle onto radar cards: a cheap
+        // local read that never writes back to the radar decision. A corrupt
+        // learning store signals "unavailable" on the base read and refuses a
+        // learning-filtered read outright, so it can never masquerade as "no
+        // learning projects".
+        const learning = options?.learning || "all";
+        let learningState = null;
+        let learningStatus = "ok";
+        try {
+          const listed = await learningService.list({ includeArchived: true });
+          learningState = new Map(listed.workspaces.map((workspace) => [workspace.repositoryId, workspace.state]));
+        } catch (error) {
+          learningStatus = "unavailable";
+          if (learning !== "all") {
+            throw new RadarRoutesError("RADAR_LEARNING_UNAVAILABLE", "学习状态当前不可用。", 503);
+          }
+        }
         const store = await radarApi.getStore();
-        return store ? store.getDashboard(options) : null;
+        return store ? store.getDashboard({ ...options, learningState, learningStatus }) : null;
       },
       async setDecision(repositoryId, status) {
         return (await radarRouteStore({ create: true })).setDecision(repositoryId, status);
@@ -1091,6 +1135,49 @@ export function workbenchApiPlugin({
         return updateRadarSchedule(patch);
       },
     },
+  });
+  // Learning service + routes over the S1 store. The service owns the parts of
+  // the flow that cross an adapter seam (radar identity, GitHub head commit) so
+  // the HTTP layer stays a thin router. Mutations run through a single
+  // withBoundWorkspace binding guard (registry lock) then the learning store's
+  // own lock; slow GitHub work happens before either lock. Reads resolve the
+  // current bound workspace and never create the learning directory.
+  const learningService = createLearningService({
+    getLearning: () => learningRepository({ create: true }),
+    bound: async (operation) => {
+      if (!registry) return operation();
+      const workspace = await currentWorkspace();
+      if (!workspace) {
+        throw new LearningWorkspaceError("WORKSPACE_NOT_FOUND", "当前 Vault 尚未绑定工作区。", 404);
+      }
+      try {
+        return await registry.withBoundWorkspace(
+          { fingerprint: vaultFingerprint, workspaceId: workspace.workspaceId },
+          operation,
+        );
+      } catch (error) {
+        if (error instanceof WorkspaceRegistryError && error.code === "WORKSPACE_BINDING_CHANGED") {
+          throw new LearningWorkspaceError(error.code, "工作区绑定已改变，请重新加载后重试。", 409);
+        }
+        throw error;
+      }
+    },
+    resolveRepository: async (repositoryId) => {
+      const store = await radarApi.getStore();
+      if (!store) return null;
+      const state = await store.getState();
+      const repository = state.repositories.find((item) => item.id === repositoryId);
+      return repository ? { fullName: repository.fullName } : null;
+    },
+    getHeadCommit: (input) => radarGithub().getHeadCommit(input),
+    mutatable: radarMutable,
+    readable: !hosted,
+    hosted,
+  });
+  const learningRoutes = createLearningRoutes({
+    service: learningService,
+    readOnly: projectReadOnly,
+    hosted,
   });
   const workspaceRouteRegistry = registry && radarMutable ? Object.freeze({
     ...registry,
@@ -1129,7 +1216,7 @@ export function workbenchApiPlugin({
         throw error;
       }
       const backup = createWorkspaceBackup({
-        providers: [await projectRepository(), await radarRepository()],
+        providers: [await projectRepository(), await radarRepository(), (await learningRepository()).registerBackupProvider()],
         secret: backupSecret,
         workspaceId: workspace.workspaceId,
       });
@@ -1153,6 +1240,7 @@ export function workbenchApiPlugin({
       workspacePromise = null;
       projectRepositoryPromise = null;
       radarRepositoryPromise = null;
+      learningRepositoryPromise = null;
       radarContextPromise = null;
       radarLifecyclePromise = null;
       workspaceBackupPromise = null;
@@ -1343,6 +1431,7 @@ export function workbenchApiPlugin({
           if (workspaceRoutes.matches(req, url)) return await workspaceRoutes.handle(req, res, url, json);
           if (projectRoutes.matches(req, url)) return await projectRoutes.handle(req, res, url);
           if (radarRoutes.matches(req, url)) return await radarRoutes.handle(req, res, url);
+          if (learningRoutes.matches(req, url)) return await learningRoutes.handle(req, res, url);
           if (readOnly && (!['GET', 'HEAD'].includes(req.method) || /^\/api\/(?:wiki-ingest|workflows|reader-explanations)(?:\/|$)/.test(url.pathname))) {
             return json(res, 403, { error: { code: "VAULT_READ_ONLY", message: "当前知识库为只读接入，不允许写入、执行脚本或启动 AI 工作流。" } });
           }

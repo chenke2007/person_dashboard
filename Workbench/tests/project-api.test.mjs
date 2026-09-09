@@ -298,7 +298,7 @@ test("exports and restores project state only after a safe preview is confirmed"
   });
   const exported = await request(fixture.origin, "/api/workspace/backup");
   assert.equal(exported.response.status, 200);
-  assert.deepEqual(Object.keys(exported.body.providers), ["ai-radar", "projects"]);
+  assert.deepEqual(Object.keys(exported.body.providers), ["ai-radar", "learning", "projects"]);
   assert.equal(JSON.stringify(exported.body).includes(fixture.vaultRoot), false);
 
   await request(fixture.origin, "/api/projects", {
@@ -310,7 +310,7 @@ test("exports and restores project state only after a safe preview is confirmed"
     body: exported.body,
   });
   assert.equal(preview.response.status, 200);
-  assert.deepEqual(preview.body.providers, [{ id: "ai-radar", version: 1, count: 0 }, { id: "projects", version: 1, count: 4 }]);
+  assert.deepEqual(preview.body.providers, [{ id: "ai-radar", version: 1, count: 0 }, { id: "learning", version: 1, count: 0 }, { id: "projects", version: 1, count: 4 }]);
   assert.equal((await request(fixture.origin, "/api/projects")).body.projects.length, 2);
 
   const confirmed = await request(fixture.origin, "/api/workspace/restore/confirm", {

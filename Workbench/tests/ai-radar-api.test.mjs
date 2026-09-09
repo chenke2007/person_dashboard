@@ -177,7 +177,7 @@ test("GET /api/ai-radar passes period/state/focus to the repository dashboard qu
   const response = await request(routes, "GET", "/api/ai-radar?period=week&state=saved&focus=agent");
 
   assert.equal(response.status, 200);
-  assert.deepEqual(repository.calls[0], ["getDashboard", { period: "week", state: "saved", focus: "agent" }]);
+  assert.deepEqual(repository.calls[0], ["getDashboard", { period: "week", state: "saved", focus: "agent", learning: "all" }]);
   assert.equal(response.body.localDate, "2026-09-02");
 });
 
@@ -205,7 +205,7 @@ test("GET /api/ai-radar defaults missing filters and rejects invalid periods saf
 
   const bare = await request(routes, "GET", "/api/ai-radar");
   assert.equal(bare.status, 200);
-  assert.deepEqual(repository.calls[0], ["getDashboard", { period: "day", state: "all", focus: "all" }]);
+  assert.deepEqual(repository.calls[0], ["getDashboard", { period: "day", state: "all", focus: "all", learning: "all" }]);
 
   const invalid = await request(routes, "GET", "/api/ai-radar?period=hourly");
   assert.equal(invalid.status, 400);

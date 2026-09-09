@@ -1,15 +1,16 @@
-# Repository Summary and Learning Entry Implementation Plan (Phase 2 — corrected)
+# Repository Summary and Learning Entry Implementation Plan (Phase 2 — corrected contract v2)
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. Implement strictly one vertical slice at a time: one failing behaviour test → minimal implementation → pass. Do not batch-write all tests before implementing, and never test private methods.
 
-**Goal:** Let users create fixed-version, per-repository learning workspaces with reviewable missions and a three-active-project limit, with an optional model adding summaries and task-draft hints. The no-model path (select repo → manual mission draft → confirm → independent workspace) must work end-to-end.
+**Goal:** Let users create fixed-version, per-repository learning workspaces with reviewable, editable missions and a three-active-project limit. The no-model path (radar card "加入学习" → choose one of five goals and edit the task draft → review fixed commit → confirm → independent workspace) must work end-to-end. Optional model summaries, relevance and task-draft hints are later slices, never a prerequisite.
 
 **Architecture (verified against current code):**
-- The GitHub client already exposes `getReadme` and `getHeadCommit` (`server/ai-radar/github-client.mjs:302`) and `createGitHubRadarClient` handles auth, rate-limit, ETag, pagination and timeout. Phase 2 reuses these read capabilities as-is; only shallow-clone of a fixed commit is net-new (a later slice, not phase 2).
-- The knowledge assistant model transport (`server/knowledge-chat/model.mjs` `createModelClient` + `loadModelConfig`) is Anthropic-compatible but coupled to `KnowledgeError` and `/v1/messages` streaming. Phase 2 wraps the same transport shape behind a **provider-neutral optional structured model** interface and does **not** import `knowledge-chat` internals into radar/learning modules.
-- Radar decision status already includes `summarized | queued | learning | completed` (`server/ai-radar/radar-schema.mjs:78`), but there is **no** `RepositorySummary` schema, **no** learning workspace store, **no** migration registry, and **no** 3-active enforcement. All of those are net-new.
+- `createGitHubRadarClient` (`server/ai-radar/github-client.mjs:302`) already exposes `getReadme` and `getHeadCommit`, plus auth, rate-limit, ETag, pagination and timeout. **Both return objects, not scalars**: `getHeadCommit({ fullName, ref? })` → `{ fullName, ref, sha, committedAt, observedAt }` (use `.sha`); `getReadme({ fullName, ref? })` → `{ fullName, ref, sha, path, content, observedAt }` where `sha` is the README **blob** SHA, not a commit SHA. Summary reading must pass the fixed commit as `ref` explicitly.
+- The knowledge assistant model transport (`server/knowledge-chat/model.mjs` `createModelClient` + `loadModelConfig`) is Anthropic-compatible but coupled to `KnowledgeError` and `/v1/messages` streaming. Phase 2 **reuses/extends the existing transport shape** behind a provider-neutral optional structured model interface; it does **not** import `knowledge-chat` internals into radar/learning modules, and never duplicates a second request implementation.
+- Radar decision status already reserves `queued | learning | completed` (`server/ai-radar/radar-schema.mjs:78`). There is **no** `RepositorySummary` schema, **no** learning workspace store, **no** 3-active enforcement, and **no** migration registry. The learning workspace store is net-new; summary storage is a later slice.
 - Learning workspaces live in the **stable bound-workspace app-state** (`appDataRoot/PersonalAIWorkbench/workspaces/{workspaceId}/learning/`), independent of the Vault path, and register as a third backup provider implementing the existing `{ id, schemaVersion, exportState, validateImport, replaceState, stageImport }` contract so it slots into `createWorkspaceBackup` with zero new plumbing.
-- Reuse the existing primitives: `createTicketLock` (cross-process lock), atomic tmp→fsync→rename, bounded inode-checked reads + symlink rejection + size caps + schema/version validation, `withBoundWorkspace` binding (rejects stale bindings with `WORKSPACE_BINDING_CHANGED`), and the backup exclusion rules (no credentials / cache / real Vault bodies / absolute paths).
+- Lock primitives are **per-store and independent**: radar holds `radar.lock`, the registry holds `workspace-registry.lock`, and the learning store holds its own lock — each via `createTicketLock` (`server/workspace-state/ticket-lock.mjs:41`). `withBoundWorkspace` (`server/workspace-state/workspace-registry.mjs:456`) is a **binding guard**: it takes the registry lock to verify the current binding, then runs the operation. It is **not** a cross-store transaction or rollback mechanism. A learning mutation runs `withBoundWorkspace` (registry lock) **then** the learning store's own lock, sequentially, each held only for its own fast local write. Slow work (`getHeadCommit`, model calls) happens **before** either lock is taken.
+- Backup exclusion rules already reject credentials / cache / real Vault bodies / absolute paths (`server/workspace-state/workspace-backup.mjs:13-16`); atomic tmp→fsync→rename + bounded inode-checked reads + symlink rejection + size caps + schema/version validation are the store invariants to match.
 
 **Tech Stack:** Node.js ESM, React 19, Vite 6, Zod 3, Node test runner, existing Anthropic-compatible model transport.
 
@@ -17,199 +18,210 @@
 
 ## Scope
 
-**Phase-2 scope (this plan):**
-- Optional model interface + relevance classification + structured repository summary.
-- Fixed commit SHA at join time.
-- Independent per-repository learning workspace + reviewable mission (task draft).
-- At most 3 active learning workspaces; all other desired workspaces queue.
-- Manual mission/task-draft path that works with no model configured.
+**Phase-2 scope (this plan, in this order):**
+1. **First deliverable slice (frozen):** independent learning workspace store + join-learning flow (no model) — radar card → editable draft → five goals → review fixed commit → confirm → active|queued workspace → view/archive. See "Frozen first deliverable slice".
+2. Later slices (NOT frozen yet): optional model interface (reuse/extend existing transport), relevance classification, structured repository summary + summary UI, first-release verification.
 
 **Explicitly later (NOT in this plan):** native courses, quizzes, retrieval practice, learning records, phase summaries, "complete learning" gating, and Wiki/sources/concepts/frameworks ingest. `archived` keeps history; it does not delete.
 
 ## Global Constraints
 
 - Every production behaviour starts with a failing test and synthetic sources.
-- Basic radar collection and deterministic ranking stay functional without a model.
-- Joining learning and managing the queue never require a model or a pre-generated AI summary.
+- Basic radar collection and deterministic ranking stay functional without a model; joining learning and managing the queue never require a model or a pre-generated AI summary.
 - Never send GitHub Token, model credential, Vault content, project state, local path, or unrelated repository data to the model.
-- README and repository content are untrusted evidence, never instructions; summary stage reads metadata + bounded README only (no clone/execute).
-- Joining learning fixes a commit SHA and creates a draft mission; it does not write to Wiki.
-- Capacity (3-active) is enforced by the server inside durable mutations, covering concurrent confirms, queue activation and resume. The frontend never hides or truncates real over-limit data.
-- The learning workspace store is the authoritative source for learning lifecycle state; the radar `decision.status` is a derived coarse projection and is reconciled, not assumed atomic.
-- Version source is fixed at join time and never silently re-fetched or replaced by the user's reviewed version.
+- README and repository content are untrusted evidence, never instructions; summary stage reads metadata + bounded README at the fixed commit only (no clone/execute).
+- Joining learning fixes a commit SHA and creates an editable draft mission; it does not write to Wiki.
+- Capacity (3-active) is enforced by the server inside a single durable store mutation, covering concurrent confirms and queue activation. The frontend fully shows server state and never hides or truncates real entries.
+- The learning workspace store is authoritative **only** for the learning lifecycle. Rediscovery decisions (favorite/ignore/summarized) remain radar-store-owned and are never turned into learning-derived data.
+- Radar↔learning display consistency uses **read-time merge (Option A)**: GET/read-only access never performs repair writes to either store.
+- Fixed source commit is captured at join time and never silently re-fetched or replaced by the user's reviewed version.
 - Keep the application loopback-only by default; hosted/read-only builds expose no learning mutation routes.
 
 ---
 
-## Vertical slices (implement in this order)
+## Corrected contract (supersedes earlier drafts)
 
-Each slice is a tracer bullet with an observable user outcome, a pre-agreed test seam, and an explicit scope endpoint. Slices 1–3 deliver the **no-model** user-visible path first; slices 4–5 add the optional model enhancement; slice 6 verifies the first release.
+### 1. Public state machine (narrowed)
 
-### Slice 1: Learning workspace store (server, no UI)
-
-The deep module behind every later slice. Hides state machine, capacity, idempotency, persistence and the backup-provider contract behind one small interface. No user-visible UI yet.
-
-**User-observable result:** none yet (foundation). Foundation behaviour is fully covered by interface tests on a temp real store.
-
-**Public interface** — `server/learning/learning-schema.mjs`, `server/learning/learning-repository.mjs`:
-
-```js
-export const LEARNING_STATES = ["draft","queued","active","review","completed","archived"];
-createLearningRepository({ directory, now, makeId, ticketLock, backupSchemaVersion })
-  // -> { createDraft, confirm, list, get, archive, markTransition, registerBackupProvider }
-```
-
-- `createDraft({ repositoryId, fullName, sourceUrl, sourceCommitSha, mission }) → workspace(state="draft")`
-  - invariants: exactly one independent workspace per repository; `sourceCommitSha` is exactly 40 hex; workspace uses a live-relative id (no absolute path).
-- `confirm({ repositoryId, token }) → { workspace, state }` — idempotent for a signed, time-boxed token; fourth concurrent confirm queues rather than failing silently; capacity checked inside a **single persisted mutation** (no read-then-write race).
-- `list({ includeArchived })`, `get(workspaceId)`, `archive(workspaceId)`, `markTransition(...)`.
-- `registerBackupProvider()` → `{ id:"learning", schemaVersion, exportState, validateImport, replaceState, stageImport }`.
-
-**State machine** (only `active` counts toward the limit of 3):
+This phase exposes only these transitions:
 
 ```text
-draft -> active | archived         (draft is unconfirmed; does not count)
+draft  -> active | queued | archived
 queued -> active | archived
-active -> review | archived
-review -> completed | active       (resume; if full, stays in review with ACTIVE_LIMIT_REACHED)
-completed -> archived
+active -> archived
 ```
 
-**Dependencies:** `server/workspace-state/ticket-lock.mjs` (`createTicketLock`, cross-process lock), `server/workspace-state/backup-schema.mjs`; pattern-match `server/ai-radar/radar-repository.mjs` atomic write + bounded inode-checked read + symlink rejection + size cap + schema/version validation + `.superpowers`-free error class `LearningWorkspaceError` + `safeLearningError` mapped via the existing `safeRadarError` style route-facing normalization.
+- `review` and `completed` are **reserved values** recognized by the schema but **unreachable** — no transition entry is provided this phase. Do not add `active → review`, `review → active|completed`, or `completed → archived` transitions.
+- Only `active` counts toward the limit of **3**.
+- A 4th draft confirm enters `queued` (never fails silently).
+- Queue activation (`queued → active`) when already at 3 active: stays `queued` and returns an explicit `ACTIVE_LIMIT_REACHED` result (no auto-promotion, no data loss).
+- Capacity is checked and enforced **inside the same single durable mutation** (no separate read-then-write race), serialized by the store's ticket lock, so concurrent confirms/activations in the same store cannot exceed 3 active.
+- `archive` is the only terminal transition this phase and is idempotent (archiving an already-archived workspace returns the same workspace).
 
-**Test seam:** the public `LearningWorkspaceRepository` interface, exercised against a temporary real on-disk store (not a fake). **This is pending review — no test written in this step.**
+### 2. Confirm contract (closed loop)
 
-**Acceptance criteria:** draft→confirm under capacity→active; fourth confirm→queued; duplicate confirm returns the same workspace; corrupt store→read-only recover (never overwrite); resume-when-full→`ACTIVE_LIMIT_REACHED` keeping `review`; `exportState`→`replaceState` round-trip; `stageImport` rolls back committed providers in reverse on any commit failure; backup provider exports only recoverable metadata (no cloned source cache, no credentials, no README bodies, no absolute paths).
+The token is **issued by the store's own preview step** — no confirm path may require a token that has no issuing interface.
 
-**Scope endpoint:** all server transitions + persistence + backup-provider contract pass with a temp real store. No routes, no UI, no reconciliation yet.
+```text
+createDraft({ repositoryId, fullName, sourceUrl, sourceCommitSha, mission }) -> { draft }   (state=draft; one per repository)
+editDraft({ draftId, mission })                                      -> { draft }   (edit goal/notes while draft)
+preview({ draftId })                                                 -> { token, expiresAt, bound }
+   bound = { repositoryId, workspaceId, goal, sourceCommitSha }      // snapshot the user reviews
+confirm({ token })                                                   -> { workspace, outcome: "active"|"queued"|"already-confirmed" }
+list({ includeArchived }) / get(workspaceId) / archive(workspaceId)  -> workspace(s)
+```
+
+- **Valid, unconsumed token**: confirms only the exact bound draft — the bound `repositoryId`, `workspaceId`, `goal`, and `sourceCommitSha` are the values confirmed. Nothing else is accepted.
+- **Retry of the same already-successful confirm**: returns the existing result (same workspace, same `outcome`), **never** creates a duplicate workspace or placeholder. This requires the store to persist the consumed-token → outcome **receipt**.
+- **Unused-but-expired / input-drifted / ownership-mismatched token**: rejected with `CONFIRM_TOKEN_INVALID`. Input drift = the live draft's `goal`/`sourceCommitSha`/`repositoryId` no longer match the token's `bound` (user edited or a different commit appeared) → force a fresh `preview`. Ownership mismatch = token wasn't issued for this store/binding.
+- **Receipt retention & restart retry**: consumed-token receipts persist in the store, bounded by a TTL (e.g. 24h, gc'd like other retention). After a process restart, a replayed token returns the persisted receipt (idempotent replay). After the receipt TTL expires, a replayed token rejects with `CONFIRM_TOKEN_CONSUMED`; the workspace remains discoverable via `get(workspaceId)`/`list`/repository lookup, so the client recovers without re-creating.
+- **Closed responsibilities**: `createDraft`/`preview`/`editDraft` never transition state out of `draft`; only `confirm` consumes a token and transitions to `active`/`queued`. Every return value is complete for its caller (draft returns the editable draft; preview returns token+bound snapshot; confirm returns workspace+outcome).
+
+### 3. Radar ↔ learning consistency (Option A: read-time merge)
+
+**The learning store is authoritative only for the learning lifecycle.** Rediscovery decisions (`saved`/`ignored`/`summarized`/`unread` via radar `setDecision`) are owned by the radar store and are never rewritten from learning state. Phase 2 sets **no** `queued`/`learning`/`completed` decision values on the radar store — those enum slots stay reserved/unused this phase; the learning lifecycle lives entirely in the learning store.
+
+**Display mapping (draft/queued/active/archived → radar card):** the radar dashboard read path joins the learning store per repository and overlays the lifecycle facet; the discovery decision is untouched:
+
+| Learning state | Radar card shows | Rediscovery decision |
+|---|---|---|
+| (no workspace) | discovery decision only | unchanged (saved/ignored/summarized/unread) |
+| draft | "学习（草稿）" | unchanged |
+| queued | "学习中（排队）" | unchanged |
+| active | "学习中" | unchanged |
+| archived | "已归档" | **unchanged** — archive does not alter the repo's earlier favorite/ignore/summarized decision |
+
+**Why Option A (read-time merge) over Option B (write-back):**
+- Option B introduces a sync-intent record, an idempotent write-back, and a "confirm write-back complete" handshake between two stores with independent locks. That machinery is exactly the class of failure the step warns about (write ordering, crash between learning-write and radar-write, retry/restart/late-op races, rebind during sync) — and it risks learning writes clobbering user rediscovery decisions.
+- Option A removes the cross-store write path entirely: the learning store is the single truth for lifecycle; the radar read path merges it live. There is nothing to converge because there is no second copy to keep in sync.
+- Cost: the radar dashboard read does one extra local read of the learning store (no network). That is cheap and localized to the read path.
+- GET and read-only access never perform repair writes by construction — a read-merge has no write path.
+
+**Failure-window / retry / restart / late-op / rebind analysis (Option A):**
+- Cross-store write ordering: none exists; there is no write to the radar store from learning code, so there is no ordering or crash window between two stores.
+- Late-completing old op: a confirm that finishes after a GET started yields a later GET showing the newer lifecycle state; benign (read-time, eventual), never a write.
+- Retry/restart: the learning store persists the transition; a restarted process re-reads it. No reconciliation step needed.
+- Rebind: the learning store lives under the bound workspace; after Vault rebind, reads use the newly bound store and the (also re-bound) radar store. No cross-store repair.
+- **Lock scope and order (corrected):** each store serializes its own writes under its own `createTicketLock`. A learning mutation is `withBoundWorkspace(...)` (registry lock; verifies binding, aborts `WORKSPACE_BINDING_CHANGED` if moved) **then** the learning store's own lock for the durable write — sequential, each held only for its own fast local op. `withBoundWorkspace` is a **binding guard, not a cross-store rollback**: it does not commit/rollback the radar store and must not be described as such. **Slow work (`getHeadCommit`, model calls) runs before any lock.** The lock-held section never awaits GitHub or the model.
+
+### 4. Unified backup contract
+
+Recovery scope by asset class:
+
+| Asset class | Backup/restore | Examples |
+|---|---|---|
+| Metadata | **recoverable** | `workspace.json`, state, goal, `sourceCommitSha`, `sourceUrl`, version, timestamps, receipt TTL bookkeeping |
+| User-written files | **recoverable** | authored mission/task notes (`MISSION.md`, `NOTES.md`) — authored learning assets |
+| Generated files | **recoverable only if learning records** | validated, source-referenced learning artifacts (checksum, source refs); **not** transient model output |
+| Cache | **never backed up** | shallow clone, fetched README cache, transient model checkpoints |
+
+- **Old backups missing the `learning` provider**: `learning` is `optionalForImport` (like `radar`), so an old projects/radar-only backup imports cleanly and the **existing learning data is preserved** (not deleted, not overwritten).
+- **Framework vs provider responsibility split:** the backup framework provides the bundle format, checksum, per-provider version validation, two-phase `stageImport` (stage all → commit sequentially → reverse rollback on any commit failure), and atomic per-provider replace. The **learning provider itself** must guarantee, at its own file level: atomic tmp→fsync→rename commit, failure recovery that leaves the prior valid state on a partial write, and corruption protection (bounded inode-checked reads, symlink rejection, size cap, schema/version validation).
+- **Absent store is a no-op:** `list`, `get`, `exportState`, and the radar read-merge must treat a missing learning store as empty and **must not create the store directory** on read-only query/export. Directory creation happens only on an actual mutation.
+
+### 5. User-action semantics
+
+- Clicking "加入学习" opens an **editable draft** (mission dialog with the five goals + free text), not an immediate activation.
+- After the user confirms, the workspace enters **`active`**, or **`queued`** if 3 are already active — per capacity, decided server-side in the single mutation.
+- **No automatic Wiki write** on join/confirm.
+- The UI renders the server's full state: active/queued/drafts/archived sections plus any `ACTIVE_LIMIT_REACHED`/`CONFIRM_TOKEN_*` outcome. It never clips entries — if the server ever returns more than 3 active, the UI surfaces a data-anomaly state rather than truncating.
+
+### 6. Fixed-source contract
+
+- Use `getHeadCommit({ fullName })` → returns an **object**; the pinned commit SHA is **`.sha`** (40-hex), not the whole object.
+- `getReadme({ fullName, ref })` → returns `{ sha, ... }` where `sha` is the **README blob SHA**, never a commit SHA.
+- Summary generation must explicitly pass the **fixed commit's SHA as `ref`** to `getReadme` so the README is read at the pinned commit; it records the blob `sha` as the README source and the fixed commit SHA as the summary source commit.
+- **Record summary-source commit and learning fixed commit independently**: the summary keeps its own `sourceCommitSha`; the learning workspace keeps its own pinned `sourceCommitSha`. When they differ, both are stored and surfaced; neither overwrites the other, and confirm never silently swaps them.
 
 ---
 
-### Slice 2: Join-learning orchestration + fixed version (server routes)
+## Frozen first deliverable slice
 
-The server half of the user-visible path, still no UI. Pins the commit, issues preview/confirm, and reconciles the radar decision.
+**Final user result (must work end-to-end, no model):**
 
-**User-observable result:** an HTTP caller can, for a chosen repository: preview a mission pinning current HEAD, confirm it into an independent workspace (or queue if full), list/get/archive workspaces, and see the radar card decision reflect queued/learning/completed — all with **no model configured**.
+```text
+雷达卡片 "加入学习"
+  → 选择五种目标之一并编辑任务草案
+  → 审核固定 commit
+  → 确认
+  → 独立工作区展示来源、目标和状态
+第 4 个进入队列，用户可查看和归档
+```
 
-**Public interface** — `server/learning/learning-service.mjs`, `server/learning/learning-routes.mjs`:
+Implementation checkpoints within this slice (mark as done only at the checkpoint, do **not** claim a checkpoint is "complete user capability" on its own):
+
+- **Checkpoint S1 — store:** `LearningWorkspaceRepository` (see interface below) fully passes its interface tests on a temp real store: state machine, capacity, idempotent confirm, read-only-without-store, restart persistence, backup-provider contract.
+- **Checkpoint S2 — HTTP:** `LearningService` + routes wire `getHeadCommit` (preview fixes commit) + `createDraft/editDraft/preview/confirm/list/get/archive`; confirm → active|queued server-side; hosted/read-only writes fail.
+- **Checkpoint S3 — UI:** radar card "加入学习" → editable mission dialog (five goals) → review fixed commit → confirm → learning workspace page (source/goal/state) + queue view with archive.
+
+Freeze rule: the slice is accepted only when **all three checkpoints** are green together against temp real stores and synthetic GitHub/model responses. The store alone is an internal foundation, not a deliverable user capability; do not ship any single checkpoint as "the feature done".
+
+**Out of this slice:** optional model, summaries, relevance, migration registry, courses, completion, Wiki ingest.
+
+---
+
+## Next implementation checkpoint — LearningWorkspaceRepository (interface & test seams)
+
+Only this next piece is detailed. Everything below is the public interface under test; tests observe behaviour **through this interface** on a **temporary real on-disk store**, never by reading internal JSON as the primary assertion.
+
+**Inputs / return values**
 
 ```js
-createLearningService({ github, summaries, learning, radar, now })
-  // -> { previewMission, confirmMission, listWorkspaces, getWorkspace, archiveWorkspace, reconcile }
+createLearningRepository({ directory, now, makeId?, ticketLock?, schemaVersion })
+  -> {
+      createDraft(input),   editDraft(input),   preview({ draftId }),
+      confirm({ token }),   list({ includeArchived }),   get(workspaceId),
+      archive(workspaceId), registerBackupProvider(),     exportState(), validateImport(value), replaceState(value)
+    }
 ```
 
-Routes under `/api/learning`: `POST /api/learning/preview`, `POST /api/learning/confirm`, `GET /api/learning`, `GET /api/learning/:id`, `POST /api/learning/:id/archive`. Summary stays under radar `/api/ai-radar`; learning lifecycle stays under `/api/learning`.
+- `createDraft(input)` input `{ repositoryId, fullName, sourceUrl, sourceCommitSha, mission }`; `mission = { goal, notes? }`; `goal ∈ { understand-architecture, learn-usage, analyze-design, reproduce-capability, adoption-decision }`. Returns `{ draft }` with `state:"draft"`, a workspace id that is live-relative (no absolute path), and 40-hex `sourceCommitSha` enforced.
+- `editDraft({ draftId, mission })` returns `{ draft }` only while `state==="draft"`; edits goal/notes; re-validates constraints.
+- `preview({ draftId })` returns `{ token, expiresAt, bound: { repositoryId, workspaceId, goal, sourceCommitSha } }`; issues a fresh single-consumption token bound to the current draft snapshot; the `bound` is what the user reviews.
+- `confirm({ token })` returns `{ workspace, outcome }` (`active`|`queued`|`already-confirmed`); consumes the token, persists the receipt, applies capacity in the same mutation.
+- `list({ includeArchived })` / `get(workspaceId)` / `archive(workspaceId)` return workspaces or a clear `WORKSPACE_NOT_FOUND`; `archive` is idempotent.
+- `registerBackupProvider()` returns `{ id:"learning", schemaVersion, exportState, validateImport, replaceState, stageImport }`.
 
-**Fixed-version source interface (reused as-is):** `github.getHeadCommit({ fullName })` (`server/ai-radar/github-client.mjs:292`, returns 40-hex default-branch HEAD). Preview pins this SHA into the mission token. Confirm binds exactly the previewed commit; it never silently re-fetches HEAD or replaces the user-reviewed version. If the summary `sourceCommitSha` differs from the joined version, record both and surface the difference; do not overwrite.
+**Draft edit & confirm (closed loop):** drafting, editing, previewing and confirming are separated as above; only `confirm` transitions state; preview is the sole token issuer; confirm validates the token bound against the live store.
 
-**No-model flow:** preview/confirm accept a user-supplied mission goal (`understand-architecture | learn-usage | analyze-design | reproduce-capability | adoption-decision`, per spec) and optional notes. An AI summary is an *optional enrichment*, never a prerequisite for join. When `optionalModel.available === false`, the manual draft path proceeds and the API returns an explicit `SUMMARY_UNAVAILABLE` capability signal while the base flow stays usable.
+**Idempotency / capacity / archive**
+- Same consumed token replayed → same `outcome`, no duplicate workspace.
+- 4th active-confirm → `queued`; queue activation at 3 active → stays `queued` + `ACTIVE_LIMIT_REACHED`.
+- Archive idempotent; archived workspace retrievable via `get`/`list({includeArchived:true})`.
 
-**State consistency (authority + reconcile):** the learning store is authoritative; radar `decisions[repositoryId].status` is a derived coarse projection. A mutation commits the learning record first, then issues the radar decision write. If the radar write fails, the learning record marks `radarDecisionSync:"pending"`. `reconcile()` re-derives the decision from authoritative learning state and retries the write; it runs at startup, before any radar dashboard/decision read, and before the next learning operation — so duplicates, retries and restarts converge deterministically. All binding-sensitive mutations run inside `registry.withBoundWorkspace(...)`; a mid-mutation rebind aborts atomically with `WORKSPACE_BINDING_CHANGED`.
+**Read-only without store (no directory created):** `list`/`get`/`exportState` on a missing store return empty (or `WORKSPACE_NOT_FOUND` for `get`) and do **not** create the store directory; only a mutation creates it.
 
-**Dependencies:** `github.getHeadCommit` (existing), `LearningWorkspaceRepository` (Slice 1), radar repository + `setDecision` (`server/ai-radar/radar-repository.mjs:425`), `server/ai-radar/radar-schema.mjs` decision statuses, `vite-plugin-workbench.mjs` route registration gated to local, non-read-only (`radarMutable`-style guard: `!hosted && !projectsReadOnly`).
+**Restart persistence via the same interface:** after re-creating `createLearningRepository({ directory: sameDir, ... })` in a fresh process, `list`/`get` return the previously persisted workspaces and confirm-receipts through the same public interface — verify by interface query, not raw file reads.
 
-**Test seam:** the fixed-version source interface (`getHeadCommit`) + the learning routes HTTP boundary (real `createLearningRoutes` + call-recording fake github/learning/radar, matching the existing `tests/ai-radar-api.test.mjs` style). **Pending review — no test written.**
-
-**Acceptance criteria:** preview pins current HEAD; confirm rejects drifted/expired/duplicate tokens; fourth confirm queues server-side; unreachable commit keeps the prior pinned version with a safe error (never silently switch HEAD); radar decision reconciles to queued/learning/completed; hosted/read-only writes fail (403/404); no route clones or executes repository code.
-
-**Scope endpoint:** all learning HTTP commands work with a manual draft and no model. No summary generation, no UI.
-
----
-
-### Slice 3: No-model learning UI (first fully user-visible slice)
-
-Delivers the end-user path: **选择仓库 → 手工任务草案 → 确认 → 独立学习工作区**, plus the queue with active-limit feedback and archive.
-
-**User-observable result:** from a radar card the user can open a mission dialog, pick one of the five goals, optionally write notes, confirm, and land on an independent learning workspace page showing source URL + pinned commit + mission. If 3 are already active, the fourth clearly queued. Without a model, radar still renders and the join path works; summary/hint areas explain configuration instead of blocking.
-
-**Public interface** — `server/learning/learning-routes.mjs` (Slice 2) + client model `src/lib/learning-api.js`, `src/lib/learning-model.js`:
-
-- Reuse the `command(path, payload)` + `queryParams` pattern from `src/lib/ai-radar-api.js` / `workspace-api.js`; pure projections mirror `src/lib/ai-radar-model.js` (`projectLearningQueue(payload) → { active, queued, drafts, archived, limit, error }`). The projection **must not hide** entries the server returns; if the server ever returns >3 active it surfaces a data-anomaly state, never truncates.
-- Components (reuse `src/components/projects/TaskDrawer.jsx` drawer skeleton): `RepositorySummaryDrawer.jsx`, `LearningMissionDialog.jsx`, `LearningQueue.jsx`, `src/pages/LearningPage.jsx`; route + nav registered only under the existing `localWorkbench = import.meta.env.VITE_WORKBENCH_HOSTED !== "true"` block in `src/App.jsx` / `AppShell.jsx` (hosted builds omit learning navigation).
-- Async state mirrors `src/pages/AiRadarPage.jsx` presentational/container split + per-action busy/error maps + out-of-order guard; read-only/hosted gating relies on server `403` + the `LOCAL_API_UNAVAILABLE` normalization in `src/lib/api-errors.js` and client-side capability arbitration like radar.
-
-**Test seam:** the HTTP capability + user-visible interaction boundary — the existing `ai-radar-ui.test.mjs` mount harness (`react-dom/client` + happy-dom + globally mocked fetch recording `(path, method)`), plus `renderToStaticMarkup` static render like `projects-ui.test.mjs`. **Pending review — no test written.**
-
-**Acceptance criteria:** mission dialog exposes exactly the five goals + confirmation; confirm never immediately activates or writes Wiki; learning page separates active/queued/drafts/archived with active count never displayed above 3 and always matching a server-enforced invariant; archive requires an explicit action and does not delete workspace files; source URL + pinned commit + mission visible; model-unavailable banner shows rather than a blocked join.
-
-**Scope endpoint:** complete no-model learning lifecycle usable in the UI. No summary drawer content, no model hints.
+**Backup-provider public contract:** `exportState` → `validateImport` → `replaceState` round-trips; `stageImport` returns `{ commit, rollback, cleanup }`; absent learning provider in an old backup is tolerated (`optionalForImport`) and leaves existing data intact; provider `exportState` never emits credentials, absolute paths, real Vault bodies, or clone/README cache.
 
 ---
 
-### Slice 4: Optional structured model interface
+## Test seams & key behaviours (for confirmation — no test written in this step)
 
-Provider-neutral seam reusing the existing transport shape without coupling to `knowledge-chat`.
+**Recommended seams (observe through the public interface, temp real stores, synthetic GitHub/model at external adapter seams):**
 
-**User-observable result:** a capability endpoint reports whether structured generation is available; when it is, radar relevance and summaries enrich the join path (feeding Slice 5). When it is not, the base flow is unchanged with a clear reason.
+1. **Slice-1 seam — `LearningWorkspaceRepository` interface** (temp real store). Key behaviours: confirm under capacity→active; 4th→queued; queue activation when full→stays queued + `ACTIVE_LIMIT_REACHED`; same-token replay→`already-confirmed` no duplicate; expired/drifted/ownership-mismatched token→`CONFIRM_TOKEN_INVALID`; archive idempotent; read-only query on missing store→empty and **no directory created**; re-create repository on same dir→same workspaces/receipts through the interface; `exportState`→`replaceState` round-trip; `stageImport` reverse-rollback on commit failure; provider exports exclude credentials/cache/abs-path/Vault body.
 
-**Public interface** — `server/models/structured-model.mjs`:
+2. **Slice-2 seam — fixed-version source + routes HTTP boundary.** Key behaviours: `getHeadCommit` returns an object, use `.sha`; preview pins `.sha` into the token bound; confirm rejects drifted/expired/duplicate/ownership token; 4th queues server-side; unreachable commit keeps prior pinned version with safe error (never silent HEAD switch); local/read-only gate (403/404 on hosted/read-only write); no route clones or executes code. (Cross-store coordination uses **temp real learning AND radar stores**; GitHub/model use synthetic responses at adapter seams — do not prove real transactions/concurrency with all-fake stores.)
 
-```js
-createStructuredModel({ transport })
-loadOptionalModel({ config, settingsPath }) // -> { available:false, reason } | { available:true, model }
-// transport.generate({ system, prompt, schema, timeoutMs }) -> validated value (throws on invalid/timeout)
-```
+3. **Slice-3 seam — HTTP capability + user-visible interaction** (`ai-radar-ui.test.mjs` mount harness + `renderToStaticMarkup`). Key behaviours: "加入学习" opens editable draft; five goals selectable; review fixed commit; confirm→active|queued; workspace page shows source/goal/state; 4th visible in queue and archivable; full state rendered — no clipping of server entries; hosted build hides learning nav; model-unavailable state never blocks the manual path.
 
-- Reuses the Anthropic-compatible transport shape of `createModelClient`/`loadModelConfig` (`server/knowledge-chat/model.mjs`) but **provider-neutral**: takes the configured base URL/token/model and its own error type (matching the `GitHubRadarError`/`RadarRepositoryError` convention), **does not import `KnowledgeError` or `./errors.mjs`**, does not assume Codex/vendor.
-- Explicit availability probe (config present + reachable), schema-validated generation (Zod), and an internal timeout so invalid output is rejected for regeneration and a missing model yields `{ available:false, reason }` with a safe message. No credentials in errors. One adapter (the existing transport) — no generic multi-vendor framework.
-
-**Test seam:** the optional structured model interface with synthetic `transport` completions (valid JSON, invalid JSON, schema mismatch, timeout, unavailable config). **Pending review — no test written.**
-
-**Acceptance criteria:** unavailable→`MODEL_NOT_CONFIGURED` explicit result and base radar/learning unaffected; valid JSON passes schema; invalid JSON / schema mismatch / timeout are rejected with safe codes and never leak credentials; existing knowledge tests still pass (no behaviour change to `knowledge-chat`).
-
-**Scope endpoint:** `loadOptionalModel` + `generate` validated. No radar/learning wiring yet.
+**Boundary notes:** tests assert through the public interface and rendered UI, not by reading internal JSON files. Never use all-fake stores to claim real transaction/concurrency invariants; use real stores for store/reconcile-level tests and synthetic responses only for GitHub/model at the external adapter seam.
 
 ---
 
-### Slice 5: Repository summary + relevance + summary UI
+## Later slices (not frozen)
 
-The optional-model enhancement fed into the join path.
+- **Optional structured model interface:** provider-neutral wrapper that **reuses/extends the existing knowledge transport shape** (no second request implementation); explicit availability probe, Zod-validated generation, internal timeout; availability probe must **not** block base pages by actively pinging the model network (probe is a local config+capability check; on-demand calls stay on the explicit action).
+- **Relevance classification + repository summary + summary UI:** rule-first, optional-model; summary reads bounded README **at the fixed commit `ref`**; records summary-source commit and learning fixed commit independently; adds a versioned store (migration registry) for summaries.
+- **First-release verification + docs.**
 
-**User-observable result:** with a model, a radar card can generate a source-bound repository summary (problem, why now, relevance, stack, maintenance, License, cautions, recommendation) displayed in the summary drawer, and relevance classification enriches the "与你相关" list; joining learning can pre-fill the mission draft from the summary, always editable and still confirmable by hand. The summary shows its own source commit/URL/read time; if it differs from the joined version, both are shown.
+## Pending decisions (product-rule conflicts, not silently changed)
 
-**Public interface** — `server/ai-radar/radar-relevance.mjs`, `server/ai-radar/repository-summary.mjs`, `server/ai-radar/summary-schema.mjs`:
-
-- `classifyRelevance({ repositories, model })` — rule-first (never model-critical), optional structured model as explicit input; only rule-filtered candidates reach the model; malformed output falls back per item; bounded reasons; credentials/README-body absent from prompts.
-- `createRepositorySummaryService({ github, radar, model, now })` → `generate(repositoryId)` — reads metadata + HEAD + bounded README on demand (`getReadme`, ≤2 MiB cap already enforced), quotes evidence inside clear delimiters, rejects tool calls/instruction expansion, persists validated structured content + source refs (URL, sourceCommitSha, read time, workflow version).
-- `RepositorySummary` schema added **with a versioned store**: radar `radarStoreSchema.version` is currently locked to `1` with no migration registry (`server/ai-radar/radar-repository.mjs:115` hard-fails on non-1). This slice introduces a migration registry so summaries extend the store without silently breaking existing `version:1` state; unknown versions are rejected and never overwrite.
-
-**Test seam:** the optional structured model interface (Slice 4) + fixed-version read interface (Slice 2) for summary `sourceCommitSha`; HTTP capability + user-visible interaction (summary drawer, summary-into-mission hint, no-model banner). **Pending review — no test written.**
-
-**Acceptance criteria:** model-not-configured returns explicit unavailable and does not affect radar; bound summary shows committed source + version; oversized README truncated with a marker; prompt-injection text treated as quoted evidence; stale/joined-version difference surfaced; invalid model output rejected with regen; no addresses/Local paths/credentials in summary or store.
-
-**Scope endpoint:** relevance + summary generation and summary UI. Nothing in this slice adds courses, quizzes, completion gating or Wiki ingest.
-
----
-
-### Slice 6: First-release verification and documentation
-
-**User-observable result:** a documented, privacy-safe first release with explicit limits; public-boundary tests assert no learning/summary leakage.
-
-**Public interface:** none (verification + docs only).
-
-**Test seam:** existing `tests/public-boundaries.test.mjs` + command-line release gate. **Pending review — no new seam.**
-
-**Acceptance criteria:** README documents optional GitHub/model config, manual-collection semantics, three lists, retention, summary scope, version pinning, 3-active limit, and that lessons/Wiki/code execution are later phases; `npm test && npm run build && npm run privacy:scan` all exit 0; `git diff --check` clean; no credential, home path, bundle-relative runtime data, real learning content or clone cache is tracked.
-
-**Scope endpoint:** release gate green; phase 2 ships without phase 3/4 behaviour implied.
-
----
-
-## Differences from the original plan
-
-The original plan ordered work model-first (Task 1 structured adapter → Task 2 relevance → Task 3 summary → Tasks 4–7 learning). This plan reorders to **no-model learning path first** (Slices 1–3) then model enhancement (Slices 4–5), because:
-- The spec mandates radar usable without a model and queue management available without one; the manual mission/task-draft path is a first-class user flow, not a degraded fallback.
-- A user-visible tracer bullet ("select repo → manual draft → confirm → workspace") delivers value before any LLM is configured and isolates the model work behind the Slice 4 seam.
-- Defers the Store-schema migration problem (Slice 5) until after the learning lifecycle is proven, so migration risk stays localized.
-
-The original plan's example test snippets (Task 1 `loadOptionalModel`, Task 6 `projectLearningQueue`, Task 4 `workspaceRelativePath`) are illustrative, not implementation-complete; each is re-derived as a failing behaviour test in its slice.
-
-## Pending decisions (product-rule conflicts found, not silently changed)
-
-1. **Resume-when-full (review → active):** spec says review can return to active. When all 3 active slots are taken, the design keeps the workspace in `review` and returns `ACTIVE_LIMIT_REACHED` rather than silently queueing or dropping. Confirm that this matches product intent (vs. queueing the resumed workspace).
-2. **Radar decision authority:** radar `decisions[repositoryId].status` is treated as a derived projection of the learning store. Confirm the radar card should always reflect the learning store's coarse state, not an independently-playable status.
-3. **Store migration:** a real migration registry (new in `ai-radar`) is required because radar store `version` is locked to `1`. Confirm a version bump + migration registry is acceptable in this phase (vs. storing summaries in a separate side-store).
-4. **Backup provider**: learning workspaces become a third backup provider alongside `projects` and `radar`, `optionalForImport`. Confirm learning metadata should restore independently when a Vault rebinds (it follows the bound workspace).
+1. `review`/`completed` are reserved-but-unreachable this phase (no transition entry). Confirm later phases own those transitions and add their UI/acceptance then.
+2. Radar↔learning display consistency uses **Option A read-time merge**; radar `queued|learning|completed` enum slots stay unused this phase. Confirm no product requirement needs a persisted radar learning status (which would force Option B).
+3. A migration registry for the radar store is deferred to the summary slice (the learning store has its own independent schema/version). Confirm that's acceptable.
 
 ## Acceptance reference (30 days)
 

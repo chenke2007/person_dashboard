@@ -1,465 +1,216 @@
-# Repository Summary and Learning Entry Implementation Plan
+# Repository Summary and Learning Entry Implementation Plan (Phase 2 — corrected)
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. Implement strictly one vertical slice at a time: one failing behaviour test → minimal implementation → pass. Do not batch-write all tests before implementing, and never test private methods.
 
-**Goal:** Add optional AI relevance and summaries, then let users create fixed-version, per-repository learning workspaces with reviewable missions and a three-active-project limit.
+**Goal:** Let users create fixed-version, per-repository learning workspaces with reviewable missions and a three-active-project limit, with an optional model adding summaries and task-draft hints. The no-model path (select repo → manual mission draft → confirm → independent workspace) must work end-to-end.
 
-**Architecture:** Reuse the existing model transport through a provider-neutral adapter, but keep radar usable without it. Summary generation accepts only normalized metadata and bounded README text. A separate `LearningWorkspaceRepository` owns workspace state and files outside the Vault; joining learning fixes the source commit and creates a draft mission that must be confirmed.
+**Architecture (verified against current code):**
+- The GitHub client already exposes `getReadme` and `getHeadCommit` (`server/ai-radar/github-client.mjs:302`) and `createGitHubRadarClient` handles auth, rate-limit, ETag, pagination and timeout. Phase 2 reuses these read capabilities as-is; only shallow-clone of a fixed commit is net-new (a later slice, not phase 2).
+- The knowledge assistant model transport (`server/knowledge-chat/model.mjs` `createModelClient` + `loadModelConfig`) is Anthropic-compatible but coupled to `KnowledgeError` and `/v1/messages` streaming. Phase 2 wraps the same transport shape behind a **provider-neutral optional structured model** interface and does **not** import `knowledge-chat` internals into radar/learning modules.
+- Radar decision status already includes `summarized | queued | learning | completed` (`server/ai-radar/radar-schema.mjs:78`), but there is **no** `RepositorySummary` schema, **no** learning workspace store, **no** migration registry, and **no** 3-active enforcement. All of those are net-new.
+- Learning workspaces live in the **stable bound-workspace app-state** (`appDataRoot/PersonalAIWorkbench/workspaces/{workspaceId}/learning/`), independent of the Vault path, and register as a third backup provider implementing the existing `{ id, schemaVersion, exportState, validateImport, replaceState, stageImport }` contract so it slots into `createWorkspaceBackup` with zero new plumbing.
+- Reuse the existing primitives: `createTicketLock` (cross-process lock), atomic tmp→fsync→rename, bounded inode-checked reads + symlink rejection + size caps + schema/version validation, `withBoundWorkspace` binding (rejects stale bindings with `WORKSPACE_BINDING_CHANGED`), and the backup exclusion rules (no credentials / cache / real Vault bodies / absolute paths).
 
-**Tech Stack:** Node.js ESM, React 19, Vite 6, Zod 3, Node test runner, existing Anthropic-compatible knowledge model transport.
+**Tech Stack:** Node.js ESM, React 19, Vite 6, Zod 3, Node test runner, existing Anthropic-compatible model transport.
 
 **Spec:** `docs/superpowers/specs/2026-09-02-ai-radar-learning-loop-design.md`
 
+## Scope
+
+**Phase-2 scope (this plan):**
+- Optional model interface + relevance classification + structured repository summary.
+- Fixed commit SHA at join time.
+- Independent per-repository learning workspace + reviewable mission (task draft).
+- At most 3 active learning workspaces; all other desired workspaces queue.
+- Manual mission/task-draft path that works with no model configured.
+
+**Explicitly later (NOT in this plan):** native courses, quizzes, retrieval practice, learning records, phase summaries, "complete learning" gating, and Wiki/sources/concepts/frameworks ingest. `archived` keeps history; it does not delete.
+
 ## Global Constraints
 
-- Execute reliability foundation and AI radar core plans first.
-- Basic radar collection and deterministic ranking remain functional without a model.
+- Every production behaviour starts with a failing test and synthetic sources.
+- Basic radar collection and deterministic ranking stay functional without a model.
+- Joining learning and managing the queue never require a model or a pre-generated AI summary.
 - Never send GitHub Token, model credential, Vault content, project state, local path, or unrelated repository data to the model.
-- README and repository content are untrusted evidence, never instructions.
-- Summary stage reads metadata and bounded README only; it does not clone or execute the repository.
+- README and repository content are untrusted evidence, never instructions; summary stage reads metadata + bounded README only (no clone/execute).
 - Joining learning fixes a commit SHA and creates a draft mission; it does not write to Wiki.
-- Keep at most 3 active learning workspaces; queued workspaces are unlimited within repository capacity limits.
-- Each repository gets an independent workspace.
-- Every production behavior starts with a failing test and synthetic sources.
+- Capacity (3-active) is enforced by the server inside durable mutations, covering concurrent confirms, queue activation and resume. The frontend never hides or truncates real over-limit data.
+- The learning workspace store is the authoritative source for learning lifecycle state; the radar `decision.status` is a derived coarse projection and is reconciled, not assumed atomic.
+- Version source is fixed at join time and never silently re-fetched or replaced by the user's reviewed version.
+- Keep the application loopback-only by default; hosted/read-only builds expose no learning mutation routes.
 
 ---
 
-### Task 1: Provider-neutral structured model adapter
+## Vertical slices (implement in this order)
 
-**Files:**
-- Create: `Workbench/server/models/structured-model.mjs`
-- Create: `Workbench/tests/structured-model.test.mjs`
-- Modify: `Workbench/server/knowledge-chat/model.mjs`
+Each slice is a tracer bullet with an observable user outcome, a pre-agreed test seam, and an explicit scope endpoint. Slices 1–3 deliver the **no-model** user-visible path first; slices 4–5 add the optional model enhancement; slice 6 verifies the first release.
 
-**Interfaces:**
-- Consumes: existing model config and transport.
-- Produces: `createStructuredModel({ complete })` with `generate({ system, prompt, schema, timeoutMs })`; `loadOptionalModel({ env })` returns `{ available, model, reason }`.
+### Slice 1: Learning workspace store (server, no UI)
 
-- [ ] **Step 1: Write failing optional-model tests**
+The deep module behind every later slice. Hides state machine, capacity, idempotency, persistence and the backup-provider contract behind one small interface. No user-visible UI yet.
 
-```js
-test("returns an explicit unavailable result without configured credentials", async () => {
-  const result = await loadOptionalModel({ env: {} });
-  assert.deepEqual(result, { available: false, model: null, reason: "MODEL_NOT_CONFIGURED" });
-});
+**User-observable result:** none yet (foundation). Foundation behaviour is fully covered by interface tests on a temp real store.
 
-test("validates structured output before returning it", async () => {
-  const model = createStructuredModel({ complete: async () => '{"direction":"agent","reason":"Synthetic reason"}' });
-  const value = await model.generate({ system: "Classify", prompt: "Synthetic evidence", schema: classificationSchema });
-  assert.equal(value.direction, "agent");
-});
-```
-
-Also test invalid JSON, schema mismatch, timeout, repair-at-most-once, and credential-free public errors.
-
-- [ ] **Step 2: Run test and verify RED**
-
-Run: `cd Workbench && node --test tests/structured-model.test.mjs`
-Expected: FAIL because the adapter is absent.
-
-- [ ] **Step 3: Extract transport reuse without changing knowledge assistant behavior**
-
-Keep `createModelClient()` compatible. Add the adapter above it rather than making radar import knowledge-service internals. Do not introduce provider-specific fields into radar or learning schemas.
-
-- [ ] **Step 4: Verify model and existing knowledge tests**
-
-Run: `cd Workbench && node --test tests/structured-model.test.mjs tests/knowledge-model.test.mjs tests/knowledge-service.test.mjs`
-Expected: PASS.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add Workbench/server/models/structured-model.mjs Workbench/server/knowledge-chat/model.mjs Workbench/tests/structured-model.test.mjs Workbench/tests/knowledge-model.test.mjs
-git commit -m "refactor: expose optional structured model interface"
-```
-
-### Task 2: Explainable AI relevance classification
-
-**Files:**
-- Create: `Workbench/server/ai-radar/radar-relevance.mjs`
-- Create: `Workbench/tests/radar-relevance.test.mjs`
-- Modify: `Workbench/server/ai-radar/radar-collector.mjs`
-- Modify: `Workbench/shared/ai-radar-ranking.mjs`
-
-**Interfaces:**
-- Consumes: a bounded list of rule-filtered candidate metadata and optional structured model.
-- Produces: `classifyRelevance({ repositories, model })` returning repository ID, direction, relevance (`high | medium | low`), and visible reason.
-
-- [ ] **Step 1: Write failing relevance tests**
+**Public interface** — `server/learning/learning-schema.mjs`, `server/learning/learning-repository.mjs`:
 
 ```js
-test("uses deterministic focus rules when no model is available", async () => {
-  const result = await classifyRelevance({ repositories: [syntheticAgentRepo()], model: null });
-  assert.deepEqual(result[0], { repositoryId: 101, direction: "agent", relevance: "medium", reasonCode: "TOPIC_MATCH", reason: "匹配 Agent 关注方向" });
-});
+export const LEARNING_STATES = ["draft","queued","active","review","completed","archived"];
+createLearningRepository({ directory, now, makeId, ticketLock, backupSchemaVersion })
+  // -> { createDraft, confirm, list, get, archive, markTransition, registerBackupProvider }
 ```
 
-Add tests that only rule-filtered candidates reach the model, malformed output falls back per item, reasons have length limits, and README/body/credentials are absent from prompts.
+- `createDraft({ repositoryId, fullName, sourceUrl, sourceCommitSha, mission }) → workspace(state="draft")`
+  - invariants: exactly one independent workspace per repository; `sourceCommitSha` is exactly 40 hex; workspace uses a live-relative id (no absolute path).
+- `confirm({ repositoryId, token }) → { workspace, state }` — idempotent for a signed, time-boxed token; fourth concurrent confirm queues rather than failing silently; capacity checked inside a **single persisted mutation** (no read-then-write race).
+- `list({ includeArchived })`, `get(workspaceId)`, `archive(workspaceId)`, `markTransition(...)`.
+- `registerBackupProvider()` → `{ id:"learning", schemaVersion, exportState, validateImport, replaceState, stageImport }`.
 
-- [ ] **Step 2: Run test and verify RED**
-
-Run: `cd Workbench && node --test tests/radar-relevance.test.mjs`
-Expected: FAIL because the classifier is absent.
-
-- [ ] **Step 3: Implement rule-first classification**
-
-Use repository name, description, topics, language, archived flag, and deterministic focus mappings. Send only a capped candidate batch to the model. Persist structured results with model/workflow version and generated time.
-
-- [ ] **Step 4: Feed relevance into the separate relevant list**
-
-Do not change rising or established list semantics. Preference signals remain explicit inputs and reasons remain visible.
-
-- [ ] **Step 5: Verify tests**
-
-Run: `cd Workbench && node --test tests/radar-relevance.test.mjs tests/ai-radar-ranking.test.mjs tests/radar-collector.test.mjs`
-Expected: PASS.
-
-- [ ] **Step 6: Commit**
-
-```bash
-git add Workbench/server/ai-radar/radar-relevance.mjs Workbench/server/ai-radar/radar-collector.mjs Workbench/shared/ai-radar-ranking.mjs Workbench/tests/radar-relevance.test.mjs Workbench/tests/ai-radar-ranking.test.mjs Workbench/tests/radar-collector.test.mjs
-git commit -m "feat: explain AI radar relevance"
-```
-
-### Task 3: Source-bound repository summaries
-
-**Files:**
-- Create: `Workbench/server/ai-radar/repository-summary.mjs`
-- Create: `Workbench/server/ai-radar/summary-schema.mjs`
-- Create: `Workbench/tests/repository-summary.test.mjs`
-- Modify: `Workbench/server/ai-radar/radar-schema.mjs`
-- Modify: `Workbench/server/ai-radar/radar-repository.mjs`
-
-**Interfaces:**
-- Consumes: normalized repository metadata, bounded README response, HEAD commit, optional structured model, and radar repository.
-- Produces: `createRepositorySummaryService(...).generate(repositoryId)` and persisted structured summary with sources and commit SHA.
-
-- [ ] **Step 1: Write failing summary tests**
-
-```js
-test("binds a summary to repository URL, commit, and README source", async () => {
-  const summary = await service.generate(101);
-  assert.equal(summary.repositoryId, 101);
-  assert.equal(summary.sourceCommitSha, "a".repeat(40));
-  assert.deepEqual(summary.sources, [{ kind: "readme", path: "README.md", commitSha: "a".repeat(40) }]);
-});
-```
-
-Add model-not-configured, missing README, oversized README truncation, prompt-injection text treated as quoted evidence, stale HEAD, invalid output, and no-secret tests.
-
-- [ ] **Step 2: Run test and verify RED**
-
-Run: `cd Workbench && node --test tests/repository-summary.test.mjs`
-Expected: FAIL because summary service is absent.
-
-- [ ] **Step 3: Define the summary schema**
-
-```js
-const summaryContentSchema = z.object({
-  problem: z.string().min(1).max(1200),
-  whyNow: z.string().min(1).max(1200),
-  relevance: z.string().min(1).max(1200),
-  stack: z.array(z.string().max(80)).max(20),
-  maintenance: z.string().max(600),
-  license: z.string().max(120).nullable(),
-  recommendation: z.enum(["learn", "watch", "skip"]),
-  cautions: z.array(z.string().max(300)).max(12),
-}).strict();
-```
-
-- [ ] **Step 4: Implement generation and persistence**
-
-Fetch metadata, HEAD and README on demand; quote evidence inside clear delimiters; reject tool calls or instruction expansion; save only validated structured content and source references. One repository may keep the latest summary plus bounded history.
-
-- [ ] **Step 5: Verify tests**
-
-Run: `cd Workbench && node --test tests/repository-summary.test.mjs tests/radar-repository.test.mjs`
-Expected: PASS.
-
-- [ ] **Step 6: Commit**
-
-```bash
-git add Workbench/server/ai-radar/repository-summary.mjs Workbench/server/ai-radar/summary-schema.mjs Workbench/server/ai-radar/radar-*.mjs Workbench/tests/repository-summary.test.mjs Workbench/tests/radar-repository.test.mjs
-git commit -m "feat: generate source-bound repository summaries"
-```
-
-### Task 4: Learning workspace schema and repository
-
-**Files:**
-- Create: `Workbench/server/learning/learning-schema.mjs`
-- Create: `Workbench/server/learning/learning-repository.mjs`
-- Create: `Workbench/tests/learning-repository.test.mjs`
-- Modify: `Workbench/server/vite-plugin-workbench.mjs`
-
-**Interfaces:**
-- Consumes: stable workspace state root, repository ID/full name, source URL, fixed commit SHA, and mission draft.
-- Produces: `createLearningRepository({ directory, now, makeId })` with draft, confirm, queue, activate, archive, and backup-provider methods.
-
-- [ ] **Step 1: Write failing repository tests**
-
-```js
-test("creates one independent draft workspace per repository", async (t) => {
-  const learning = createLearningRepository({ directory: await makeStore(t), now: fixedClock(), makeId: sequenceIds() });
-  const draft = await learning.createDraft({ repositoryId: 101, fullName: "synthetic/example", sourceUrl: "https://github.com/synthetic/example", sourceCommitSha: "a".repeat(40), mission: syntheticMission() });
-  assert.equal(draft.state, "draft");
-  assert.match(draft.workspaceRelativePath, /^[0-9a-f-]+$/);
-  assert.equal(path.isAbsolute(draft.workspaceRelativePath), false);
-});
-```
-
-Add unique repository workspace, exactly 40-hex commit, draft confirmation token, revision drift, three-active limit, queue ordering, archive, corrupt workspace, atomic writes, symlink escape, and no Vault write tests.
-
-- [ ] **Step 2: Run test and verify RED**
-
-Run: `cd Workbench && node --test tests/learning-repository.test.mjs`
-Expected: FAIL because the module is absent.
-
-- [ ] **Step 3: Implement v1 workspace files**
-
-For the first release create:
+**State machine** (only `active` counts toward the limit of 3):
 
 ```text
-workspace.json
-MISSION.md
-RESOURCES.md
-NOTES.md
-reference/
-lessons/
-learning-records/
-assets/
-```
-
-`MISSION.md` is generated from structured mission data; it contains no absolute path or credential. Directories for future artifacts are empty and ignored by the public repository because runtime workspaces live under local application state.
-
-- [ ] **Step 4: Enforce state transitions**
-
-```js
-draft -> queued | active
+draft -> active | archived         (draft is unconfirmed; does not count)
 queued -> active | archived
 active -> review | archived
-review -> completed | active
+review -> completed | active       (resume; if full, stays in review with ACTIVE_LIMIT_REACHED)
 completed -> archived
 ```
 
-Only `active` counts toward the limit of 3. Confirming a fourth draft queues it rather than failing silently.
+**Dependencies:** `server/workspace-state/ticket-lock.mjs` (`createTicketLock`, cross-process lock), `server/workspace-state/backup-schema.mjs`; pattern-match `server/ai-radar/radar-repository.mjs` atomic write + bounded inode-checked read + symlink rejection + size cap + schema/version validation + `.superpowers`-free error class `LearningWorkspaceError` + `safeLearningError` mapped via the existing `safeRadarError` style route-facing normalization.
 
-- [ ] **Step 5: Register backup provider**
+**Test seam:** the public `LearningWorkspaceRepository` interface, exercised against a temporary real on-disk store (not a fake). **This is pending review — no test written in this step.**
 
-Export workspace metadata and authored learning files, but exclude cloned repository cache, credentials, transient model checkpoints, and absolute paths.
+**Acceptance criteria:** draft→confirm under capacity→active; fourth confirm→queued; duplicate confirm returns the same workspace; corrupt store→read-only recover (never overwrite); resume-when-full→`ACTIVE_LIMIT_REACHED` keeping `review`; `exportState`→`replaceState` round-trip; `stageImport` rolls back committed providers in reverse on any commit failure; backup provider exports only recoverable metadata (no cloned source cache, no credentials, no README bodies, no absolute paths).
 
-- [ ] **Step 6: Verify tests**
+**Scope endpoint:** all server transitions + persistence + backup-provider contract pass with a temp real store. No routes, no UI, no reconciliation yet.
 
-Run: `cd Workbench && node --test tests/learning-repository.test.mjs tests/workspace-backup.test.mjs`
-Expected: PASS.
+---
 
-- [ ] **Step 7: Commit**
+### Slice 2: Join-learning orchestration + fixed version (server routes)
 
-```bash
-git add Workbench/server/learning Workbench/server/vite-plugin-workbench.mjs Workbench/tests/learning-repository.test.mjs Workbench/tests/workspace-backup.test.mjs
-git commit -m "feat: add repository learning workspaces"
-```
+The server half of the user-visible path, still no UI. Pins the commit, issues preview/confirm, and reconciles the radar decision.
 
-### Task 5: Join-learning orchestration and routes
+**User-observable result:** an HTTP caller can, for a chosen repository: preview a mission pinning current HEAD, confirm it into an independent workspace (or queue if full), list/get/archive workspaces, and see the radar card decision reflect queued/learning/completed — all with **no model configured**.
 
-**Files:**
-- Create: `Workbench/server/learning/learning-service.mjs`
-- Create: `Workbench/server/learning/learning-routes.mjs`
-- Create: `Workbench/tests/learning-api.test.mjs`
-- Modify: `Workbench/server/ai-radar/radar-routes.mjs`
-- Modify: `Workbench/server/vite-plugin-workbench.mjs`
-
-**Interfaces:**
-- Consumes: GitHub `getHeadCommit`, latest repository summary, learning repository, and radar decision state.
-- Produces: mission preview/confirm, workspace list/read/archive, and synchronized radar learning states.
-
-- [ ] **Step 1: Write failing orchestration tests**
-
-Cover:
-
-- `POST /api/ai-radar/repositories/:id/summary`
-- `POST /api/learning/preview`
-- `POST /api/learning/confirm`
-- `GET /api/learning`
-- `GET /api/learning/:id`
-- `POST /api/learning/:id/archive`
-
-Assert preview fixes the current HEAD, confirm rejects changed preview inputs, the fourth confirmed workspace queues, hosted/read-only writes fail, and no route executes or clones repository code.
-
-- [ ] **Step 2: Run test and verify RED**
-
-Run: `cd Workbench && node --test tests/learning-api.test.mjs`
-Expected: FAIL because the service and routes are absent.
-
-- [ ] **Step 3: Implement mission preview**
+**Public interface** — `server/learning/learning-service.mjs`, `server/learning/learning-routes.mjs`:
 
 ```js
-export function createLearningService({ github, summaries, learning, radar, now }) {
-  return { previewMission, confirmMission, listWorkspaces, getWorkspace, archiveWorkspace };
-}
+createLearningService({ github, summaries, learning, radar, now })
+  // -> { previewMission, confirmMission, listWorkspaces, getWorkspace, archiveWorkspace, reconcile }
 ```
 
-Mission goal must be one of `understand-architecture | learn-usage | analyze-design | reproduce-capability | adoption-decision`. The preview includes scope, expected outcome, source summary, fixed commit SHA, and a 30-minute-expiring confirmation token.
+Routes under `/api/learning`: `POST /api/learning/preview`, `POST /api/learning/confirm`, `GET /api/learning`, `GET /api/learning/:id`, `POST /api/learning/:id/archive`. Summary stays under radar `/api/ai-radar`; learning lifecycle stays under `/api/learning`.
 
-- [ ] **Step 4: Implement focused routes**
+**Fixed-version source interface (reused as-is):** `github.getHeadCommit({ fullName })` (`server/ai-radar/github-client.mjs:292`, returns 40-hex default-branch HEAD). Preview pins this SHA into the mission token. Confirm binds exactly the previewed commit; it never silently re-fetches HEAD or replaces the user-reviewed version. If the summary `sourceCommitSha` differs from the joined version, record both and surface the difference; do not overwrite.
 
-Keep summary action under radar and learning lifecycle under `/api/learning`. Reuse local same-origin and JSON protections. Update radar decision only after learning state is durable.
+**No-model flow:** preview/confirm accept a user-supplied mission goal (`understand-architecture | learn-usage | analyze-design | reproduce-capability | adoption-decision`, per spec) and optional notes. An AI summary is an *optional enrichment*, never a prerequisite for join. When `optionalModel.available === false`, the manual draft path proceeds and the API returns an explicit `SUMMARY_UNAVAILABLE` capability signal while the base flow stays usable.
 
-- [ ] **Step 5: Verify tests**
+**State consistency (authority + reconcile):** the learning store is authoritative; radar `decisions[repositoryId].status` is a derived coarse projection. A mutation commits the learning record first, then issues the radar decision write. If the radar write fails, the learning record marks `radarDecisionSync:"pending"`. `reconcile()` re-derives the decision from authoritative learning state and retries the write; it runs at startup, before any radar dashboard/decision read, and before the next learning operation — so duplicates, retries and restarts converge deterministically. All binding-sensitive mutations run inside `registry.withBoundWorkspace(...)`; a mid-mutation rebind aborts atomically with `WORKSPACE_BINDING_CHANGED`.
 
-Run: `cd Workbench && node --test tests/learning-api.test.mjs tests/repository-summary.test.mjs tests/learning-repository.test.mjs`
-Expected: PASS.
+**Dependencies:** `github.getHeadCommit` (existing), `LearningWorkspaceRepository` (Slice 1), radar repository + `setDecision` (`server/ai-radar/radar-repository.mjs:425`), `server/ai-radar/radar-schema.mjs` decision statuses, `vite-plugin-workbench.mjs` route registration gated to local, non-read-only (`radarMutable`-style guard: `!hosted && !projectsReadOnly`).
 
-- [ ] **Step 6: Commit**
+**Test seam:** the fixed-version source interface (`getHeadCommit`) + the learning routes HTTP boundary (real `createLearningRoutes` + call-recording fake github/learning/radar, matching the existing `tests/ai-radar-api.test.mjs` style). **Pending review — no test written.**
 
-```bash
-git add Workbench/server/learning Workbench/server/ai-radar/radar-routes.mjs Workbench/server/vite-plugin-workbench.mjs Workbench/tests/learning-api.test.mjs
-git commit -m "feat: create reviewable learning missions"
-```
+**Acceptance criteria:** preview pins current HEAD; confirm rejects drifted/expired/duplicate tokens; fourth confirm queues server-side; unreachable commit keeps the prior pinned version with a safe error (never silently switch HEAD); radar decision reconciles to queued/learning/completed; hosted/read-only writes fail (403/404); no route clones or executes repository code.
 
-### Task 6: Summary and learning client model
+**Scope endpoint:** all learning HTTP commands work with a manual draft and no model. No summary generation, no UI.
 
-**Files:**
-- Create: `Workbench/src/lib/learning-api.js`
-- Create: `Workbench/src/lib/learning-model.js`
-- Create: `Workbench/tests/learning-model.test.mjs`
-- Modify: `Workbench/src/lib/ai-radar-api.js`
+---
 
-**Interfaces:**
-- Consumes: summary and learning HTTP routes.
-- Produces: exact command clients and pure learning queue projections.
+### Slice 3: No-model learning UI (first fully user-visible slice)
 
-- [ ] **Step 1: Write failing client/model tests**
+Delivers the end-user path: **选择仓库 → 手工任务草案 → 确认 → 独立学习工作区**, plus the queue with active-limit feedback and archive.
+
+**User-observable result:** from a radar card the user can open a mission dialog, pick one of the five goals, optionally write notes, confirm, and land on an independent learning workspace page showing source URL + pinned commit + mission. If 3 are already active, the fourth clearly queued. Without a model, radar still renders and the join path works; summary/hint areas explain configuration instead of blocking.
+
+**Public interface** — `server/learning/learning-routes.mjs` (Slice 2) + client model `src/lib/learning-api.js`, `src/lib/learning-model.js`:
+
+- Reuse the `command(path, payload)` + `queryParams` pattern from `src/lib/ai-radar-api.js` / `workspace-api.js`; pure projections mirror `src/lib/ai-radar-model.js` (`projectLearningQueue(payload) → { active, queued, drafts, archived, limit, error }`). The projection **must not hide** entries the server returns; if the server ever returns >3 active it surfaces a data-anomaly state, never truncates.
+- Components (reuse `src/components/projects/TaskDrawer.jsx` drawer skeleton): `RepositorySummaryDrawer.jsx`, `LearningMissionDialog.jsx`, `LearningQueue.jsx`, `src/pages/LearningPage.jsx`; route + nav registered only under the existing `localWorkbench = import.meta.env.VITE_WORKBENCH_HOSTED !== "true"` block in `src/App.jsx` / `AppShell.jsx` (hosted builds omit learning navigation).
+- Async state mirrors `src/pages/AiRadarPage.jsx` presentational/container split + per-action busy/error maps + out-of-order guard; read-only/hosted gating relies on server `403` + the `LOCAL_API_UNAVAILABLE` normalization in `src/lib/api-errors.js` and client-side capability arbitration like radar.
+
+**Test seam:** the HTTP capability + user-visible interaction boundary — the existing `ai-radar-ui.test.mjs` mount harness (`react-dom/client` + happy-dom + globally mocked fetch recording `(path, method)`), plus `renderToStaticMarkup` static render like `projects-ui.test.mjs`. **Pending review — no test written.**
+
+**Acceptance criteria:** mission dialog exposes exactly the five goals + confirmation; confirm never immediately activates or writes Wiki; learning page separates active/queued/drafts/archived with active count never displayed above 3 and always matching a server-enforced invariant; archive requires an explicit action and does not delete workspace files; source URL + pinned commit + mission visible; model-unavailable banner shows rather than a blocked join.
+
+**Scope endpoint:** complete no-model learning lifecycle usable in the UI. No summary drawer content, no model hints.
+
+---
+
+### Slice 4: Optional structured model interface
+
+Provider-neutral seam reusing the existing transport shape without coupling to `knowledge-chat`.
+
+**User-observable result:** a capability endpoint reports whether structured generation is available; when it is, radar relevance and summaries enrich the join path (feeding Slice 5). When it is not, the base flow is unchanged with a clear reason.
+
+**Public interface** — `server/models/structured-model.mjs`:
 
 ```js
-test("projects no more than three active workspaces", () => {
-  const projected = projectLearningQueue(syntheticLearningPayload());
-  assert.equal(projected.active.length, 3);
-  assert.equal(projected.queued.length, 1);
-});
+createStructuredModel({ transport })
+loadOptionalModel({ config, settingsPath }) // -> { available:false, reason } | { available:true, model }
+// transport.generate({ system, prompt, schema, timeoutMs }) -> validated value (throws on invalid/timeout)
 ```
 
-Assert exact request bodies, mission goal labels, source/commit visibility, archive projection, and no local path projection.
+- Reuses the Anthropic-compatible transport shape of `createModelClient`/`loadModelConfig` (`server/knowledge-chat/model.mjs`) but **provider-neutral**: takes the configured base URL/token/model and its own error type (matching the `GitHubRadarError`/`RadarRepositoryError` convention), **does not import `KnowledgeError` or `./errors.mjs`**, does not assume Codex/vendor.
+- Explicit availability probe (config present + reachable), schema-validated generation (Zod), and an internal timeout so invalid output is rejected for regeneration and a missing model yields `{ available:false, reason }` with a safe message. No credentials in errors. One adapter (the existing transport) — no generic multi-vendor framework.
 
-- [ ] **Step 2: Run test and verify RED**
+**Test seam:** the optional structured model interface with synthetic `transport` completions (valid JSON, invalid JSON, schema mismatch, timeout, unavailable config). **Pending review — no test written.**
 
-Run: `cd Workbench && node --test tests/learning-model.test.mjs`
-Expected: FAIL because modules are absent.
+**Acceptance criteria:** unavailable→`MODEL_NOT_CONFIGURED` explicit result and base radar/learning unaffected; valid JSON passes schema; invalid JSON / schema mismatch / timeout are rejected with safe codes and never leak credentials; existing knowledge tests still pass (no behaviour change to `knowledge-chat`).
 
-- [ ] **Step 3: Implement client and pure model**
+**Scope endpoint:** `loadOptionalModel` + `generate` validated. No radar/learning wiring yet.
 
-```js
-export const previewLearningMission = (input) => command("/api/learning/preview", input);
-export const confirmLearningMission = (token) => command("/api/learning/confirm", { token });
-export function projectLearningQueue(payload) { /* active, queued, drafts, archived */ }
-```
+---
 
-- [ ] **Step 4: Verify tests**
+### Slice 5: Repository summary + relevance + summary UI
 
-Run: `cd Workbench && node --test tests/learning-model.test.mjs`
-Expected: PASS.
+The optional-model enhancement fed into the join path.
 
-- [ ] **Step 5: Commit**
+**User-observable result:** with a model, a radar card can generate a source-bound repository summary (problem, why now, relevance, stack, maintenance, License, cautions, recommendation) displayed in the summary drawer, and relevance classification enriches the "与你相关" list; joining learning can pre-fill the mission draft from the summary, always editable and still confirmable by hand. The summary shows its own source commit/URL/read time; if it differs from the joined version, both are shown.
 
-```bash
-git add Workbench/src/lib/learning-*.js Workbench/src/lib/ai-radar-api.js Workbench/tests/learning-model.test.mjs
-git commit -m "feat: add learning workspace client model"
-```
+**Public interface** — `server/ai-radar/radar-relevance.mjs`, `server/ai-radar/repository-summary.mjs`, `server/ai-radar/summary-schema.mjs`:
 
-### Task 7: Summary and learning queue UI
+- `classifyRelevance({ repositories, model })` — rule-first (never model-critical), optional structured model as explicit input; only rule-filtered candidates reach the model; malformed output falls back per item; bounded reasons; credentials/README-body absent from prompts.
+- `createRepositorySummaryService({ github, radar, model, now })` → `generate(repositoryId)` — reads metadata + HEAD + bounded README on demand (`getReadme`, ≤2 MiB cap already enforced), quotes evidence inside clear delimiters, rejects tool calls/instruction expansion, persists validated structured content + source refs (URL, sourceCommitSha, read time, workflow version).
+- `RepositorySummary` schema added **with a versioned store**: radar `radarStoreSchema.version` is currently locked to `1` with no migration registry (`server/ai-radar/radar-repository.mjs:115` hard-fails on non-1). This slice introduces a migration registry so summaries extend the store without silently breaking existing `version:1` state; unknown versions are rejected and never overwrite.
 
-**Files:**
-- Create: `Workbench/src/components/ai-radar/RepositorySummaryDrawer.jsx`
-- Create: `Workbench/src/components/learning/LearningMissionDialog.jsx`
-- Create: `Workbench/src/components/learning/LearningQueue.jsx`
-- Create: `Workbench/src/components/learning/learning.css`
-- Modify: `Workbench/src/pages/AiRadarPage.jsx`
-- Create: `Workbench/src/pages/LearningPage.jsx`
-- Modify: `Workbench/src/App.jsx`
-- Modify: `Workbench/src/components/AppShell.jsx`
-- Create: `Workbench/tests/learning-ui.test.mjs`
+**Test seam:** the optional structured model interface (Slice 4) + fixed-version read interface (Slice 2) for summary `sourceCommitSha`; HTTP capability + user-visible interaction (summary drawer, summary-into-mission hint, no-model banner). **Pending review — no test written.**
 
-**Interfaces:**
-- Consumes: summary, mission preview/confirm, list/read/archive client functions.
-- Produces: summary drawer, five-goal mission review, local `/learning` queue, source/version display, and active-limit feedback.
+**Acceptance criteria:** model-not-configured returns explicit unavailable and does not affect radar; bound summary shows committed source + version; oversized README truncated with a marker; prompt-injection text treated as quoted evidence; stale/joined-version difference surfaced; invalid model output rejected with regen; no addresses/Local paths/credentials in summary or store.
 
-- [ ] **Step 1: Write failing UI contract tests**
+**Scope endpoint:** relevance + summary generation and summary UI. Nothing in this slice adds courses, quizzes, completion gating or Wiki ingest.
 
-Assert:
+---
 
-- Without a model, radar still renders and summary button explains configuration.
-- Summary shows problem, why now, relevance, stack, maintenance, License, cautions, recommendation, URL, commit and source time.
-- “加入学习” first opens a mission preview; it never immediately activates or writes Wiki.
-- Mission dialog exposes exactly five goals and a confirmation step.
-- Learning page separates active, queued, drafts and archived; active count never exceeds 3.
-- Hosted builds omit learning routes and navigation.
+### Slice 6: First-release verification and documentation
 
-- [ ] **Step 2: Run test and verify RED**
+**User-observable result:** a documented, privacy-safe first release with explicit limits; public-boundary tests assert no learning/summary leakage.
 
-Run: `cd Workbench && node --test tests/learning-ui.test.mjs`
-Expected: FAIL because UI files are absent.
+**Public interface:** none (verification + docs only).
 
-- [ ] **Step 3: Implement summary drawer and mission dialog**
+**Test seam:** existing `tests/public-boundaries.test.mjs` + command-line release gate. **Pending review — no new seam.**
 
-Keep fetched README out of the browser payload. Show only validated summary and explicit source metadata. If HEAD changes between summary and mission preview, display the newly fixed commit rather than silently claiming the old summary version is current.
+**Acceptance criteria:** README documents optional GitHub/model config, manual-collection semantics, three lists, retention, summary scope, version pinning, 3-active limit, and that lessons/Wiki/code execution are later phases; `npm test && npm run build && npm run privacy:scan` all exit 0; `git diff --check` clean; no credential, home path, bundle-relative runtime data, real learning content or clone cache is tracked.
 
-- [ ] **Step 4: Implement learning queue page**
+**Scope endpoint:** release gate green; phase 2 ships without phase 3/4 behaviour implied.
 
-Use state-labelled sections and one clear next action per workspace. Archiving requires the existing user action but does not delete workspace files. Do not add lesson authoring or Wiki ingest controls in this increment.
+---
 
-- [ ] **Step 5: Verify UI and build**
+## Differences from the original plan
 
-Run: `cd Workbench && node --test tests/learning-ui.test.mjs tests/ai-radar-ui.test.mjs && npm run build`
-Expected: PASS.
+The original plan ordered work model-first (Task 1 structured adapter → Task 2 relevance → Task 3 summary → Tasks 4–7 learning). This plan reorders to **no-model learning path first** (Slices 1–3) then model enhancement (Slices 4–5), because:
+- The spec mandates radar usable without a model and queue management available without one; the manual mission/task-draft path is a first-class user flow, not a degraded fallback.
+- A user-visible tracer bullet ("select repo → manual draft → confirm → workspace") delivers value before any LLM is configured and isolates the model work behind the Slice 4 seam.
+- Defers the Store-schema migration problem (Slice 5) until after the learning lifecycle is proven, so migration risk stays localized.
 
-- [ ] **Step 6: Commit**
+The original plan's example test snippets (Task 1 `loadOptionalModel`, Task 6 `projectLearningQueue`, Task 4 `workspaceRelativePath`) are illustrative, not implementation-complete; each is re-derived as a failing behaviour test in its slice.
 
-```bash
-git add Workbench/src/components/ai-radar/RepositorySummaryDrawer.jsx Workbench/src/components/learning Workbench/src/pages/AiRadarPage.jsx Workbench/src/pages/LearningPage.jsx Workbench/src/App.jsx Workbench/src/components/AppShell.jsx Workbench/tests/learning-ui.test.mjs
-git commit -m "feat: add repository learning entry"
-```
+## Pending decisions (product-rule conflicts found, not silently changed)
 
-### Task 8: First-release verification and documentation
+1. **Resume-when-full (review → active):** spec says review can return to active. When all 3 active slots are taken, the design keeps the workspace in `review` and returns `ACTIVE_LIMIT_REACHED` rather than silently queueing or dropping. Confirm that this matches product intent (vs. queueing the resumed workspace).
+2. **Radar decision authority:** radar `decisions[repositoryId].status` is treated as a derived projection of the learning store. Confirm the radar card should always reflect the learning store's coarse state, not an independently-playable status.
+3. **Store migration:** a real migration registry (new in `ai-radar`) is required because radar store `version` is locked to `1`. Confirm a version bump + migration registry is acceptable in this phase (vs. storing summaries in a separate side-store).
+4. **Backup provider**: learning workspaces become a third backup provider alongside `projects` and `radar`, `optionalForImport`. Confirm learning metadata should restore independently when a Vault rebinds (it follows the bound workspace).
 
-**Files:**
-- Modify: `Workbench/README.md`
-- Modify: `README.md`
-- Modify: `Workbench/tests/public-boundaries.test.mjs`
-- Modify only other files required to correct verification failures.
+## Acceptance reference (30 days)
 
-**Interfaces:**
-- Consumes: all tasks in the three implementation plans.
-- Produces: documented, privacy-safe first release with no implied later-phase behavior.
-
-- [ ] **Step 1: Document exact behavior and limits**
-
-Document optional GitHub/model configuration, internal schedule semantics, manual collection, missing-history behavior, the three lists, retention, summary scope, three-active limit, and that lessons/Wiki ingest/code execution are later phases.
-
-- [ ] **Step 2: Extend public-boundary tests**
-
-Assert hosted builds expose no AI radar/learning navigation or local mutation routes, fixtures are synthetic, `.env` values are absent, runtime radar/learning data is ignored, and backup excludes credentials/cache/Vault bodies.
-
-- [ ] **Step 3: Run focused first-release tests**
-
-Run: `cd Workbench && node --test --test-concurrency=1 tests/structured-model.test.mjs tests/radar-*.test.mjs tests/github-radar-client.test.mjs tests/ai-radar-*.test.mjs tests/repository-summary.test.mjs tests/learning-*.test.mjs tests/workspace-*.test.mjs tests/public-boundaries.test.mjs`
-Expected: PASS with zero failures.
-
-- [ ] **Step 4: Run the complete release gate**
-
-Run: `cd Workbench && npm test && npm run build && npm run privacy:scan`
-Expected: all commands exit 0.
-
-- [ ] **Step 5: Inspect tracked data**
-
-Run: `git status --short && git diff --check && git grep -n -E "(github_pat_|ghp_|Authorization: Bearer|[A-Z]:\\\\Users\\\\)" -- . ':!docs/superpowers/plans/*'`
-Expected: no credential, local home path, real learning content, runtime state, or repository clone is tracked.
-
-- [ ] **Step 6: Commit**
-
-```bash
-git add README.md Workbench/README.md Workbench/tests/public-boundaries.test.mjs
-git commit -m "docs: document AI radar learning entry"
-```
-
-- [ ] **Step 7: Perform the 30-day acceptance setup**
-
-Record only local runtime health counters: scheduled run coverage, failed run count, number of repositories reviewed, number saved, summaries generated, and learning projects started. Do not commit real metrics. The product acceptance after 30 days is review under 10 minutes/day, at least 4 worthwhile repositories, and at least 1 started learning project.
+Record only local health counters (scheduled run coverage, failed run count, repos reviewed/saved, summaries generated, learning projects started); never commit real metrics. Success = review <10 min/day, ≥4 worthwhile repos, ≥1 started learning project.

@@ -63,19 +63,22 @@ active -> archived
 The token is **issued by the store's own preview step** — no confirm path may require a token that has no issuing interface.
 
 ```text
-createDraft({ repositoryId, fullName, sourceUrl, sourceCommitSha, mission }) -> { draft }   (state=draft; one per repository)
-editDraft({ draftId, mission })                                      -> { draft }   (edit goal/notes while draft)
-preview({ draftId })                                                 -> { token, expiresAt, bound }
-   bound = { repositoryId, workspaceId, goal, sourceCommitSha }      // snapshot the user reviews
-confirm({ token })                                                   -> { workspace, outcome: "active"|"queued"|"already-confirmed" }
-list({ includeArchived }) / get(workspaceId) / archive(workspaceId)  -> workspace(s)
+createDraft({ repositoryId, fullName, sourceUrl, sourceCommitSha, mission }) -> { draft }   (state=draft; one per repository; carries draftRevision)
+editDraft({ workspaceId, expectedRevision, mission })                     -> { draft }   (edit goal/notes while draft; requires expectedRevision, bumps draftRevision)
+preview({ draftId })                                                      -> { token, expiresAt, draftRevision, sourceCommitSha, mission }
+   mission = { goal, notes? };  // full reviewable mission; token bound to mission + draftRevision + repository + sourceCommitSha
+confirm({ token })                                                        -> { confirmed, workspace }
+   confirmed = "active" | "queued" | "already-confirmed"   // original confirm outcome, immutable
+   workspace.state = current state (may differ after a later activate/archive)
+activate({ workspaceId, expectedRevision })                               -> { workspace, outcome: "active" | "already-active" | "ACTIVE_LIMIT_REACHED" }
+list({ includeArchived }) / get(workspaceId) / archive(workspaceId)       -> workspace(s)
 ```
 
 - **Valid, unconsumed token**: confirms only the exact bound draft — the bound `repositoryId`, `workspaceId`, `goal`, and `sourceCommitSha` are the values confirmed. Nothing else is accepted.
-- **Retry of the same already-successful confirm**: returns the existing result (same workspace, same `outcome`), **never** creates a duplicate workspace or placeholder. This requires the store to persist the consumed-token → outcome **receipt**.
+- **Retry of the same already-successful confirm**: returns the existing result (**same `confirmed` and `workspace`**), **never** creates a duplicate workspace or placeholder, and does **not** undo a later `activate`/`archive` (the replayed `confirmed` stays the original outcome while `workspace.state` shows the current state). This requires the store to persist the consumed-token → receipt.
 - **Unused-but-expired / input-drifted / ownership-mismatched token**: rejected with `CONFIRM_TOKEN_INVALID`. Input drift = the live draft's `goal`/`sourceCommitSha`/`repositoryId` no longer match the token's `bound` (user edited or a different commit appeared) → force a fresh `preview`. Ownership mismatch = token wasn't issued for this store/binding.
 - **Receipt retention & restart retry**: consumed-token receipts persist in the store, bounded by a TTL (e.g. 24h, gc'd like other retention). After a process restart, a replayed token returns the persisted receipt (idempotent replay). After the receipt TTL expires, a replayed token rejects with `CONFIRM_TOKEN_CONSUMED`; the workspace remains discoverable via `get(workspaceId)`/`list`/repository lookup, so the client recovers without re-creating.
-- **Closed responsibilities**: `createDraft`/`preview`/`editDraft` never transition state out of `draft`; only `confirm` consumes a token and transitions to `active`/`queued`. Every return value is complete for its caller (draft returns the editable draft; preview returns token+bound snapshot; confirm returns workspace+outcome).
+- **Closed responsibilities**: `createDraft`/`preview`/`editDraft` never transition state out of `draft`; only `confirm` consumes a token and transitions to `active`/`queued`; `activate` transitions `queued`→`active` under capacity. Every return value is complete for its caller (draft returns the editable draft with revision; preview returns the full reviewable mission + token + revision; confirm returns `{ confirmed, workspace }`).
 
 ### 3. Radar ↔ learning consistency (Option A: read-time merge)
 
@@ -167,33 +170,38 @@ Only this next piece is detailed. Everything below is the public interface under
 **Inputs / return values**
 
 ```js
-createLearningRepository({ directory, now, makeId?, ticketLock?, schemaVersion })
+createLearningRepository({ directory, now, makeId? })     // schemaVersion is implementation-controlled, not caller-supplied
   -> {
-      createDraft(input),   editDraft(input),   preview({ draftId }),
-      confirm({ token }),   list({ includeArchived }),   get(workspaceId),
-      archive(workspaceId), registerBackupProvider(),     exportState(), validateImport(value), replaceState(value)
+      createDraft(input),  editDraft(input),  preview({ draftId }),
+      confirm({ token }),  activate({ workspaceId, expectedRevision }),
+      list({ includeArchived }),  get(workspaceId),  archive(workspaceId),
+      registerBackupProvider(),   exportState(),        validateImport(value), replaceState(value)
     }
 ```
 
-- `createDraft(input)` input `{ repositoryId, fullName, sourceUrl, sourceCommitSha, mission }`; `mission = { goal, notes? }`; `goal ∈ { understand-architecture, learn-usage, analyze-design, reproduce-capability, adoption-decision }`. Returns `{ draft }` with `state:"draft"`, a workspace id that is live-relative (no absolute path), and 40-hex `sourceCommitSha` enforced.
-- `editDraft({ draftId, mission })` returns `{ draft }` only while `state==="draft"`; edits goal/notes; re-validates constraints.
-- `preview({ draftId })` returns `{ token, expiresAt, bound: { repositoryId, workspaceId, goal, sourceCommitSha } }`; issues a fresh single-consumption token bound to the current draft snapshot; the `bound` is what the user reviews.
-- `confirm({ token })` returns `{ workspace, outcome }` (`active`|`queued`|`already-confirmed`); consumes the token, persists the receipt, applies capacity in the same mutation.
+- `createDraft(input)` input `{ repositoryId, fullName, sourceUrl, sourceCommitSha, mission }`; `mission = { goal, notes? }`; `goal ∈ { understand-architecture, learn-usage, analyze-design, reproduce-capability, adoption-decision }`. Returns `{ draft }` with `state:"draft"`, `draftRevision` (version counter, starts at 1, increments on each edit), a workspace id that is live-relative (no absolute path), and 40-hex `sourceCommitSha` enforced.
+  - **Duplicate `repositoryId`:** must not overlay an existing task/fixed-commit/active state/archive history. Either return the **existing** workspace (idempotent) or raise a clear `WORKSPACE_ALREADY_EXISTS` conflict — never silently cover the prior record.
+- `editDraft({ workspaceId, expectedRevision, mission })` returns `{ draft }` only while `state==="draft"`; edits goal/notes; re-validates constraints; increments `draftRevision`. **`expectedRevision` is required**: if the caller's expected revision does not match the current draft revision, raise `REVISION_CONFLICT` (a newer edit happened) instead of overwriting.
+- `preview({ draftId })` returns `{ token, expiresAt, draftRevision, sourceCommitSha, mission }` — the **complete, reviewable mission**, the **fixed source** (`sourceCommitSha`), and the `draftRevision`. Issues a fresh single-consumption token bound to the **entire** current mission + revision + repository; the returned mission is what the user reviews. Any later mission-content edit changes `draftRevision`, which **invalidates** an old preview's confirm.
+- `confirm({ token })` returns `{ confirmed, workspace }` — `confirmed` is **`active` | `queued` | `already-confirmed`** (the original confirm outcome, immutable); `workspace.state` is the **current** workspace state (may differ from `confirmed` after later activation/archive). These are distinct fields so a replayed receipt never masks a later `activate`/`archive`. Consumes the token, persists the receipt, applies capacity in the same mutation.
+- `activate({ workspaceId, expectedRevision })` — `queued → active` when under capacity; at 3 active, stays `queued` and returns `ACTIVE_LIMIT_REACHED` (no silent promotion/data loss). Capacity check and the state change happen **inside the same store lock's single mutation**.
 - `list({ includeArchived })` / `get(workspaceId)` / `archive(workspaceId)` return workspaces or a clear `WORKSPACE_NOT_FOUND`; `archive` is idempotent.
-- `registerBackupProvider()` returns `{ id:"learning", schemaVersion, exportState, validateImport, replaceState, stageImport }`.
+- `registerBackupProvider()` returns `{ id:"learning", schemaVersion, optionalForImport: true, exportState, validateImport, replaceState, stageImport }`.
+- **Credential/token handling:** confirm credentials are unpredictable tokens; the store persists only a **token digest (hash)**. Business queries and backup export never carry the raw token that could authorize a confirm. After an import, confirm requires a **fresh preview** — imported data cannot resurrect an old confirm authorization.
 
-**Draft edit & confirm (closed loop):** drafting, editing, previewing and confirming are separated as above; only `confirm` transitions state; preview is the sole token issuer; confirm validates the token bound against the live store.
+**Draft edit & confirm (closed loop):** drafting, editing, previewing and confirming are separated; only `confirm` transitions state; preview is the sole token issuer; confirm validates the token bound against the live store (mission + `draftRevision` + repository). `editDraft` requires `expectedRevision` and raises `REVISION_CONFLICT` on a newer edit; any mission-content change bumps `draftRevision` and invalidates an old preview.
 
-**Idempotency / capacity / archive**
-- Same consumed token replayed → same `outcome`, no duplicate workspace.
-- 4th active-confirm → `queued`; queue activation at 3 active → stays `queued` + `ACTIVE_LIMIT_REACHED`.
+**Idempotency / receipt / capacity / archive**
+- Same consumed token replayed in receipt-valid window → **same receipt** (`confirmed` + `workspace`), no duplicate workspace/placeholder, and does **not** undo a later `activate` or `archive` (returned via distinct `confirmed` vs `workspace.state` fields).
+- Unified duplicate-token semantics across docs and tests: one token consumption story; when the receipt has expired, return the unified `CONFIRM_TOKEN_INVALID`/`CONFIRM_TOKEN_CONSUMED` error — no requirement to distinguish "consumed" from "expired" after the receipt is gone.
+- 4th active-confirm → `queued`; `activate` at 3 active → stays `queued` + `ACTIVE_LIMIT_REACHED`.
 - Archive idempotent; archived workspace retrievable via `get`/`list({includeArchived:true})`.
 
 **Read-only without store (no directory created):** `list`/`get`/`exportState` on a missing store return empty (or `WORKSPACE_NOT_FOUND` for `get`) and do **not** create the store directory; only a mutation creates it.
 
 **Restart persistence via the same interface:** after re-creating `createLearningRepository({ directory: sameDir, ... })` in a fresh process, `list`/`get` return the previously persisted workspaces and confirm-receipts through the same public interface — verify by interface query, not raw file reads.
 
-**Backup-provider public contract:** `exportState` → `validateImport` → `replaceState` round-trips; `stageImport` returns `{ commit, rollback, cleanup }`; absent learning provider in an old backup is tolerated (`optionalForImport`) and leaves existing data intact; provider `exportState` never emits credentials, absolute paths, real Vault bodies, or clone/README cache.
+**Backup-provider public contract:** `exportState` → `validateImport` → `replaceState` round-trips; `stageImport` returns `{ commit, rollback, cleanup }` with the learning provider guaranteeing its own atomic file commit, failure recovery (leave prior valid state on partial write), and corruption protection; absent learning provider in an old backup is tolerated (`optionalForImport`) and leaves existing data intact; provider `exportState` never emits raw confirm tokens (only digests, and even those are best excluded from backup), credentials, absolute paths, real Vault bodies, or clone/README cache. After any import/`replaceState`, confirm authorization is not resurrected — a fresh `preview` is required.
 
 ---
 
@@ -201,7 +209,7 @@ createLearningRepository({ directory, now, makeId?, ticketLock?, schemaVersion }
 
 **Recommended seams (observe through the public interface, temp real stores, synthetic GitHub/model at external adapter seams):**
 
-1. **Slice-1 seam — `LearningWorkspaceRepository` interface** (temp real store). Key behaviours: confirm under capacity→active; 4th→queued; queue activation when full→stays queued + `ACTIVE_LIMIT_REACHED`; same-token replay→`already-confirmed` no duplicate; expired/drifted/ownership-mismatched token→`CONFIRM_TOKEN_INVALID`; archive idempotent; read-only query on missing store→empty and **no directory created**; re-create repository on same dir→same workspaces/receipts through the interface; `exportState`→`replaceState` round-trip; `stageImport` reverse-rollback on commit failure; provider exports exclude credentials/cache/abs-path/Vault body.
+1. **Slice-1 seam — `LearningWorkspaceRepository` interface** (temp real store). Key behaviours: confirm under capacity→active; 4th→queued; `activate` when full→stays queued + `ACTIVE_LIMIT_REACHED`; same-token replay→same receipt, no duplicate, and a later activate/archive is not undone (distinct `confirmed` vs `workspace.state`); expired/drifted/ownership-mismatched token→`CONFIRM_TOKEN_INVALID`/`CONFIRM_TOKEN_CONSUMED`; `editDraft` mismatch→`REVISION_CONFLICT` and any edit invalidates an old preview confirm; duplicate `createDraft` for same repository→existing workspace or clear `WORKSPACE_ALREADY_EXISTS`, never overwrite; archive idempotent; read-only query on missing store→empty and **no directory created**; re-create repository on same dir→same workspaces/receipts through the interface; `exportState`→`replaceState` round-trip; `stageImport` reverse-rollback on commit failure; provider exports exclude raw confirm tokens (digest only/digest omitted), credentials/cache/abs-path/Vault body; after `replaceState`, old confirm token cannot be replayed (fresh preview required).
 
 2. **Slice-2 seam — fixed-version source + routes HTTP boundary.** Key behaviours: `getHeadCommit` returns an object, use `.sha`; preview pins `.sha` into the token bound; confirm rejects drifted/expired/duplicate/ownership token; 4th queues server-side; unreachable commit keeps prior pinned version with safe error (never silent HEAD switch); local/read-only gate (403/404 on hosted/read-only write); no route clones or executes code. (Cross-store coordination uses **temp real learning AND radar stores**; GitHub/model use synthetic responses at adapter seams — do not prove real transactions/concurrency with all-fake stores.)
 

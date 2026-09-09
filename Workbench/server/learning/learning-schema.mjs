@@ -4,6 +4,9 @@ import path from "node:path";
 export const MAX_LEARNING_BYTES = 32 * 1024 * 1024;
 export const LEARNING_ACTIVE_LIMIT = 3;
 export const CONFIRM_TOKEN_TTL_MS = 24 * 60 * 60 * 1000;
+// A successful confirmation keeps its receipt alive for a full window from the
+// confirmation instant, decoupled from the preview token's own shorter life.
+export const CONFIRM_RECEIPT_TTL_MS = 24 * 60 * 60 * 1000;
 
 const timestamp = z.string().datetime({ offset: true }).transform((value) => new Date(value).toISOString());
 const nullableTimestamp = timestamp.nullable();
@@ -100,12 +103,19 @@ export const learningStoreSchema = z.object({
   const issue = (field, index, message) => context.addIssue({ code: z.ZodIssueCode.custom, path: [field, index], message });
   const seenWorkspace = new Set();
   const seenRepository = new Set();
+  let active = 0;
   store.workspaces.forEach((workspace, index) => {
     if (seenWorkspace.has(workspace.workspaceId)) issue("workspaces", index, "duplicate workspace identity");
     seenWorkspace.add(workspace.workspaceId);
     if (seenRepository.has(workspace.repositoryId)) issue("workspaces", index, "duplicate repository");
     seenRepository.add(workspace.repositoryId);
+    if (workspace.state === "active") active += 1;
   });
+  // capacity is a store-wide invariant, not just a transition rule: reads,
+  // writes and imports must all reject a value that exceeds the active limit.
+  if (active > LEARNING_ACTIVE_LIMIT) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["workspaces"], message: `active workspaces exceed the limit of ${LEARNING_ACTIVE_LIMIT}` });
+  }
   const seenToken = new Set();
   store.confirmations.forEach((token, index) => {
     if (seenToken.has(token.tokenDigest)) issue("confirmations", index, "duplicate confirm token");

@@ -3,6 +3,7 @@ import path from "node:path";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { createTicketLock } from "../workspace-state/ticket-lock.mjs";
 import {
+  CONFIRM_RECEIPT_TTL_MS,
   CONFIRM_TOKEN_TTL_MS,
   LEARNING_ACTIVE_LIMIT,
   MAX_LEARNING_BYTES,
@@ -35,6 +36,7 @@ export function safeLearningError(error, fallback = "LEARNING_FAILED") {
   const messages = {
     LEARNING_FAILED: "学习工作区操作失败。",
     LEARNING_PERSISTENCE_FAILED: "学习工作区状态未能保存。",
+    LEARNING_IMPORT_CONFIRMATIONS_REJECTED: "导入数据包含确认授权信息，已拒绝。",
   };
   let code;
   try { code = error?.code; } catch { /* Arbitrary thrown values are not trusted. */ }
@@ -187,10 +189,6 @@ export function createLearningRepository({ directory, now = () => new Date() } =
     }, { write: true });
   }
 
-  function getState() {
-    return serialized(async () => structuredClone(await readStore()));
-  }
-
   function requireWorkspace(store, workspaceId) {
     const workspace = store.workspaces.find((item) => item.workspaceId === workspaceId);
     if (!workspace) fail("WORKSPACE_NOT_FOUND", "学习工作区不存在。", 404);
@@ -290,7 +288,10 @@ export function createLearningRepository({ directory, now = () => new Date() } =
       const confirmed = activeCount(store) >= LEARNING_ACTIVE_LIMIT ? "queued" : "active";
       workspace.state = confirmed;
       workspace.updatedAt = clock();
-      record.consumed = { confirmed, confirmedAt: clock(), receiptExpiresAt: record.expiresAt };
+      // The receipt's TTL is measured from confirmation, not from the preview's
+      // token expiry, so a confirmation made near preview expiry still earns a
+      // full receipt window and does not expire immediately.
+      record.consumed = { confirmed, confirmedAt: clock(), receiptExpiresAt: new Date(nowMs + CONFIRM_RECEIPT_TTL_MS).toISOString() };
       return { confirmed, workspace };
     });
   }
@@ -311,6 +312,7 @@ export function createLearningRepository({ directory, now = () => new Date() } =
   function archive(workspaceId) {
     return mutate((store) => {
       const workspace = requireWorkspace(store, workspaceId);
+      if (workspace.state === "archived") return workspace; // Idempotent: keep content and updatedAt unchanged.
       workspace.state = "archived";
       workspace.updatedAt = clock();
       return workspace;
@@ -336,6 +338,12 @@ export function createLearningRepository({ directory, now = () => new Date() } =
     try {
       if (Buffer.byteLength(JSON.stringify(value)) > MAX_BYTES) fail("LEARNING_STORAGE_TOO_LARGE", "学习数据超过容量限制。", 413);
       const checkedValue = await learningStoreSchema.parseAsync(value);
+      // Authorization material (confirmation records) is never imported from an
+      // external source: a backup must be token-free. Legitimate exports always
+      // carry an empty array, so this stays compatible with current backups.
+      if (checkedValue.confirmations.length > 0) {
+        fail("LEARNING_IMPORT_CONFIRMATIONS_REJECTED", "导入数据包含确认授权信息，已拒绝。", 400);
+      }
       if (Buffer.byteLength(`${JSON.stringify(checkedValue, null, 2)}\n`) > MAX_BYTES) fail("LEARNING_STORAGE_TOO_LARGE", "学习数据超过容量限制。", 413);
       return structuredClone(checkedValue);
     } catch (error) {
@@ -450,6 +458,6 @@ export function createLearningRepository({ directory, now = () => new Date() } =
 
   return Object.freeze({
     createDraft, editDraft, preview, confirm, activate, list, get, archive,
-    getState, registerBackupProvider, exportState, validateImport: validatedImport, replaceState,
+    registerBackupProvider, exportState, validateImport: validatedImport, replaceState,
   });
 }

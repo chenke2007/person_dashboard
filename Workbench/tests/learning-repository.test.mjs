@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
-import { lstat, mkdtemp, readdir, realpath, rm } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -91,7 +92,7 @@ test("confirm transitions under capacity: first three active, fourth queues", as
     outcomes.push((await learning.confirm({ token: page.token })).confirmed);
   }
   assert.deepEqual(outcomes, ["active", "active", "active", "queued"]);
-  const state = (await learning.getState()).workspaces;
+  const state = (await learning.list()).workspaces;
   assert.equal(state.filter((w) => w.state === "active").length, 3);
   assert.equal(state.filter((w) => w.state === "queued").length, 1);
 });
@@ -194,7 +195,7 @@ test("restart persistence re-reads workspaces and receipts through the same inte
   const { workspace } = await first.createDraft(draftInput(101));
   const page = await first.preview({ workspaceId: workspace.workspaceId });
   await first.confirm({ token: page.token });
-  const snapshot = await first.getState();
+  const snapshot = await first.list();
 
   const restarted = createLearningRepository({ directory, now });
   const listed = await restarted.list();
@@ -225,7 +226,7 @@ test("backup provider contract round-trips, omits raw tokens and rejects unknown
   const previewImport = await backup.previewImport(bundle);
   assert.deepEqual(previewImport.providers, [{ id: "learning", version: 1, count: 1 }]);
   await backup.confirmImport(previewImport.token);
-  assert.equal((await learning.getState()).workspaces.length, 1);
+  assert.equal((await learning.list()).workspaces.length, 1);
 
   // Unknown storage version is rejected by validateImport.
   await assert.rejects(provider.validateImport({ version: 2 }), isCode("LEARNING_STORAGE_VERSION_UNSUPPORTED"));
@@ -244,7 +245,7 @@ test("independent instances and processes keep at most three active under concur
   const previews = [];
   for (const { workspace } of drafts) previews.push(await first.preview({ workspaceId: workspace.workspaceId }));
   await Promise.all(previews.map((page, index) => (index % 2 ? first : other).confirm({ token: page.token })));
-  const state = (await first.getState()).workspaces;
+  const state = (await first.list()).workspaces;
   assert.equal(state.filter((w) => w.state === "active").length, 3);
   assert.equal(state.filter((w) => w.state === "queued").length, 2);
 
@@ -259,7 +260,357 @@ test("independent instances and processes keep at most three active under concur
     const page = await repository.preview({ workspaceId: draft.workspace.workspaceId });
     await repository.confirm({ token: page.token });
   `, directory, String(id)])));
-  const finalState = (await first.getState()).workspaces;
+  const finalState = (await first.list()).workspaces;
   assert.equal(finalState.filter((w) => w.state === "active").length, 3);
   assert.equal(finalState.map((w) => w.repositoryId).includes(204), true);
 });
+
+// -------------------- Step 12: S1 import invariants --------------------
+
+function storePatch(workspaces, confirmations = [], revision = 0) {
+  return { version: 1, revision, updatedAt: null, workspaces, confirmations };
+}
+function confirmRecord(workspace, token, expiresAt) {
+  return {
+    tokenDigest: createHash("sha256").update(token).digest("hex"),
+    workspaceId: workspace.workspaceId,
+    repositoryId: workspace.repositoryId,
+    sourceCommitSha: workspace.sourceCommitSha,
+    draftRevision: workspace.draftRevision,
+    mission: workspace.mission,
+    expiresAt,
+    consumed: null,
+  };
+}
+async function draftsFor(learning, ids) {
+  const drafts = [];
+  for (const id of ids) drafts.push(await learning.createDraft(draftInput(id)));
+  return drafts.map(({ workspace }) => workspace);
+}
+
+test("P1a: rejects a store value with more than three active workspaces on validateImport, replaceState and stageImport", async (t) => {
+  const { learning } = await fixture(t);
+  const provider = learning.registerBackupProvider();
+  const workspaces = await draftsFor(learning, [101, 102, 103, 104]);
+  const fourActive = storePatch(workspaces.map((workspace) => ({ ...workspace, state: "active" })));
+  await assert.rejects(provider.validateImport(fourActive), isCode("LEARNING_STORAGE_CORRUPT"));
+  await assert.rejects(learning.replaceState(fourActive), isCode("LEARNING_STORAGE_CORRUPT"));
+  await assert.rejects(provider.stageImport(fourActive), isCode("LEARNING_STORAGE_CORRUPT"));
+});
+
+test("P1a: a three-active import is accepted and becomes the store state", async (t) => {
+  const { learning } = await fixture(t);
+  const workspaces = await draftsFor(learning, [101, 102, 103]);
+  const threeActive = storePatch(workspaces.map((workspace) => ({ ...workspace, state: "active" })));
+  await learning.replaceState(threeActive);
+  const after = await learning.list();
+  assert.equal(after.workspaces.length, 3);
+  assert.equal(after.workspaces.every((w) => w.state === "active"), true);
+});
+
+test("P1a: a rejected import leaves the original workspaces intact through public queries", async (t) => {
+  const { learning } = await fixture(t);
+  const workspaces = [];
+  for (const id of [101, 102, 103, 104]) workspaces.push((await learning.createDraft(draftInput(id))).workspace);
+  const before = await learning.list();
+  const fourActive = storePatch(workspaces.map((workspace) => ({ ...workspace, state: "active" })));
+  await assert.rejects(learning.replaceState(fourActive), isCode("LEARNING_STORAGE_CORRUPT"));
+  assert.deepEqual(await learning.list(), before);
+});
+
+test("P1b: importing non-empty confirmations (authorization material) is rejected on validateImport and replaceState", async (t) => {
+  const { learning } = await fixture(t);
+  const provider = learning.registerBackupProvider();
+  const [workspace] = await draftsFor(learning, [101]);
+  const page = await learning.preview({ workspaceId: workspace.workspaceId });
+  const withTokens = storePatch([workspace], [confirmRecord(workspace, page.token, page.expiresAt)]);
+  await assert.rejects(provider.validateImport(withTokens), isCode("LEARNING_IMPORT_CONFIRMATIONS_REJECTED"));
+  await assert.rejects(learning.replaceState(withTokens), isCode("LEARNING_IMPORT_CONFIRMATIONS_REJECTED"));
+  await assert.rejects(provider.stageImport(withTokens), isCode("LEARNING_IMPORT_CONFIRMATIONS_REJECTED"));
+  // A clean backup (empty confirmations) still round-trips.
+  const clean = storePatch([workspace]);
+  await learning.replaceState(clean);
+  assert.equal((await learning.list()).workspaces.length, 1);
+});
+
+test("P1b: after a legitimate import every previously issued token is invalidated", async (t) => {
+  const { learning } = await fixture(t);
+  const [workspace] = await draftsFor(learning, [101]);
+  const page = await learning.preview({ workspaceId: workspace.workspaceId });
+  await learning.confirm({ token: page.token }); // active + consumed receipt
+  // A fresh draft holds an unconsumed pending token.
+  const [pendingWorkspace] = await draftsFor(learning, [102]);
+  const pending = await learning.preview({ workspaceId: pendingWorkspace.workspaceId });
+  // A legitimate token-free backup replaces the store (and drops the pending draft).
+  await learning.replaceState(storePatch([{ ...workspace, state: "active" }]));
+  // The unconsumed pending token is invalidated.
+  await assert.rejects(learning.confirm({ token: pending.token }), isCode("CONFIRM_TOKEN_INVALID"));
+  // The consumed receipt is also gone after a legitimate import.
+  await assert.rejects(learning.confirm({ token: page.token }), isCode("CONFIRM_TOKEN_INVALID"));
+});
+
+test("4.1: a confirmation near preview expiry still earns a full 24h receipt window", async (t) => {
+  const root = await mkdtemp(path.join(await realpath(os.tmpdir()), "workbench-learning-receipt-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  let tick = Date.parse(instant);
+  const clock = () => new Date(tick);
+  const learning = createLearningRepository({ directory: path.join(root, "learning"), now: clock });
+  const { workspace } = await learning.createDraft(draftInput(101));
+  const page = await learning.preview({ workspaceId: workspace.workspaceId }); // expiresAt = now + 24h
+  // Confirm 23h59m after preview, one minute before the preview token would expire.
+  tick += (23 * 60 + 59) * 60 * 1000;
+  const confirmed = await learning.confirm({ token: page.token });
+  assert.equal(confirmed.confirmed, "active");
+  // Two minutes later (past the original preview expiry) the receipt is still valid.
+  tick += 2 * 60 * 1000;
+  assert.equal((await learning.confirm({ token: page.token })).confirmed, "active");
+  // ~23h after confirmation the receipt is still valid.
+  tick += 23 * 60 * 60 * 1000;
+  assert.equal((await learning.confirm({ token: page.token })).confirmed, "active");
+  // Past the full 24h receipt window from confirmation it expires.
+  tick += 2 * 60 * 60 * 1000;
+  await assert.rejects(learning.confirm({ token: page.token }), isCode("CONFIRM_TOKEN_INVALID"));
+});
+
+test("4.2: archiving an already-archived workspace leaves content and updatedAt unchanged", async (t) => {
+  const root = await mkdtemp(path.join(await realpath(os.tmpdir()), "workbench-learning-archive-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  let tick = Date.parse(instant);
+  const clock = () => new Date((tick += 1000));
+  const learning = createLearningRepository({ directory: path.join(root, "learning"), now: clock });
+  const { workspace } = await learning.createDraft(draftInput(101));
+  const first = await learning.archive(workspace.workspaceId);
+  const frozen = first.workspace;
+  tick += 60 * 60 * 1000;
+  const retry = await learning.archive(workspace.workspaceId);
+  assert.equal(retry.workspace.updatedAt, frozen.updatedAt);
+  assert.deepEqual(retry.workspace, frozen);
+  assert.deepEqual(await learning.get(workspace.workspaceId), { workspace: frozen });
+});
+
+test("3.1: confirm race — exactly one of two processes wins the last active slot and all workspaces remain", async (t) => {
+  const { directory } = await fixture(t);
+  const main = createLearningRepository({ directory, now });
+  // Baseline of two active workspaces.
+  for (const id of [101, 102]) {
+    const draft = await main.createDraft(draftInput(id));
+    const page = await main.preview({ workspaceId: draft.workspace.workspaceId });
+    await main.confirm({ token: page.token });
+  }
+  assert.equal((await main.list()).workspaces.filter((w) => w.state === "active").length, 2);
+
+  const barrierDir = await mkdtemp(path.join(await realpath(os.tmpdir()), "workbench-learning-race-"));
+  t.after(() => rm(barrierDir, { recursive: true, force: true }));
+  const codes = await barrierConfirmRace({ directory, barrierDir, userIds: [201, 202] });
+  assert.deepEqual(codes.sort((a, b) => a - b), [10, 20]); // one active, one queued
+  const state = (await main.list()).workspaces;
+  assert.equal(state.filter((w) => w.state === "active").length, 3);
+  assert.equal(state.filter((w) => w.state === "queued").length, 1);
+  assert.deepEqual(state.map((w) => w.repositoryId).sort((a, b) => a - b), [101, 102, 201, 202]);
+});
+
+test("3.1: activate race — exactly one of two processes promotes a queued workspace into the last slot", async (t) => {
+  const { directory } = await fixture(t);
+  const main = createLearningRepository({ directory, now });
+  const active = [];
+  const queued = [];
+  for (const id of [101, 102, 103, 104, 105]) {
+    const draft = await main.createDraft(draftInput(id));
+    const page = await main.preview({ workspaceId: draft.workspace.workspaceId });
+    const result = await main.confirm({ token: page.token });
+    (result.confirmed === "active" ? active : queued).push(draft.workspace);
+  }
+  // Confirm five leaves three active and two queued; archive one active to free
+  // the third slot so exactly two queued workspaces contest for it.
+  assert.equal(active.length, 3);
+  assert.equal(queued.length, 2);
+  await main.archive(active[0].workspaceId);
+  assert.equal((await main.list()).workspaces.filter((w) => w.state === "active").length, 2);
+
+  const barrierDir = await mkdtemp(path.join(await realpath(os.tmpdir()), "workbench-learning-race-activate-"));
+  t.after(() => rm(barrierDir, { recursive: true, force: true }));
+  const codes = await barrierActivateRace({ directory, barrierDir, workspaceIds: queued.map((w) => w.workspaceId) });
+  assert.deepEqual(codes.sort((a, b) => a - b), [10, 20]); // one promoted, one stays queued
+  const state = (await main.list()).workspaces;
+  assert.equal(state.filter((w) => w.state === "active").length, 3);
+  assert.equal(state.filter((w) => w.state === "queued").length, 1);
+});
+
+test("3.2: learning commit then a later provider commit fails — learning workspace and task roll back to the original", async (t) => {
+  const { directory, learning } = await fixture(t);
+  const provider = learning.registerBackupProvider();
+  const { workspace } = await learning.createDraft(draftInput(101));
+  const page = await learning.preview({ workspaceId: workspace.workspaceId });
+  await learning.confirm({ token: page.token }); // active + receipt persisted in the store
+  const current = await learning.list();
+  // A later workspace appears after the backup snapshot (mutate live state).
+  const later = await learning.createDraft(draftInput(102));
+
+  const failingProjects = {
+    id: "projects",
+    schemaVersion: 1,
+    optionalForImport: false,
+    exportState: async () => ({ version: 1, revision: 0, updatedAt: null, projects: [], columns: [] }),
+    validateImport: async (value) => structuredClone(value),
+    replaceState: async () => {},
+    async stageImport() {
+      return {
+        async commit() { throw new Error("synthetic later provider commit failure"); },
+        async rollback() {},
+        async cleanup() {},
+      };
+    },
+  };
+  const backup = createWorkspaceBackup({ providers: [provider, failingProjects], secret: Buffer.alloc(32, 7) });
+  const bundle = await backup.exportBundle();
+  assert.deepEqual(Object.keys(bundle.providers).sort(), ["learning", "projects"]); // learning commits first
+  await assert.rejects(
+    backup.confirmImport((await backup.previewImport(bundle)).token),
+    { code: "WORKSPACE_RESTORE_COMMIT_FAILED" },
+  );
+  // Learning restored: both workspaces and task content intact, original authorization restored.
+  const after = await learning.list();
+  assert.deepEqual(after.workspaces.map((w) => w.repositoryId).sort((a, b) => a - b), [101, 102]);
+  assert.deepEqual((await learning.get(later.workspace.workspaceId)).workspace, later.workspace);
+  // Internal rollback restores the original store bytes, so the original token still authorizes.
+  assert.equal((await learning.confirm({ token: page.token })).confirmed, "active");
+});
+
+test("3.3: restoring a legacy backup without the learning provider preserves existing learning data", async (t) => {
+  const { directory, learning } = await fixture(t);
+  const provider = learning.registerBackupProvider();
+  const { workspace } = await learning.createDraft(draftInput(101));
+  const page = await learning.preview({ workspaceId: workspace.workspaceId });
+  await learning.confirm({ token: page.token });
+  const before = await learning.list();
+
+  const projects = {
+    id: "projects",
+    schemaVersion: 1,
+    exportState: async () => ({ version: 1, revision: 0, updatedAt: null, projects: [], columns: [] }),
+    validateImport: async (value) => structuredClone(value),
+    replaceState: async () => {},
+  };
+  const legacyBackup = createWorkspaceBackup({ providers: [projects], secret: Buffer.alloc(32, 7) });
+  const bundle = await legacyBackup.exportBundle();
+  assert.equal(Object.keys(bundle.providers).includes("learning"), false);
+
+  const restoreBackup = createWorkspaceBackup({ providers: [projects, provider], secret: Buffer.alloc(32, 7) });
+  const preview = await restoreBackup.previewImport(bundle);
+  assert.match(preview.warnings.join(" "), /learning.*保留/);
+  assert.deepEqual(preview.providers.map(({ id }) => id), ["projects"]);
+  await restoreBackup.confirmImport(preview.token);
+  assert.deepEqual(await learning.list(), before);
+  assert.equal((await learning.get(workspace.workspaceId)).workspace.state, "active");
+});
+
+test("3.4a: a corrupted store file fails mutations and preserves the original bytes", async (t) => {
+  const root = await mkdtemp(path.join(await realpath(os.tmpdir()), "workbench-learning-corrupt-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const directory = path.join(root, "learning");
+  await mkdir(directory, { recursive: true });
+  const file = path.join(directory, "learning.json");
+  const corrupt = "<not-json>%corrupt%";
+  await writeFile(file, corrupt);
+  const learning = createLearningRepository({ directory, now });
+  await assert.rejects(learning.createDraft(draftInput(101)), isCode("LEARNING_STORAGE_CORRUPT"));
+  assert.equal(await readFile(file, "utf8"), corrupt);
+});
+
+test("3.4b: an unsupported store version is rejected without overwriting", async (t) => {
+  const root = await mkdtemp(path.join(await realpath(os.tmpdir()), "workbench-learning-version-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const directory = path.join(root, "learning");
+  await mkdir(directory, { recursive: true });
+  const file = path.join(directory, "learning.json");
+  const unknown = JSON.stringify({ version: 99 });
+  await writeFile(file, unknown);
+  const learning = createLearningRepository({ directory, now });
+  await assert.rejects(learning.createDraft(draftInput(101)), isCode("LEARNING_STORAGE_VERSION_UNSUPPORTED"));
+  assert.equal(await readFile(file, "utf8"), unknown);
+});
+
+test("3.4c: a store file that links outside the storage directory is rejected", async (t) => {
+  const root = await mkdtemp(path.join(await realpath(os.tmpdir()), "workbench-learning-symlink-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const directory = path.join(root, "learning");
+  await mkdir(directory, { recursive: true });
+  const outside = path.join(root, "outside.json");
+  await writeFile(outside, JSON.stringify({ version: 1 }));
+  let linked = true;
+  try {
+    await symlink(outside, path.join(directory, "learning.json"));
+  } catch {
+    linked = false; // platform without symlink privileges: nothing to assert
+  }
+  if (!linked) return;
+  const learning = createLearningRepository({ directory, now });
+  await assert.rejects(learning.createDraft(draftInput(101)), isCode("LEARNING_STORAGE_CORRUPT"));
+});
+
+function barrierChildren(directory, barrierDir, entries, mode) {
+  const source = new URL("../server/learning/learning-repository.mjs", import.meta.url).href;
+  return entries.map((entry) => {
+    const body = `
+      import { createLearningRepository } from ${JSON.stringify(source)};
+      import { readFile, writeFile } from "node:fs/promises";
+      const directory = ${JSON.stringify(directory)};
+      const barrierDir = ${JSON.stringify(barrierDir)};
+      const repository = createLearningRepository({ directory, now: () => new Date("2026-09-02T06:00:00Z") });
+      const ticketId = ${JSON.stringify(String(entry.ticketId))};
+      await writeFile(barrierDir + "/ready-" + ticketId + ".ticket", ticketId);
+      process.stdout.write("READY\\n");
+      for (;;) { try { await readFile(barrierDir + "/go.ticket"); break; } catch { await new Promise((r) => setTimeout(r, 5)); } }
+      const id = ${JSON.stringify(String(entry.id))};
+      if (${mode === "activate" ? "true" : "false"}) {
+        const result = await repository.activate({ workspaceId: id, expectedRevision: 1 });
+        if (result.outcome === "active") process.exitCode = 10;
+        else if (result.outcome === "ACTIVE_LIMIT_REACHED") process.exitCode = 20;
+        else process.exitCode = 1;
+      } else {
+        const draft = await repository.createDraft({ repositoryId: Number(id), fullName: "synthetic/r-"+id, sourceUrl: "https://github.com/synthetic/r-"+id, sourceCommitSha: "a".repeat(40), mission: { goal: "learn-usage", notes: "race" } });
+        const page = await repository.preview({ workspaceId: draft.workspace.workspaceId });
+        const result = await repository.confirm({ token: page.token });
+        if (result.confirmed === "active") process.exitCode = 10;
+        else if (result.confirmed === "queued") process.exitCode = 20;
+        else process.exitCode = 1;
+      }
+    `;
+    return body;
+  });
+}
+
+async function runBarrier({ barrierDir, scripts }) {
+  const children = scripts.map((body) => spawn(process.execPath, ["--input-type=module", "-e", body], { stdio: ["ignore", "pipe", "inherit"] }));
+  let readySeen = 0;
+  const ready = new Promise((resolve, reject) => {
+    let settled = false;
+    const fire = () => { if (!settled) { settled = true; resolve(); } };
+    for (const child of children) {
+      child.stdout.on("data", (chunk) => {
+        const text = chunk.toString();
+        for (let i = 0; i < text.length; i += 1) {
+          if (text.startsWith("READY", i)) readySeen += 1;
+        }
+        if (readySeen >= scripts.length) fire();
+      });
+      child.on("error", (error) => { if (!settled) { settled = true; reject(error); } });
+    }
+  });
+  await Promise.race([ready, new Promise((_, reject) => setTimeout(() => reject(new Error("race barrier timeout")), 15000))]);
+  await writeFile(path.join(barrierDir, "go.ticket"), "go");
+  const codes = await Promise.all(children.map((child) => new Promise((resolve, reject) => {
+    child.on("exit", (code) => resolve(code ?? 1));
+    child.on("error", reject);
+  })));
+  return codes;
+}
+
+async function barrierConfirmRace({ directory, barrierDir, userIds }) {
+  const scripts = barrierChildren(directory, barrierDir, userIds.map((id) => ({ ticketId: id, id })), "confirm");
+  return runBarrier({ barrierDir, scripts });
+}
+async function barrierActivateRace({ directory, barrierDir, workspaceIds }) {
+  const scripts = barrierChildren(directory, barrierDir, workspaceIds.map((id) => ({ ticketId: id, id })), "activate");
+  return runBarrier({ barrierDir, scripts });
+}

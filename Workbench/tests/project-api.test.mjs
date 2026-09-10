@@ -70,6 +70,16 @@ async function request(origin, route, { method = "GET", body, headers } = {}) {
   return { response, body: await response.json() };
 }
 
+// Binds the vault's own fingerprint to a fresh empty workspace with a distinct
+// id, so tests exercising backup/restore flows have durable state without
+// depending on reads auto-creating the binding.
+async function bindVault(registryDirectory, vaultRoot, makeId) {
+  const registry = createWorkspaceRegistry({ directory: registryDirectory, makeId });
+  const fingerprint = createHash("sha256").update(path.resolve(vaultRoot).toLowerCase()).digest("hex");
+  const workspace = await registry.resolveVault({ fingerprint, label: "Synthetic Vault Workspace" });
+  return workspace.workspaceId;
+}
+
 test("creates and reads a project through the local API", async (t) => {
   const { origin } = await startFixture(t);
   const created = await request(origin, "/api/projects", {
@@ -323,7 +333,12 @@ test("exports and restores project state only after a safe preview is confirmed"
 });
 
 test("workspace restore routes keep origin, JSON, read-only, checksum, and hosted gates", async (t) => {
-  const writable = await startFixture(t, { useWorkspaceRegistry: true });
+  const writable = await startFixture(t, {
+    useWorkspaceRegistry: true,
+    async beforeStart({ vaultRoot, appDataRoot }) {
+      await bindVault(path.join(appDataRoot, "PersonalAIWorkbench"), vaultRoot, () => "vault-workspace");
+    },
+  });
   const bundle = (await request(writable.origin, "/api/workspace/backup")).body;
 
   const crossOrigin = await fetch(`${writable.origin}/api/workspace/restore/preview`, {
@@ -363,9 +378,10 @@ test("workspace restore routes keep origin, JSON, read-only, checksum, and hoste
 
 test("lists safe workspace candidates and requires preview confirmation before rebind", async (t) => {
   let existingWorkspaceId;
+  let vaultWorkspaceId;
   const fixture = await startFixture(t, {
     useWorkspaceRegistry: true,
-    async beforeStart({ appDataRoot }) {
+    async beforeStart({ vaultRoot, appDataRoot }) {
       const registryDirectory = path.join(appDataRoot, "PersonalAIWorkbench");
       const registry = createWorkspaceRegistry({ directory: registryDirectory, makeId: () => "workspace-existing" });
       const existing = await registry.resolveVault({
@@ -378,17 +394,26 @@ test("lists safe workspace candidates and requires preview confirmation before r
       });
       await repository.createProject({ key: "OLD", name: "Synthetic retained project" });
       await createRadarRepository({ directory: path.join(registryDirectory, "workspaces", existing.workspaceId, "ai-radar"), timeZone: "UTC" }).updateSchedule({ time: "13:45" });
+      // The vault owns an empty workspace so read-only backup exports have
+      // state without reads auto-creating the binding.
+      vaultWorkspaceId = await bindVault(registryDirectory, vaultRoot, () => "vault-workspace");
     },
   });
 
   const candidates = await request(fixture.origin, "/api/workspace/rebind/candidates");
   assert.equal(candidates.response.status, 200);
-  assert.deepEqual(candidates.body.items, [{
+  assert.equal(candidates.body.items.length, 2);
+  assert.deepEqual(candidates.body.items[0], {
     workspaceId: existingWorkspaceId,
     label: "Synthetic Existing Workspace",
     updatedAt: candidates.body.items[0].updatedAt,
     isCurrent: false,
-  }]);
+  });
+  // The vault's own workspace is listed as current; its label follows the
+  // plugin's vault basename, so only id and current flag are pinned here.
+  assert.equal(candidates.body.items.length, 2);
+  assert.equal(candidates.body.items[1].workspaceId, vaultWorkspaceId);
+  assert.equal(candidates.body.items[1].isCurrent, true);
   assert.equal(JSON.stringify(candidates.body).includes("fingerprint"), false);
 
   const beforeBackup = await request(fixture.origin, "/api/workspace/backup");

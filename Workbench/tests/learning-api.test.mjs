@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
 import { access, mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import http from "node:http";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -10,6 +11,7 @@ import { createServer as createViteServer } from "vite";
 import { createRadarRepository } from "../server/ai-radar/radar-repository.mjs";
 import { createLearningRepository } from "../server/learning/learning-repository.mjs";
 import { createLearningRoutes } from "../server/learning/learning-routes.mjs";
+import { createLearningService } from "../server/learning/learning-service.mjs";
 import { workbenchApiPlugin } from "../server/vite-plugin-workbench.mjs";
 import { createWorkspaceRegistry } from "../server/workspace-state/workspace-registry.mjs";
 
@@ -70,6 +72,41 @@ function syntheticGitHub() {
   };
 }
 
+// A GitHub client whose getHeadCommit stays pending until the test releases
+// it. Lets a test pause the slow remote work of an in-flight createDraft while
+// another request rebinds the workspace.
+function controllableGitHub() {
+  const state = {
+    calls: [],
+    enteredResolve: null,
+    releaseResolve: null,
+  };
+  state.entered = new Promise((resolve) => { state.enteredResolve = resolve; });
+  state.head = new Promise((resolve) => { state.releaseResolve = resolve; });
+  return {
+    state,
+    async getHeadCommit(input) {
+      state.calls.push(input);
+      state.enteredResolve?.();
+      return state.head;
+    },
+    release(sha) {
+      state.releaseResolve({
+        ref: "refs/heads/main",
+        sha: commitSha(sha || "b"),
+        committedAt: "2026-09-01T00:00:00.000Z",
+        observedAt: "2026-09-02T06:00:00.000Z",
+      });
+    },
+    async discoverCandidates() {
+      return { repositories: [], errors: [], partial: false, retryAt: null, truncated: false };
+    },
+    async getRepositories() {
+      return { repositories: [], errors: [], partial: false, retryAt: null, truncated: false };
+    },
+  };
+}
+
 const fetchForbiddenPorts = new Set([
   1, 7, 9, 11, 13, 15, 17, 19, 20, 21, 22, 23, 25, 37, 42, 43, 53, 69, 77, 79, 87, 95,
   101, 102, 103, 104, 109, 110, 111, 113, 115, 117, 119, 123, 135, 137, 139, 143, 161, 179,
@@ -103,10 +140,16 @@ async function request(origin, route, { method = "GET", body, headers } = {}) {
 
 // Mirrors project-api.test.mjs startFixture but always uses the workspace
 // registry (projectDirectory = null) and injects a synthetic GitHub client at
-// the external adapter seam. A caller-supplied seed hook runs inside
-// beforeStart after the workspace binding is created, so it can write real
-// radar/learning stores into the deterministic bound-workspace stateRoot.
-async function startFixture(t, { readOnly = false, profile = "default", projectReadOnly, hosted = false, github = syntheticGitHub, seed = async () => {} } = {}) {
+// the external adapter seam. With prebind true (default) the vault is bound to
+// a deterministic workspace exactly like the plugin's currentWorkspace({create:
+// true}); with prebind false the vault starts unbound so tests can prove reads
+// never create registry/workspace/learning state and a later mutation
+// initializes it. radarDirectory lets tests host the radar store outside the
+// bound workspace, so a data-bearing radar read never makes the workspace
+// "stateful" and blocks a rebind used by the race tests. A caller-supplied
+// seed hook runs after pre-binding and can write real radar/learning stores
+// into the deterministic bound-workspace stateRoot.
+async function startFixture(t, { readOnly = false, profile = "default", projectReadOnly, hosted = false, github = syntheticGitHub, prebind = true, radarDirectory = null, seed = async () => {} } = {}) {
   const stableTempRoot = await realpath(os.tmpdir());
   const root = await mkdtemp(path.join(stableTempRoot, "workbench-learning-api-"));
   assert.equal(root, await realpath(root));
@@ -118,6 +161,11 @@ async function startFixture(t, { readOnly = false, profile = "default", projectR
   let boundStateRoot = null;
   let boundWorkspaceId = null;
   const client = github();
+  // A relative radarDirectory is resolved under the fixture root so the test
+  // temp tree owns every store; an absolute path passes through untouched.
+  const resolvedRadarDirectory = radarDirectory
+    ? (path.isAbsolute(radarDirectory) ? radarDirectory : path.join(root, radarDirectory))
+    : null;
   const vite = await createViteServer({
     configFile: false,
     logLevel: "silent",
@@ -127,15 +175,16 @@ async function startFixture(t, { readOnly = false, profile = "default", projectR
       profile,
       appDataRoot,
       projectDirectory: null,
+      radarDirectory: resolvedRadarDirectory,
       readOnly,
       projectReadOnly,
       hosted,
       radarOptions: { github: client },
     })],
   });
-  // Pre-bind the workspace deterministically, exactly as the plugin's
-  // currentWorkspace({ create: true }) dedupes by fingerprint.
-  {
+  if (prebind) {
+    // Pre-bind the workspace deterministically, exactly as the plugin's
+    // currentWorkspace({ create: true }) dedupes by fingerprint.
     const registry = createWorkspaceRegistry({ directory: registryDirectory });
     const fingerprint = createHash("sha256").update(path.resolve(vaultRoot).toLowerCase()).digest("hex");
     const workspace = await registry.resolveVault({ fingerprint, label: "Synthetic Learning Vault" });
@@ -144,7 +193,7 @@ async function startFixture(t, { readOnly = false, profile = "default", projectR
       ? path.join(registryDirectory, workspace.workspaceId)
       : path.join(registryDirectory, "workspaces", workspace.workspaceId);
   }
-  await seed({ vaultRoot, appDataRoot, registryDirectory, stateRoot: boundStateRoot, workspaceId: boundWorkspaceId, createRadarRepository });
+  await seed({ vaultRoot, appDataRoot, registryDirectory, stateRoot: boundStateRoot, workspaceId: boundWorkspaceId, radarDirectory: resolvedRadarDirectory, createRadarRepository, createLearningRepository });
   const server = http.createServer(vite.middlewares);
   await listenOnFetchSafePort(server);
   const origin = `http://127.0.0.1:${server.address().port}`;
@@ -153,7 +202,15 @@ async function startFixture(t, { readOnly = false, profile = "default", projectR
     await vite.close();
     await rm(root, { recursive: true, force: true });
   });
-  return { origin, root, vaultRoot, appDataRoot, stateRoot: boundStateRoot, workspaceId: boundWorkspaceId, github: client };
+  return { origin, root, vaultRoot, appDataRoot, registryDirectory, stateRoot: boundStateRoot, workspaceId: boundWorkspaceId, github: client };
+}
+
+function seedRadarAt(directory, repos) {
+  return async () => {
+    const radar = createRadarRepository({ directory, timeZone: "UTC" });
+    await radar.updateSchedule({ time: "11:30" });
+    if (repos?.length) await radar.upsertRepositories(repos);
+  };
 }
 
 function seedRadar(repos) {
@@ -552,4 +609,344 @@ test("read-only export of an absent learning store never creates its directory",
   assert.equal(backup.body.providers.learning.data.workspaces.length, 0);
   // Reading/exporting an absent learning store must not create the directory.
   await assert.rejects(access(path.join(stateRoot, "learning")), { code: "ENOENT" });
+});
+
+function rawChunkedPost(port, pathname, bytes, split) {
+  return new Promise((resolve, reject) => {
+    const socket = net.connect(port, "127.0.0.1");
+    let received = Buffer.alloc(0);
+    socket.on("connect", () => {
+      socket.write(Buffer.from(
+        `POST ${pathname} HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n`,
+        "ascii",
+      ));
+      const chunk = (slice) => Buffer.concat([
+        Buffer.from(`${slice.length.toString(16)}\r\n`, "ascii"),
+        slice,
+        Buffer.from("\r\n", "ascii"),
+      ]);
+      socket.write(chunk(bytes.subarray(0, split)));
+      // A short pause forces the second half to arrive as its own TCP data
+      // event, so the multibyte cut really lands on a chunk boundary.
+      setTimeout(() => {
+        socket.write(chunk(bytes.subarray(split)));
+        socket.write("0\r\n\r\n");
+      }, 10);
+    });
+    socket.on("data", (part) => { received = Buffer.concat([received, part]); });
+    socket.on("error", reject);
+    socket.on("close", () => {
+      const text = received.toString("utf8");
+      const status = Number(/HTTP\/1\.[01] (\d{3})/.exec(text)?.[1] || 0);
+      // The response may itself be chunked (HTTP/1.1 default without
+      // Content-Length), so decode its framing before parsing JSON. Chunk
+      // sizes are BYTE counts, so decode on the raw Buffer, never a string.
+      const bodyStart = received.indexOf(Buffer.from("\r\n\r\n", "ascii"));
+      let json = null;
+      try { json = JSON.parse(decodeChunkedBody(bodyStart >= 0 ? received.subarray(bodyStart + 4) : received)); } catch { /* non-JSON body */ }
+      resolve({ status, json });
+    });
+  });
+}
+
+function decodeChunkedBody(buffer) {
+  const delimiter = Buffer.from("\r\n", "ascii");
+  let cursor = 0;
+  const parts = [];
+  for (;;) {
+    const lineEnd = buffer.indexOf(delimiter, cursor);
+    if (lineEnd < 0) break;
+    const size = Number.parseInt(buffer.subarray(cursor, lineEnd).toString("ascii"), 16);
+    if (!size) break;
+    parts.push(buffer.subarray(lineEnd + 2, lineEnd + 2 + size));
+    cursor = lineEnd + 2 + size + 2;
+  }
+  return Buffer.concat(parts).toString("utf8");
+}
+
+test("chunked JSON bodies split mid-multibyte-character parse without loss", async (t) => {
+  const { origin } = await startFixture(t, { seed: seedRadar([syntheticRepository(101)]) });
+  const port = Number(new URL(origin).port);
+  const notes = "学习📚跨字节分块测试🔀完成";
+  const payload = JSON.stringify({ repositoryId: 101, mission: { goal: "understand-architecture", notes } });
+  const bytes = Buffer.from(payload, "utf8");
+  const marker = bytes.indexOf(Buffer.from("📚", "utf8"));
+  assert.ok(marker >= 0, "payload must contain the emoji marker");
+  const split = marker + Buffer.byteLength("📚", "utf8") - 1; // cut inside the 4-byte emoji
+  const response = await rawChunkedPost(port, "/api/learning/drafts", bytes, split);
+  assert.equal(response.status, 201);
+  assert.equal(response.json.workspace.mission.notes, notes);
+});
+
+test("request bodies over the limit are rejected with a safe 413", async (t) => {
+  const { origin } = await startFixture(t, { seed: seedRadar([syntheticRepository(101)]) });
+  const oversized = "x".repeat(300 * 1024);
+  const result = await request(origin, "/api/learning/drafts", {
+    method: "POST",
+    body: { repositoryId: 101, mission: { goal: "learn-usage", notes: oversized } },
+  });
+  assert.equal(result.response.status, 413);
+  assert.equal(result.body.error.code, "LEARNING_REQUEST_TOO_LARGE");
+});
+
+test("invalid request parameters are rejected safely before any GitHub dependency is touched", async (t) => {
+  const { origin, github } = await startFixture(t, { seed: seedRadar([syntheticRepository(101)]) });
+
+  const unknownField = await request(origin, "/api/learning/drafts", {
+    method: "POST",
+    body: { repositoryId: 101, mission: { goal: "learn-usage", notes: "x" }, extra: "sneaky" },
+  });
+  assert.equal(unknownField.response.status, 400);
+  assert.equal(unknownField.body.error.code, "LEARNING_INVALID_INPUT");
+  assert.equal(github.calls.length, 0);
+
+  const nonInteger = await request(origin, "/api/learning/drafts", {
+    method: "POST",
+    body: { repositoryId: "101", mission: { goal: "learn-usage", notes: "x" } },
+  });
+  assert.equal(nonInteger.response.status, 400);
+  assert.equal(nonInteger.body.error.code, "LEARNING_INVALID_INPUT");
+
+  const badGoal = await request(origin, "/api/learning/drafts", {
+    method: "POST",
+    body: { repositoryId: 101, mission: { goal: "not-a-goal", notes: "x" } },
+  });
+  assert.equal(badGoal.response.status, 400);
+  assert.equal(badGoal.body.error.code, "LEARNING_INVALID_INPUT");
+});
+
+test("unknown errors from dependency reads are sanitized to a generic 500", async (t) => {
+  const { origin } = await startFixture(t, {
+    seed: async ({ stateRoot }) => {
+      await mkdir(path.join(stateRoot, "ai-radar"), { recursive: true });
+      await writeFile(path.join(stateRoot, "ai-radar", "radar.json"), "<not-json>%corrupt%", "utf8");
+    },
+  });
+  const result = await request(origin, "/api/learning/drafts", {
+    method: "POST",
+    body: { repositoryId: 101, mission: { goal: "learn-usage", notes: "synthetic" } },
+  });
+  assert.equal(result.response.status, 500);
+  assert.deepEqual(result.body.error, { code: "LEARNING_INTERNAL_ERROR", message: "学习服务暂时不可用。" });
+});
+
+test("read-only and hosted builds reject mutations before touching GitHub or the store", async (t) => {
+  const readOnly = await startFixture(t, { projectReadOnly: true, seed: seedRadar([syntheticRepository(101)]) });
+  const ro = await request(readOnly.origin, "/api/learning/drafts", {
+    method: "POST",
+    body: { repositoryId: 101, mission: { goal: "learn-usage", notes: "x" } },
+  });
+  assert.equal(ro.response.status, 403);
+  assert.equal(ro.body.error.code, "LEARNING_READ_ONLY");
+  assert.equal(readOnly.github.calls.length, 0);
+  await assert.rejects(access(path.join(readOnly.stateRoot, "learning")), { code: "ENOENT" });
+
+  const hosted = await startFixture(t, { hosted: true, seed: seedRadar([syntheticRepository(101)]) });
+  const h = await request(hosted.origin, "/api/learning/drafts", {
+    method: "POST",
+    body: { repositoryId: 101, mission: { goal: "learn-usage", notes: "x" } },
+  });
+  assert.equal(h.response.status, 404);
+  assert.equal(h.body.error.code, "LEARNING_UNAVAILABLE");
+  assert.equal(hosted.github.calls.length, 0);
+  await assert.rejects(access(path.join(hosted.stateRoot, "learning")), { code: "ENOENT" });
+});
+
+test("preview completes its response inside a single bound store context", async () => {
+  let creations = 0;
+  const repository = {
+    async preview({ workspaceId }) {
+      return {
+        workspaceId,
+        token: "synthetic-preview-token",
+        expiresAt: "2026-09-03T00:00:00.000Z",
+        draftRevision: 1,
+        sourceCommitSha: commitSha("b"),
+        mission: { goal: "learn-usage", notes: "synthetic" },
+      };
+    },
+    async get(workspaceId) {
+      return {
+        workspace: {
+          workspaceId,
+          repositoryId: 101,
+          fullName: "synthetic/repository-101",
+          sourceUrl: "https://github.com/synthetic/repository-101",
+        },
+      };
+    },
+  };
+  const service = createLearningService({
+    getLearning: async () => { creations += 1; return repository; },
+    bound: async (_binding, operation) => operation(),
+    resolveRepository: null,
+    getHeadCommit: null,
+  });
+  const preview = await service.preview({ workspaceId: "synthetic-workspace" });
+  assert.equal(preview.token, "synthetic-preview-token");
+  assert.equal(preview.repositoryId, 101);
+  assert.equal(preview.fullName, "synthetic/repository-101");
+  // The preview token/page and its source complement come from ONE store
+  // resolution, so a rebinding can never splice a second binding's data in.
+  assert.equal(creations, 1);
+});
+
+test("unbound reads never create registry, workspace or learning state", async (t) => {
+  const { origin, registryDirectory } = await startFixture(t, { prebind: false });
+
+  const listed = await request(origin, "/api/learning");
+  assert.equal(listed.response.status, 200);
+  assert.deepEqual(listed.body.workspaces, []);
+
+  const caps = await request(origin, "/api/learning/capabilities");
+  assert.equal(caps.response.status, 200);
+  assert.equal(caps.body.capabilities.read, true);
+
+  const radar = await request(origin, "/api/ai-radar");
+  assert.equal(radar.response.status, 404);
+  assert.equal(radar.body.error.code, "RADAR_UNAVAILABLE");
+
+  const backup = await request(origin, "/api/workspace/backup");
+  assert.equal(backup.response.status, 404);
+  assert.equal(backup.body.error.code, "WORKSPACE_NOT_FOUND");
+
+  // The whole app-data registry store, workspace roots and learning dirs
+  // remain absent: reads never bind or create on a fresh vault.
+  await assert.rejects(access(registryDirectory), { code: "ENOENT" });
+});
+
+test("after unbound read-only queries, a legitimate mutation initializes the binding and store", async (t) => {
+  const { origin, registryDirectory, vaultRoot } = await startFixture(t, {
+    prebind: false,
+    radarDirectory: "shared-radar",
+    seed: async ({ radarDirectory }) => {
+      const radar = createRadarRepository({ directory: radarDirectory, timeZone: "UTC" });
+      await radar.updateSchedule({ time: "11:30" });
+      await radar.upsertRepositories([syntheticRepository(101)]);
+    },
+  });
+
+  const before = await request(origin, "/api/learning");
+  assert.equal(before.response.status, 200);
+  assert.deepEqual(before.body.workspaces, []);
+  await assert.rejects(access(registryDirectory), { code: "ENOENT" });
+
+  // The cached empty read must not poison the first legitimate mutation.
+  const created = await request(origin, "/api/learning/drafts", {
+    method: "POST",
+    body: { repositoryId: 101, mission: { goal: "learn-usage", notes: "initialized after empty reads" } },
+  });
+  assert.equal(created.response.status, 201);
+  // The mutation auto-bound the vault: the learning store now exists under the
+  // NEW registry binding's state root (the draft's workspaceId is a learning
+  // store id, NOT the registry binding id).
+  const fingerprint = createHash("sha256").update(path.resolve(vaultRoot).toLowerCase()).digest("hex");
+  const registry = createWorkspaceRegistry({ directory: registryDirectory });
+  const binding = await registry.lookupVault({ fingerprint });
+  assert.ok(binding, "mutation must bind the vault");
+  await access(path.join(registryDirectory, "workspaces", binding.workspaceId, "learning"));
+
+  const after = await request(origin, "/api/learning");
+  assert.equal(after.body.workspaces.length, 1);
+  assert.equal(after.body.workspaces[0].repositoryId, 101);
+});
+
+test("a rebind during in-flight draft creation yields 409 and never writes into the new workspace", async (t) => {
+  let registryDirectory;
+  let boundWorkspaceId;
+  let targetWorkspaceId;
+  const serverGithub = controllableGitHub();
+  const { origin } = await startFixture(t, {
+    github: () => serverGithub,
+    radarDirectory: "shared-radar",
+    seed: async ({ registryDirectory: rd, workspaceId: wid, radarDirectory }) => {
+      registryDirectory = rd;
+      boundWorkspaceId = wid;
+      const radar = createRadarRepository({ directory: radarDirectory, timeZone: "UTC" });
+      await radar.updateSchedule({ time: "11:30" });
+      await radar.upsertRepositories([syntheticRepository(101)]);
+      const registry = createWorkspaceRegistry({ directory: rd });
+      const target = await registry.resolveVault({ fingerprint: "b".repeat(64), label: "Target Workspace B" });
+      targetWorkspaceId = target.workspaceId;
+    },
+  });
+
+  // In A: initiate a draft, which pins the binding and pauses in getHeadCommit.
+  const draft = request(origin, "/api/learning/drafts", {
+    method: "POST",
+    body: { repositoryId: 101, mission: { goal: "understand-architecture", notes: "bound while in flight" } },
+  });
+  await serverGithub.state.entered;
+  assert.ok(serverGithub.state.calls.length >= 1, "draft must have paused at GitHub");
+
+  // Rebind the vault to the empty target workspace through the official API.
+  const preview = await request(origin, "/api/workspace/rebind/preview", { method: "POST", body: { workspaceId: targetWorkspaceId } });
+  assert.equal(preview.response.status, 200);
+  const confirmed = await request(origin, "/api/workspace/rebind/confirm", { method: "POST", body: { token: preview.body.token } });
+  assert.equal(confirmed.response.status, 200);
+
+  // Release GitHub: the write guard must reject the stale binding, never
+  // re-resolve the current workspace B and continue writing A's request.
+  serverGithub.release("c");
+  const result = await draft;
+  assert.equal(result.response.status, 409);
+  assert.equal(result.body.error.code, "WORKSPACE_BINDING_CHANGED");
+
+  // B owns no learning record and the old workspace A was never written.
+  const after = await request(origin, "/api/learning"); // vault is bound to B now
+  assert.equal(after.response.status, 200);
+  assert.deepEqual(after.body.workspaces, []);
+  await assert.rejects(
+    access(path.join(registryDirectory, "workspaces", targetWorkspaceId, "learning")),
+    { code: "ENOENT" },
+  );
+  await assert.rejects(
+    access(path.join(registryDirectory, "workspaces", boundWorkspaceId, "learning")),
+    { code: "ENOENT" },
+  );
+});
+
+test("radar read-time merge follows the rebound workspace and never mixes bindings", async (t) => {
+  let registryDirectory;
+  let targetWorkspaceId;
+  const { origin } = await startFixture(t, {
+    radarDirectory: "shared-radar",
+    seed: async ({ registryDirectory: rd, radarDirectory, createLearningRepository }) => {
+      registryDirectory = rd;
+      const radar = createRadarRepository({ directory: radarDirectory, timeZone: "UTC" });
+      await radar.updateSchedule({ time: "11:30" });
+      await radar.upsertRepositories([syntheticRepository(101, { stars: 700 })]);
+      // Target workspace B owns its own learning draft for the same repo.
+      const registry = createWorkspaceRegistry({ directory: rd });
+      const target = await registry.resolveVault({ fingerprint: "b".repeat(64), label: "Target Workspace B" });
+      targetWorkspaceId = target.workspaceId;
+      const learning = createLearningRepository({ directory: path.join(rd, "workspaces", target.workspaceId, "learning") });
+      await learning.createDraft({
+        repositoryId: 101,
+        fullName: "synthetic/repository-101",
+        sourceUrl: "https://github.com/synthetic/repository-101",
+        sourceCommitSha: commitSha("a"),
+        mission: { goal: "learn-usage", notes: "owned by workspace B" },
+      });
+    },
+  });
+
+  // Bound to A: shared radar repos render WITHOUT B's learning facet.
+  const before = await request(origin, "/api/ai-radar");
+  assert.equal(before.response.status, 200);
+  assert.equal(before.body.learningStatus, "ok");
+  const beforeEntry = before.body.lists.established.find((entry) => entry.repositoryId === 101);
+  assert.equal(beforeEntry.learning, null);
+
+  const preview = await request(origin, "/api/workspace/rebind/preview", { method: "POST", body: { workspaceId: targetWorkspaceId } });
+  assert.equal(preview.response.status, 200);
+  const confirmed = await request(origin, "/api/workspace/rebind/confirm", { method: "POST", body: { token: preview.body.token } });
+  assert.equal(confirmed.response.status, 200);
+
+  // Bound to B: the same radar repos pick up B's draft facet, not A's empty state.
+  const after = await request(origin, "/api/ai-radar");
+  assert.equal(after.response.status, 200);
+  assert.equal(after.body.learningStatus, "ok");
+  const afterEntry = after.body.lists.established.find((entry) => entry.repositoryId === 101);
+  assert.equal(afterEntry.learning, "draft");
 });

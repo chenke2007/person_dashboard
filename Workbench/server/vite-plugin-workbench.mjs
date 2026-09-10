@@ -932,26 +932,29 @@ export function workbenchApiPlugin({
     return radarRepositoryPromise;
   }
   let learningRepositoryPromise = null;
-  function learningRepository({ create = true } = {}) {
-    learningRepositoryPromise ??= (async () => {
-      let resolvedDirectory = null;
-      const workspace = await currentWorkspace({ create });
-      if (!workspace) return null;
-      const stateRoot = workspace.storageLayout === "legacy"
-        ? path.join(workspaceRegistryDirectory, workspace.workspaceId)
-        : path.join(workspaceRegistryDirectory, "workspaces", workspace.workspaceId);
-      resolvedDirectory = path.join(stateRoot, "learning");
-      if (!create) {
-        try {
-          await lstat(resolvedDirectory);
-        } catch (error) {
-          if (error?.code === "ENOENT") return null;
-          throw error;
-        }
+  async function learningRepository({ create = true } = {}) {
+    // Cache only a concrete repository, never a null resolution: a read on a
+    // fresh unbound vault must stay side-effect free, and the next legitimate
+    // mutation must still be able to bind and write.
+    if (learningRepositoryPromise) return learningRepositoryPromise;
+    let resolvedDirectory = null;
+    const workspace = await currentWorkspace({ create });
+    if (!workspace) return null;
+    const stateRoot = workspace.storageLayout === "legacy"
+      ? path.join(workspaceRegistryDirectory, workspace.workspaceId)
+      : path.join(workspaceRegistryDirectory, "workspaces", workspace.workspaceId);
+    resolvedDirectory = path.join(stateRoot, "learning");
+    if (!create) {
+      try {
+        await lstat(resolvedDirectory);
+      } catch (error) {
+        if (error?.code === "ENOENT") return null;
+        throw error;
       }
-      return createLearningRepository({ directory: resolvedDirectory, now: () => new Date() });
-    })();
-    return learningRepositoryPromise;
+    }
+    const repository = createLearningRepository({ directory: resolvedDirectory, now: () => new Date() });
+    learningRepositoryPromise = repository;
+    return repository;
   }
   let radarContextPromise = null;
   async function radarContext({ create = false } = {}) {
@@ -1087,7 +1090,14 @@ export function workbenchApiPlugin({
         // local read that never writes back to the radar decision. A corrupt
         // learning store signals "unavailable" on the base read and refuses a
         // learning-filtered read outright, so it can never masquerade as "no
-        // learning projects".
+        // learning projects". The radar context (and its binding) is resolved
+        // BEFORE the learning list and the guarded radar read verifies that
+        // same binding on the way out, so a successful response never mixes
+        // two bindings; the learning list itself must not run under the
+        // registry lock, because resolving the learning store calls back into
+        // the registry (lookupVault) and would deadlock on its own queue.
+        const context = await radarContext({ create: false });
+        if (!context) return null;
         const learning = options?.learning || "all";
         let learningState = null;
         let learningStatus = "ok";
@@ -1100,8 +1110,7 @@ export function workbenchApiPlugin({
             throw new RadarRoutesError("RADAR_LEARNING_UNAVAILABLE", "学习状态当前不可用。", 503);
           }
         }
-        const store = await radarApi.getStore();
-        return store ? store.getDashboard({ ...options, learningState, learningStatus }) : null;
+        return context.store.getDashboard({ ...options, learningState, learningStatus });
       },
       async setDecision(repositoryId, status) {
         return (await radarRouteStore({ create: true })).setDecision(repositoryId, status);
@@ -1141,20 +1150,30 @@ export function workbenchApiPlugin({
   // the HTTP layer stays a thin router. Mutations run through a single
   // withBoundWorkspace binding guard (registry lock) then the learning store's
   // own lock; slow GitHub work happens before either lock. Reads resolve the
-  // current bound workspace and never create the learning directory.
+  // current bound workspace without creating it and never create the learning
+  // directory. The createDraft flow captures its expected binding before the
+  // slow remote work, so a rebind landing mid-request rejects the write
+  // instead of silently continuing against the new workspace.
   const learningService = createLearningService({
-    getLearning: () => learningRepository({ create: true }),
-    bound: async (operation) => {
+    getLearning: (options) => learningRepository(options),
+    captureBinding: async () => {
+      if (!registry) return null;
+      const workspace = await currentWorkspace({ create: true });
+      if (!workspace) return null;
+      return { fingerprint: vaultFingerprint, workspaceId: workspace.workspaceId };
+    },
+    bound: async (binding, operation) => {
       if (!registry) return operation();
-      const workspace = await currentWorkspace();
-      if (!workspace) {
+      let expected = binding;
+      if (!expected) {
+        const workspace = await currentWorkspace({ create: true });
+        if (workspace) expected = { fingerprint: vaultFingerprint, workspaceId: workspace.workspaceId };
+      }
+      if (!expected) {
         throw new LearningWorkspaceError("WORKSPACE_NOT_FOUND", "当前 Vault 尚未绑定工作区。", 404);
       }
       try {
-        return await registry.withBoundWorkspace(
-          { fingerprint: vaultFingerprint, workspaceId: workspace.workspaceId },
-          operation,
-        );
+        return await registry.withBoundWorkspace(expected, operation);
       } catch (error) {
         if (error instanceof WorkspaceRegistryError && error.code === "WORKSPACE_BINDING_CHANGED") {
           throw new LearningWorkspaceError(error.code, "工作区绑定已改变，请重新加载后重试。", 409);
@@ -1207,8 +1226,11 @@ export function workbenchApiPlugin({
   const backupSecret = randomBytes(32);
   let workspaceBackupPromise = null;
   function workspaceBackup() {
+    // Backup export and restore previews are read paths: resolve the existing
+    // binding and never auto-create a workspace. A failed resolution is not
+    // memoized, so a later binding can still initialize the backup provider.
     workspaceBackupPromise ??= (async () => {
-      const workspace = await currentWorkspace();
+      const workspace = await currentWorkspace({ create: false });
       if (!workspace) {
         const error = new Error("当前 Vault 尚未绑定工作区。");
         error.code = "WORKSPACE_NOT_FOUND";
@@ -1226,7 +1248,10 @@ export function workbenchApiPlugin({
           ? registry.withBoundWorkspace({ fingerprint: vaultFingerprint, workspaceId: workspace.workspaceId }, () => backup.confirmImport(token))
           : backup.confirmImport(token),
       });
-    })();
+    })().then((value) => value, (error) => {
+      workspaceBackupPromise = null;
+      throw error;
+    });
     return workspaceBackupPromise;
   }
   const workspaceRoutes = createWorkspaceRoutes({

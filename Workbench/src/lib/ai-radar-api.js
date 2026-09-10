@@ -12,8 +12,8 @@ function queryParams(values) {
   return params.toString();
 }
 
-export const loadRadar = ({ period = "day", state, focus } = {}) => {
-  const query = queryParams({ period, state, focus });
+export const loadRadar = ({ period = "day", state, focus, learning } = {}) => {
+  const query = queryParams({ period, state, focus, learning });
   return request(`/api/ai-radar${query ? `?${query}` : ""}`, { method: "GET" });
 };
 export const loadRadarStatus = () => request("/api/ai-radar/status", { method: "GET" });

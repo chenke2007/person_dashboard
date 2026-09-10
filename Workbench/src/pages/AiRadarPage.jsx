@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useSearchParams } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { PageHeader } from "../components/PageHeader";
 import { AiRadarCard } from "../components/ai-radar/AiRadarCard";
 import { AiRadarFilters } from "../components/ai-radar/AiRadarFilters";
 import { AiRadarStatus } from "../components/ai-radar/AiRadarStatus";
-import { RADAR_FOCUSES, RADAR_LISTS, RADAR_PERIODS, RADAR_STATES, projectRadarDashboard } from "../lib/ai-radar-model.js";
+import { LearningDraftDialog } from "../components/learning/LearningDraftDialog";
+import { RADAR_FOCUSES, RADAR_LEARNING_LABELS, RADAR_LEARNING_STATES, RADAR_LISTS, RADAR_PERIODS, RADAR_STATES, projectRadarDashboard } from "../lib/ai-radar-model.js";
 import {
   addRadarPreference,
   collectRadar,
@@ -18,6 +19,7 @@ import {
   setRadarDecision,
   updateRadarSchedule,
 } from "../lib/ai-radar-api.js";
+import { loadLearningCapabilities } from "../lib/learning-api.js";
 import "../components/ai-radar/ai-radar.css";
 
 export function radarFilterFromSearch(params) {
@@ -30,12 +32,13 @@ export function radarFilterFromSearch(params) {
     list: get("list", RADAR_LISTS, "rising"),
     state: get("state", RADAR_STATES, "all"),
     focus: get("focus", RADAR_FOCUSES, "all"),
+    learning: get("learning", RADAR_LEARNING_STATES, "all"),
   };
 }
 
 export function radarFilterToSearch(filter = {}) {
   const params = new URLSearchParams();
-  for (const [key, fallback] of Object.entries({ period: "day", list: "rising", state: "all", focus: "all" })) {
+  for (const [key, fallback] of Object.entries({ period: "day", list: "rising", state: "all", focus: "all", learning: "all" })) {
     const value = filter[key] ?? fallback;
     if (value !== fallback) params.set(key, value);
   }
@@ -88,6 +91,9 @@ export function AiRadarView({
   actionErrors,
   collectFeedback,
   actions,
+  canJoinLearning = true,
+  learningStatus = "ok",
+  learningCapsError = null,
 }) {
   const cards = view && !view.empty && Array.isArray(view.cards) ? view.cards : [];
   return (
@@ -105,6 +111,14 @@ export function AiRadarView({
           ) : null}
         </div>
       ) : null}
+      {learningCapsError ? (
+        <div className="radar-message radar-message--error" role="alert">
+          <p>无法确认学习权限：{learningCapsError}。已停用“加入学习”等操作。</p>
+          {actions?.onRetryLearningCapabilities ? (
+            <button onClick={() => actions.onRetryLearningCapabilities()} type="button">重试</button>
+          ) : null}
+        </div>
+      ) : null}
       <AiRadarStatus
         actionErrors={actionErrors}
         actions={actions}
@@ -118,6 +132,11 @@ export function AiRadarView({
         statusError={statusError}
       />
       <AiRadarFilters filter={filter} onChangeFilter={onChangeFilter} />
+      {filter?.learning !== "all" && view ? (
+        <p className="radar-filters__note">
+          雷达总数（{view.eligibleCount ?? 0}）不受学习筛选影响；本榜单展示 {view.cards.length} 条学习状态为“{RADAR_LEARNING_LABELS[filter.learning] ?? filter.learning}”的条目。
+        </p>
+      ) : null}
       {error ? (
         <div className="radar-message radar-message--error" role="alert">
           <p>AI 雷达加载失败：{error}</p>
@@ -135,6 +154,14 @@ export function AiRadarView({
           <p>本地观测仍在积累时不会编造数据；可稍后查看，或调整周期、状态与方向筛选。</p>
         </div>
       ) : null}
+      {learningStatus === "unavailable" ? (
+        <div className="radar-message radar-message--error" role="alert">
+          <p>学习状态当前不可用，无法判断哪些仓库已加入学习。基础雷达榜单仍正常显示。</p>
+          {actions?.onRetryAux || actions?.onRetry ? (
+            <button onClick={() => (actions.onRetryAux ?? actions.onRetry)()} type="button">重试</button>
+          ) : null}
+        </div>
+      ) : null}
       {refreshError ? (
         <div className="radar-message radar-message--error" role="alert">
           <p>榜单刷新失败：{refreshError}，正在显示上次成功数据。</p>
@@ -149,10 +176,13 @@ export function AiRadarView({
             <AiRadarCard
               actionErrors={actionErrors}
               busy={busy}
+              canJoinLearning={!readOnly && canJoinLearning && learningStatus === "ok"}
               card={card}
               key={card.repositoryId}
               onDecide={actions.onDecide}
+              onJoinLearning={actions.onJoinLearning}
               onLessLike={actions.onLessLike}
+              onOpenLearning={actions.onOpenLearning}
               readOnly={readOnly}
             />
           ))}
@@ -210,6 +240,7 @@ export function AiRadarView({
 }
 
 export function AiRadarPage() {
+  const navigate = useNavigate();
   const [radarCapabilities, setRadarCapabilities] = useState(null);
   const [capabilitiesError, setCapabilitiesError] = useState(null);
   // Radar mutation capability comes from the server (collect/schedule), which is
@@ -223,6 +254,19 @@ export function AiRadarPage() {
       .catch((error) => setCapabilitiesError(error?.message ?? "无法读取雷达权限信息"));
   }, []);
   useEffect(() => { void loadCaps(); }, [loadCaps]);
+  // Learning join capability comes from the learning API contract and stays
+  // conservative while pending or failed: the join button never appears until
+  // the server confirms a writable workspace.
+  const [learningCaps, setLearningCaps] = useState(null);
+  const [learningCapsError, setLearningCapsError] = useState(null);
+  const loadLearningCaps = useCallback(() => {
+    loadLearningCapabilities()
+      .then((body) => { setLearningCaps(body?.capabilities ?? null); setLearningCapsError(null); })
+      .catch((error) => setLearningCapsError(error?.message ?? "无法读取学习权限信息"));
+  }, []);
+  useEffect(() => { void loadLearningCaps(); }, [loadLearningCaps]);
+  const learningCreate = learningCaps?.create === true;
+  const [joinCard, setJoinCard] = useState(null);
   const [searchParams, setSearchParams] = useSearchParams();
   const filter = useMemo(() => radarFilterFromSearch(searchParams), [searchParams]);
   const [dashboard, setDashboard] = useState(null);
@@ -250,7 +294,7 @@ export function AiRadarPage() {
       // error. A failed *refresh of the currently displayed filter* must keep
       // the last good board and only surface a refresh error + stale marker.
       const current = dashboardQueryRef.current;
-      const matchesCurrent = Boolean(current) && current.period === q?.period && current.state === q?.state && current.focus === q?.focus;
+      const matchesCurrent = Boolean(current) && current.period === q?.period && current.state === q?.state && current.focus === q?.focus && current.learning === q?.learning;
       if (matchesCurrent) {
         setRefreshError(error.message);
         setLoading(false);
@@ -275,13 +319,13 @@ export function AiRadarPage() {
   const reloadFor = useCallback((query) => {
     const loader = loaderRef.current ??= createRadarDashboardLoader(loadRadar, applyDashboard);
     setLoading(true);
-    return loader.load({ period: query.period, state: query.state, focus: query.focus }).catch(() => {});
+    return loader.load({ period: query.period, state: query.state, focus: query.focus, learning: query.learning }).catch(() => {});
   }, [applyDashboard]);
 
-  // Reflect filter changes from the URL (period/state/focus each require a re-query).
+  // Reflect filter changes from the URL (period/state/focus/learning each require a re-query).
   useEffect(() => {
-    void reloadFor({ period: filter.period, state: filter.state, focus: filter.focus });
-  }, [reloadFor, filter.period, filter.state, filter.focus]);
+    void reloadFor({ period: filter.period, state: filter.state, focus: filter.focus, learning: filter.learning });
+  }, [reloadFor, filter.period, filter.state, filter.focus, filter.learning]);
 
   const refreshExtras = useCallback(() => Promise.all([
     loadRadarStatus()
@@ -308,7 +352,8 @@ export function AiRadarPage() {
     Boolean(dashboardQuery) &&
     dashboardQuery.period === filter.period &&
     dashboardQuery.state === filter.state &&
-    dashboardQuery.focus === filter.focus;
+    dashboardQuery.focus === filter.focus &&
+    dashboardQuery.learning === filter.learning;
   const currentDashboard = dashboardMatches ? dashboard : null;
   const view = useMemo(
     () => (currentDashboard ? projectRadarDashboard(currentDashboard, { period: filter.period, list: filter.list, state: filter.state, focus: filter.focus }) : null),
@@ -427,31 +472,55 @@ export function AiRadarPage() {
     onRevertPreference,
     onResetPreferences,
     onUpdateSchedule,
+    onJoinLearning: (repositoryId) => {
+      const card = view?.cards.find((item) => item.repositoryId === repositoryId);
+      if (card) setJoinCard(card);
+    },
+    onOpenLearning: (workspaceId) => navigate(`/learning/${encodeURIComponent(workspaceId)}`),
     onRetry: retry,
     onRetryCapabilities: loadCaps,
+    onRetryLearningCapabilities: loadLearningCaps,
     onRetryAux: refreshExtras,
-  }), [onCollect, onDecide, onLessLike, onRevertPreference, onResetPreferences, onUpdateSchedule, retry, loadCaps, refreshExtras]);
+  }), [onCollect, onDecide, onLessLike, onRevertPreference, onResetPreferences, onUpdateSchedule, retry, loadCaps, loadLearningCaps, refreshExtras, view, navigate]);
 
   return (
-    <AiRadarView
-      actionErrors={actionErrors}
-      actions={actions}
-      busy={busy}
-      capabilitiesError={capabilitiesError}
-      collectFeedback={collectFeedback}
-      error={dashboardError}
-      filter={filter}
-      loading={loading}
-      onChangeFilter={onChangeFilter}
-      preferences={preferences}
-      preferencesError={preferencesError}
-      readOnly={radarReadOnly}
-      refreshError={refreshError}
-      schedule={schedule}
-      stale={stale}
-      status={status}
-      statusError={statusError}
-      view={view}
-    />
+    <>
+      <AiRadarView
+        actionErrors={actionErrors}
+        actions={actions}
+        busy={busy}
+        canJoinLearning={learningCreate}
+        capabilitiesError={capabilitiesError}
+        collectFeedback={collectFeedback}
+        error={dashboardError}
+        filter={filter}
+        learningCapsError={learningCapsError}
+        loading={loading}
+        onChangeFilter={onChangeFilter}
+        preferences={preferences}
+        preferencesError={preferencesError}
+        readOnly={radarReadOnly}
+        refreshError={refreshError}
+        schedule={schedule}
+        stale={stale}
+        status={status}
+        statusError={statusError}
+        view={view}
+        learningStatus={view?.learningStatus ?? "ok"}
+      />
+      {joinCard ? (
+        <LearningDraftDialog
+          onClose={() => setJoinCard(null)}
+          onConfirmed={() => {
+            setJoinCard(null);
+            void refreshAfter();
+          }}
+          onDraftSaved={() => void refreshAfter()}
+          onOpenWorkspace={(id) => navigate(`/learning/${encodeURIComponent(id)}`)}
+          readOnly={!learningCreate}
+          repository={joinCard}
+        />
+      ) : null}
+    </>
   );
 }

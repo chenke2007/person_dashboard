@@ -165,6 +165,25 @@ test("the learning filter gate applies before rank truncation", async (t) => {
   assert.ok(establishedIds.includes(12), `expected repo 12 in established, got ${establishedIds}`);
 });
 
+test("dashboard entries expose the learning workspace id alongside the lifecycle facet", async (t) => {
+  const { radar, learning } = await fixture(t);
+  await radar.upsertRepositories([syntheticRepository(101)]);
+  const [draft] = await drafts(learning, [101]);
+  const ids = new Map([[101, draft.workspaceId]]);
+
+  const board = await radar.getDashboard({
+    learningState: await learningStateOf(learning),
+    learningWorkspaceIds: ids,
+  });
+  const entry = allEntries(board).find((item) => item.repositoryId === 101);
+  assert.equal(entry.learning, "draft");
+  assert.equal(entry.learningWorkspaceId, draft.workspaceId);
+
+  // Without an id map the facet stays null, never a fabricated id.
+  const bare = await radar.getDashboard({ learningState: await learningStateOf(learning) });
+  assert.equal(allEntries(bare).find((item) => item.repositoryId === 101).learningWorkspaceId, null);
+});
+
 test("the learning filter leaves radar decision counts and eligibleCount untouched", async (t) => {
   const { radar, learning } = await fixture(t);
   await radar.upsertRepositories([

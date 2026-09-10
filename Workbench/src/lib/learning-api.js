@@ -1,0 +1,18 @@
+import { request } from "./api-request.js";
+
+function command(path, method, body = {}) {
+  return request(path, { method, body: JSON.stringify(body) });
+}
+
+export const loadLearningCapabilities = () => request("/api/learning/capabilities", { method: "GET" });
+export const loadLearningWorkspaces = ({ includeArchived = false } = {}) =>
+  request(`/api/learning${includeArchived ? "?includeArchived=1" : ""}`, { method: "GET" });
+export const loadLearningWorkspace = (workspaceId) => request(`/api/learning/${encodeURIComponent(workspaceId)}`, { method: "GET" });
+export const createLearningDraft = (repositoryId, mission) => command("/api/learning/drafts", "POST", { repositoryId, mission });
+export const editLearningDraft = (workspaceId, expectedRevision, mission) =>
+  command(`/api/learning/${encodeURIComponent(workspaceId)}/draft`, "PATCH", { expectedRevision, mission });
+export const previewLearningDraft = (workspaceId) => command(`/api/learning/${encodeURIComponent(workspaceId)}/preview`, "POST");
+export const confirmLearning = (token) => command("/api/learning/confirm", "POST", { token });
+export const activateLearning = (workspaceId, expectedRevision) =>
+  command(`/api/learning/${encodeURIComponent(workspaceId)}/activate`, "POST", { expectedRevision });
+export const archiveLearning = (workspaceId) => command(`/api/learning/${encodeURIComponent(workspaceId)}/archive`, "POST");

@@ -4,6 +4,33 @@ export const RADAR_PERIODS = Object.freeze(["day", "week", "month"]);
 export const RADAR_LISTS = Object.freeze(["rising", "established", "relevant"]);
 export const RADAR_STATES = Object.freeze(["all", "unread", "saved", "summarized", "queued", "learning", "completed", "ignored"]);
 export const RADAR_FOCUSES = Object.freeze(["all", "agent", "ai-coding", "rag-knowledge", "ai-productivity"]);
+export const RADAR_LEARNING_STATES = Object.freeze(["all", "draft", "queued", "active", "archived"]);
+export const RADAR_LEARNING_LABELS = Object.freeze({
+  all: "全部",
+  draft: "学习草稿",
+  queued: "学习队列",
+  active: "学习中",
+  archived: "学习已归档",
+});
+export const RADAR_PERIOD_LABELS = Object.freeze({ day: "今日", week: "每周", month: "每月" });
+export const RADAR_LIST_LABELS = Object.freeze({ rising: "快速上升", established: "长期热门", relevant: "与你相关" });
+export const RADAR_STATE_LABELS = Object.freeze({
+  all: "全部",
+  unread: "未处理",
+  saved: "收藏",
+  summarized: "已摘要",
+  queued: "学习队列",
+  learning: "学习中",
+  completed: "已完成",
+  ignored: "已忽略",
+});
+export const RADAR_FOCUS_LABELS = Object.freeze({
+  all: "全部",
+  agent: "AI Agent",
+  "ai-coding": "AI 编程",
+  "rag-knowledge": "RAG/知识库",
+  "ai-productivity": "AI 应用与生产力",
+});
 export const RADAR_VIEW_LIMITS = Object.freeze({ day: 8, week: 12, month: 20 });
 
 function requireChoice(value, choices, label) {
@@ -35,6 +62,11 @@ function projectCard(entry) {
     reasons: Array.isArray(entry.reasons) ? entry.reasons : [],
     decisionStatus: decision.status ?? "unread",
     decisionUpdatedAt: decision.updatedAt ?? null,
+    // Learning lifecycle is a read-time overlay from the learning store; null
+    // means "no learning workspace", never a fabricated state.
+    learningState: entry.learning ?? null,
+    hasLearning: entry.learning != null,
+    learningWorkspaceId: entry.learningWorkspaceId ?? null,
   };
 }
 
@@ -56,15 +88,16 @@ function emptyView(view) {
   };
 }
 
-export function projectRadarDashboard(payload, { period = "day", list = "rising", state = "all", focus = "all" } = {}) {
+export function projectRadarDashboard(payload, { period = "day", list = "rising", state = "all", focus = "all", learning = "all" } = {}) {
   requireChoice(period, RADAR_PERIODS, "period");
   requireChoice(list, RADAR_LISTS, "list");
   requireChoice(state, RADAR_STATES, "state");
   requireChoice(focus, RADAR_FOCUSES, "focus");
-  const view = { period, list, state, focus, viewLimit: RADAR_VIEW_LIMITS[period] };
+  requireChoice(learning, RADAR_LEARNING_STATES, "learning");
+  const view = { period, list, state, focus, learning, viewLimit: RADAR_VIEW_LIMITS[period] };
 
   if (!payload || typeof payload !== "object" || !Array.isArray(payload.lists?.[list])) {
-    return emptyView(view);
+    return { ...emptyView(view), learningStatus: payload?.learningStatus ?? "ok" };
   }
 
   const cards = [];
@@ -78,6 +111,7 @@ export function projectRadarDashboard(payload, { period = "day", list = "rising"
       const directions = classifyRadarFocus(entry?.repository ?? entry).directions;
       if (!directions.includes(view.focus)) continue;
     }
+    if (view.learning !== "all" && entry?.learning !== view.learning) continue;
     cards.push(projectCard(entry));
   }
 
@@ -94,6 +128,7 @@ export function projectRadarDashboard(payload, { period = "day", list = "rising"
     retryAt: payload.retryAt ?? null,
     errors: payload.errors ?? null,
     run: payload.run ?? null,
+    learningStatus: payload.learningStatus ?? "ok",
     empty: cards.length === 0,
   };
 }

@@ -1,24 +1,15 @@
-import { RADAR_PERIODS, RADAR_LISTS, RADAR_STATES, RADAR_FOCUSES } from "../../lib/ai-radar-model.js";
-
-export const RADAR_PERIOD_LABELS = Object.freeze({ day: "今日", week: "每周", month: "每月" });
-export const RADAR_LIST_LABELS = Object.freeze({ rising: "快速上升", established: "长期热门", relevant: "与你相关" });
-export const RADAR_STATE_LABELS = Object.freeze({
-  all: "全部",
-  unread: "未处理",
-  saved: "收藏",
-  summarized: "已摘要",
-  queued: "学习队列",
-  learning: "学习中",
-  completed: "已完成",
-  ignored: "已忽略",
-});
-export const RADAR_FOCUS_LABELS = Object.freeze({
-  all: "全部",
-  agent: "AI Agent",
-  "ai-coding": "AI 编程",
-  "rag-knowledge": "RAG/知识库",
-  "ai-productivity": "AI 应用与生产力",
-});
+import {
+  RADAR_FOCUS_LABELS,
+  RADAR_FOCUSES,
+  RADAR_LEARNING_LABELS,
+  RADAR_LEARNING_STATES,
+  RADAR_LIST_LABELS,
+  RADAR_LISTS,
+  RADAR_PERIOD_LABELS,
+  RADAR_PERIODS,
+  RADAR_STATE_LABELS,
+  RADAR_STATES,
+} from "../../lib/ai-radar-model.js";
 
 function TabBar({ label, options, labels, value, onChange }) {
   return (
@@ -57,6 +48,14 @@ export function AiRadarFilters({ filter, onChangeFilter }) {
           <select onChange={(event) => onChangeFilter({ focus: event.target.value })} value={filter.focus}>
             {RADAR_FOCUSES.map((focus) => (
               <option key={focus} value={focus}>{RADAR_FOCUS_LABELS[focus]}</option>
+            ))}
+          </select>
+        </label>
+        <label>
+          学习
+          <select name="learning" onChange={(event) => onChangeFilter({ learning: event.target.value })} value={filter.learning}>
+            {RADAR_LEARNING_STATES.map((learning) => (
+              <option key={learning} value={learning}>{RADAR_LEARNING_LABELS[learning]}</option>
             ))}
           </select>
         </label>

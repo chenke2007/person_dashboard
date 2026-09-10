@@ -1,3 +1,5 @@
+import { LEARNING_CARD_BADGES } from "../../lib/learning-model.js";
+
 export const RADAR_DECISION_LABELS = Object.freeze({
   unread: "未处理",
   saved: "收藏",
@@ -8,7 +10,7 @@ export const RADAR_DECISION_LABELS = Object.freeze({
   ignored: "已忽略",
 });
 
-export function AiRadarCard({ card, readOnly, busy, actionErrors, onDecide, onLessLike }) {
+export function AiRadarCard({ card, readOnly, busy, actionErrors, onDecide, onLessLike, canJoinLearning = true, onJoinLearning, onOpenLearning }) {
   const repositoryId = card.repositoryId;
   const decisionBusy = busy?.decision instanceof Set && busy.decision.has(repositoryId);
   const lessLikeBusy = busy?.lessLike instanceof Set && busy.lessLike.has(repositoryId);
@@ -30,7 +32,12 @@ export function AiRadarCard({ card, readOnly, busy, actionErrors, onDecide, onLe
         <h3 className="radar-card__name">
           <a href={card.htmlUrl} rel="noopener noreferrer" target="_blank">{card.fullName}</a>
         </h3>
-        <span className="radar-card__decision">{RADAR_DECISION_LABELS[card.decisionStatus] ?? card.decisionStatus}</span>
+        <div className="radar-card__badges">
+          <span className="radar-card__decision">{RADAR_DECISION_LABELS[card.decisionStatus] ?? card.decisionStatus}</span>
+          {card.hasLearning ? (
+            <span className="radar-card__learning">{LEARNING_CARD_BADGES[card.learningState] ?? card.learningState}</span>
+          ) : null}
+        </div>
       </header>
       {card.description ? <p className="radar-card__description">{card.description}</p> : null}
       <dl className="radar-card__metrics">
@@ -72,8 +79,32 @@ export function AiRadarCard({ card, readOnly, busy, actionErrors, onDecide, onLe
           {card.reasons.map((reason, index) => <li key={index}>{reason}</li>)}
         </ul>
       ) : null}
+      {card.hasLearning ? (
+        <div className="radar-card__learning-row">
+          {card.learningWorkspaceId ? (
+            <button
+              aria-label={`查看学习 ${card.fullName}`}
+              disabled={!card.learningWorkspaceId}
+              onClick={() => card.learningWorkspaceId && onOpenLearning?.(card.learningWorkspaceId)}
+              type="button"
+            >
+              查看学习
+            </button>
+          ) : null}
+        </div>
+      ) : null}
       {!readOnly ? (
         <div className="radar-card__actions">
+          {!card.hasLearning && canJoinLearning ? (
+            <button
+              aria-label={`加入学习 ${card.fullName}`}
+              disabled={decisionBusy}
+              onClick={() => onJoinLearning?.(repositoryId)}
+              type="button"
+            >
+              {decisionBusy ? "保存中…" : "加入学习"}
+            </button>
+          ) : null}
           {card.decisionStatus === "saved" ? (
             <button
               aria-label={`取消收藏 ${card.fullName}`}

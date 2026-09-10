@@ -178,6 +178,9 @@ test("each list projects stable card fields from the server entry", () => {
     reasons: ["观测 Star 变化：+7。", "与 1 天前基线相比。"],
     decisionStatus: "saved",
     decisionUpdatedAt: "2026-09-02T00:30:00.000Z",
+    learningState: null,
+    hasLearning: false,
+    learningWorkspaceId: null,
   });
 
   const establishedCard = projectRadarDashboard(base, { period: "day", list: "established" }).cards[0];
@@ -221,6 +224,41 @@ test("focus filtering keeps only repositories carrying the selected direction", 
 
   const all = projectRadarDashboard(base, { period: "day", list: "rising", focus: "all" });
   assert.equal(all.cards.length, 3);
+});
+
+test("cards carry the learning facet and the view surfaces learning status and filter", () => {
+  const list = [
+    risingEntry(1, { learning: "active" }),
+    risingEntry(2, { learning: null }),
+    risingEntry(3, { learning: "queued" }),
+  ];
+  const base = payload({ lists: { rising: list, established: [], relevant: [] }, learningStatus: "unavailable" });
+
+  const active = projectRadarDashboard(base, { period: "day", list: "rising", learning: "active" });
+  assert.deepEqual(active.cards.map((card) => card.repositoryId), [1]);
+  assert.equal(active.cards[0].learningState, "active");
+  assert.equal(active.cards[0].hasLearning, true);
+
+  const queuedOnly = projectRadarDashboard(base, { period: "day", list: "rising", learning: "queued" });
+  assert.deepEqual(queuedOnly.cards.map((card) => card.repositoryId), [3]);
+
+  const all = projectRadarDashboard(base, { period: "day", list: "rising" });
+  assert.equal(all.cards.length, 3);
+  assert.equal(all.cards[1].learningState, null);
+  assert.equal(all.cards[1].hasLearning, false);
+  assert.equal(all.learningStatus, "unavailable");
+  assert.equal(all.learning, "all");
+
+  assert.throws(() => projectRadarDashboard(base, { period: "day", list: "rising", learning: "nope" }), RangeError);
+});
+
+test("the view keeps eligibleCount as the radar decision total separate from the learning filter", () => {
+  const base = payload({ lists: { rising: [risingEntry(1, { learning: "active" })], established: [], relevant: [] }, eligibleCount: 28 });
+  const view = projectRadarDashboard(base, { period: "day", list: "rising", learning: "active" });
+  assert.equal(view.eligibleCount, 28);
+  assert.equal(view.cards.length, 1);
+  assert.equal(view.learning, "active");
+  assert.equal(view.filters.learning, undefined);
 });
 
 test("focus filtering follows the server classifier for topic-inferred directions in every list", () => {

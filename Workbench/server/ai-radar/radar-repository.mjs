@@ -328,12 +328,13 @@ export function createRadarRepository({ directory, now = () => new Date(), timeZ
     return { aggregatedSnapshots, retainedSnapshots: retained.length };
   }
 
-  async function getDashboard({ period = "day", state: selectedState = "all", focus = "all", timeZone: selectedTimeZone, rank = rankRadar, learning = "all", learningState = null, learningStatus = "ok" } = {}) {
+  async function getDashboard({ period = "day", state: selectedState = "all", focus = "all", timeZone: selectedTimeZone, rank = rankRadar, learning = "all", learningState = null, learningStatus = "ok", learningWorkspaceIds = null } = {}) {
     checked(z.enum(["day", "week", "month"]), period);
     checked(z.union([z.literal("all"), radarDecisionStatusSchema]), selectedState);
     checked(z.enum(["all", "agent", "ai-coding", "rag-knowledge", "ai-productivity"]), focus);
     checked(z.enum(["all", "draft", "queued", "active", "archived"]), learning);
     if (learningState !== null && !(learningState instanceof Map)) throw new TypeError("learningState must be a Map or null");
+    if (learningWorkspaceIds !== null && !(learningWorkspaceIds instanceof Map)) throw new TypeError("learningWorkspaceIds must be a Map or null");
     checked(z.enum(["ok", "unavailable"]), learningStatus);
     const store = await getState();
     const zone = checked(radarTimeZoneSchema, selectedTimeZone ?? store.schedule.timeZone);
@@ -361,7 +362,8 @@ export function createRadarRepository({ directory, now = () => new Date(), timeZ
     const ids = new Set(repositories.map((item) => item.id));
     const ranked = rank({ repositories, snapshots: snapshots.filter((item) => ids.has(item.repositoryId)), period, preferences: store.preferences, now: new Date(asOf), timeZone: zone });
     const learningFor = (id) => learningStatus === "unavailable" ? null : (learningState?.get(id) ?? null);
-    const lists = Object.fromEntries(Object.entries(ranked).map(([key, entries]) => [key, entries.map((entry) => ({ ...entry, decision: decisionFor(entry.repositoryId), learning: learningFor(entry.repositoryId) }))]));
+    const learningIdFor = (id) => learningStatus === "unavailable" || !learningWorkspaceIds ? null : (learningWorkspaceIds.get(id) ?? null);
+    const lists = Object.fromEntries(Object.entries(ranked).map(([key, entries]) => [key, entries.map((entry) => ({ ...entry, decision: decisionFor(entry.repositoryId), learning: learningFor(entry.repositoryId), learningWorkspaceId: learningIdFor(entry.repositoryId) }))]));
     const orderedRuns = [...store.runs].sort((a, b) => b.sequence - a.sequence || b.startedAt.localeCompare(a.startedAt) || b.id.localeCompare(a.id));
     const projectRun = (run) => run ? { ...run, errors: run.errors.map((error) => safeRadarError(error)) } : null;
     const run = projectRun(orderedRuns[0]);

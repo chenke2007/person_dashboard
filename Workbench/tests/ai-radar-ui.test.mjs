@@ -21,6 +21,7 @@ const result = await build({
         createRadarDashboardLoader,
       } from "../src/pages/AiRadarPage.jsx";
       exports.renderView = (props) => renderToStaticMarkup(React.createElement(AiRadarView, props));
+      exports.AiRadarView = AiRadarView;
       exports.radarFilterFromSearch = radarFilterFromSearch;
       exports.radarFilterToSearch = radarFilterToSearch;
       exports.createRadarDashboardLoader = createRadarDashboardLoader;
@@ -241,7 +242,7 @@ function radarDashboard({ period = "day", marker }) {
 // Mounts AiRadarPage under a router. `fetchImpl` receives (path, options) and
 // must return a thenable resolving to a Response-like object. Returns helpers
 // plus `entries` recording every fetch(path, method).
-async function mountPage(t, fetchImpl) {
+async function mountPage(t, fetchImpl, initialEntries = ["/ai-radar?period=day"]) {
   const entries = [];
   const originalFetch = globalThis.fetch;
   globalThis.fetch = (path, options = {}) => {
@@ -252,7 +253,7 @@ async function mountPage(t, fetchImpl) {
   document.body.append(container);
   const root = createRoot(container);
   await act(() => {
-    root.render(React.createElement(MemoryRouter, { initialEntries: ["/ai-radar?period=day"] }, React.createElement(pageCompiled.exports.AiRadarPage)));
+    root.render(React.createElement(MemoryRouter, { initialEntries }, React.createElement(pageCompiled.exports.AiRadarPage)));
   });
   t.after(() => {
     act(() => root.unmount());
@@ -322,6 +323,9 @@ function card(overrides = {}) {
     reasons: ["明确关注方向：agent。"],
     decisionStatus: "unread",
     decisionUpdatedAt: null,
+    learningState: null,
+    hasLearning: false,
+    learningWorkspaceId: null,
     ...overrides,
   };
 }
@@ -355,6 +359,8 @@ function props(overrides = {}) {
     readOnly: false,
     busy: { collect: false, save: false, decision: null, lessLike: null, revert: null, reset: false },
     actionErrors: { collect: null, save: null, decision: {}, lessLike: {}, revert: {}, reset: null },
+    canJoinLearning: true,
+    learningStatus: "ok",
     actions: {
       onCollect: async () => {},
       onDecide: async () => {},
@@ -362,6 +368,8 @@ function props(overrides = {}) {
       onRevertPreference: async () => {},
       onResetPreferences: async () => {},
       onUpdateSchedule: async () => {},
+      onJoinLearning: async () => {},
+      onOpenLearning: async () => {},
       onRetry: async () => {},
     },
     ...overrides,
@@ -521,12 +529,103 @@ test("card actions stay visible and labelled without hover", () => {
   assert.doesNotMatch(html, /收集基线不足|请将鼠标|移入卡片/);
 });
 
+test("a card without a learning workspace offers 加入学习 and nothing else", () => {
+  const html = viewHtml({ view: view({ cards: [card()] }) });
+  assert.match(html, />加入学习</);
+  assert.doesNotMatch(html, />查看学习</);
+  assert.doesNotMatch(html, /radar-card__learning/);
+});
+
+test("a card with a learning workspace shows the lifecycle badge, 查看学习 and no 加入学习", () => {
+  const html = viewHtml({
+    view: view({ cards: [card({ learningState: "active", hasLearning: true, learningWorkspaceId: "11111111-2222-4333-8444-555555555555" })] }),
+  });
+  assert.match(html, />学习中</);
+  assert.match(html, />查看学习</);
+  assert.doesNotMatch(html, />加入学习</);
+
+  const draft = viewHtml({ view: view({ cards: [card({ learningState: "draft", hasLearning: true })] }) });
+  assert.match(draft, />学习（草稿）</);
+
+  const queued = viewHtml({ view: view({ cards: [card({ learningState: "queued", hasLearning: true })] }) });
+  assert.match(queued, />学习中（排队）</);
+});
+
+test("learning archive copy stays distinct from the repository archive flag", () => {
+  // The repository itself is archived on GitHub AND its learning workspace is
+  // archived: both facts render, with separate copy.
+  const html = viewHtml({
+    view: view({ cards: [card({ archived: true, learningState: "archived", hasLearning: true })] }),
+  });
+  assert.match(html, />已归档</);
+  assert.match(html, />学习已归档</);
+  // The learning archive must never read as a repository archive alone.
+  assert.ok(html.indexOf("学习已归档") > 0);
+});
+
+test("加入学习 is suppressed while learning capability is pending or unavailable", () => {
+  const pending = viewHtml({ canJoinLearning: false });
+  assert.doesNotMatch(pending, />加入学习</);
+
+  const unavailable = viewHtml({ learningStatus: "unavailable" });
+  assert.doesNotMatch(unavailable, />加入学习</);
+});
+
+test("查看学习 stays visible in read-only mode because it only navigates", () => {
+  const html = viewHtml({
+    readOnly: true,
+    view: view({ cards: [card({ learningState: "queued", hasLearning: true, learningWorkspaceId: "11111111-2222-4333-8444-555555555555" })] }),
+  });
+  assert.match(html, />查看学习</);
+  assert.doesNotMatch(html, />加入学习</);
+});
+
+// Mounted view harness: renders AiRadarView so clicks reach the action
+// handlers wired from the page.
+async function mountView(t, viewProps) {
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root = createRoot(container);
+  await act(() => {
+    root.render(React.createElement(compiled.exports.AiRadarView, props(viewProps)));
+  });
+  t.after(() => {
+    act(() => root.unmount());
+    container.remove();
+  });
+  return container;
+}
+
+test("card join and view-learning actions report the repository and workspace id", async (t) => {
+  const joined = [];
+  const opened = [];
+  const container = await mountView(t, {
+    view: view({
+      cards: [
+        card({ repositoryId: 21, learningState: null, hasLearning: false }),
+        card({ repositoryId: 22, learningState: "active", hasLearning: true, learningWorkspaceId: "22222222-2222-4333-8444-555555555555" }),
+      ],
+    }),
+    actions: {
+      ...props().actions,
+      onJoinLearning: (id) => joined.push(id),
+      onOpenLearning: (id) => opened.push(id),
+    },
+  });
+  const join = [...container.querySelectorAll("button")].find((b) => b.textContent.trim() === "加入学习");
+  const open = [...container.querySelectorAll("button")].find((b) => b.textContent.trim() === "查看学习");
+  await act(() => join.click());
+  await act(() => open.click());
+  assert.deepEqual(joined, [21]);
+  assert.deepEqual(opened, ["22222222-2222-4333-8444-555555555555"]);
+});
+
 test("radar filter search params round-trip with fallbacks and default omission", () => {
   const parsed = compiled.exports.radarFilterFromSearch(new URLSearchParams("period=week&list=relevant&state=saved&focus=agent"));
-  assert.deepEqual(parsed, { period: "week", list: "relevant", state: "saved", focus: "agent" });
+  assert.deepEqual(parsed, { period: "week", list: "relevant", state: "saved", focus: "agent", learning: "all" });
 
   const fallback = compiled.exports.radarFilterFromSearch(new URLSearchParams("period=decade&state=starred&focus=machine-learning"));
-  assert.deepEqual(fallback, { period: "day", list: "rising", state: "all", focus: "all" });
+  assert.deepEqual(fallback, { period: "day", list: "rising", state: "all", focus: "all", learning: "all" });
 
   const encoded = compiled.exports.radarFilterToSearch({ period: "day", list: "rising", state: "all", focus: "all" });
   assert.equal(encoded.toString(), "");
@@ -535,7 +634,41 @@ test("radar filter search params round-trip with fallbacks and default omission"
   assert.equal(nonDefault.toString(), "period=week&list=relevant&state=saved&focus=rag-knowledge");
 
   const roundTrip = compiled.exports.radarFilterFromSearch(nonDefault);
-  assert.deepEqual(roundTrip, { period: "week", list: "relevant", state: "saved", focus: "rag-knowledge" });
+  assert.deepEqual(roundTrip, { period: "week", list: "relevant", state: "saved", focus: "rag-knowledge", learning: "all" });
+});
+
+test("learning filter round-trips through the URL and falls back to all", () => {
+  const parsed = compiled.exports.radarFilterFromSearch(new URLSearchParams("period=week&learning=active"));
+  assert.deepEqual(parsed, { period: "week", list: "rising", state: "all", focus: "all", learning: "active" });
+
+  const fallback = compiled.exports.radarFilterFromSearch(new URLSearchParams("learning=completed"));
+  assert.equal(fallback.learning, "all");
+
+  const encoded = compiled.exports.radarFilterToSearch({ period: "day", list: "rising", state: "all", focus: "all", learning: "queued" });
+  assert.equal(encoded.toString(), "learning=queued");
+
+  const roundTrip = compiled.exports.radarFilterFromSearch(new URLSearchParams(encoded.toString()));
+  assert.equal(roundTrip.learning, "queued");
+});
+
+test("an unavailable learning status surfaces an explicit error with retry, never '尚未加入学习'", () => {
+  const html = viewHtml({ learningStatus: "unavailable", actions: { ...props().actions, onRetry: () => {} } });
+  assert.match(html, /学习状态当前不可用/);
+  assert.match(html, />重试</);
+  assert.doesNotMatch(html, /尚未加入学习/);
+});
+
+test("a learning-filtered board labels radar totals separately from learning matches", () => {
+  const html = viewHtml({
+    filter: { period: "day", list: "rising", state: "all", focus: "all", learning: "active" },
+    view: view({ cards: [card({ learningState: "active", hasLearning: true })], eligibleCount: 28 }),
+  });
+  // The radar total (eligibleCount) must be labeled as the radar decision set,
+  // while the visible count is the matched learning slice.
+  assert.match(html, /雷达总数/);
+  assert.match(html, /28/);
+  assert.match(html, /本榜单展示 1 条/);
+  assert.doesNotMatch(html, />28.*匹配结果</);
 });
 
 test("dashboard loader drops superseded slow responses and surfaces the latest", async () => {
@@ -576,6 +709,20 @@ test("radar navigation stays behind the local Workbench gate and labels the entr
   assert.match(shell, /to: "\/ai-radar",\s*label: "AI 雷达"/);
   assert.match(shell, /\.\.\.\(localWorkbench\s*\?\s*\[\{\s*to: "\/ai-radar"/);
   // The obsidian read-only profile curates a narrow nav that omits AI radar.
+  assert.match(shell, /\["\/", "\/graph", "\/wiki", "\/materials", "\/projects"\]\.includes/);
+});
+
+test("learning routes and navigation stay behind the local Workbench gate", async () => {
+  const [app, shell] = await Promise.all([
+    readFile(new URL("../src/App.jsx", import.meta.url), "utf8"),
+    readFile(new URL("../src/components/AppShell.jsx", import.meta.url), "utf8"),
+  ]);
+  // All learning surfaces are local-only: hosted builds never expose the
+  // routes, and the obsidian read-only profile's curated nav omits them too.
+  assert.match(app, /localWorkbench\s*\?\s*<Route path="\/learning"/);
+  assert.match(app, /localWorkbench\s*\?\s*<Route path="\/learning\/:workspaceId"/);
+  assert.match(shell, /to: "\/learning",\s*label: "学习任务"/);
+  assert.match(shell, /\.\.\.\(localWorkbench\s*\?\s*\[\{\s*to: "\/learning"/);
   assert.match(shell, /\["\/", "\/graph", "\/wiki", "\/materials", "\/projects"\]\.includes/);
 });
 test("schedule form reflects persisted values once they arrive after the initial render", async (t) => {
@@ -1122,6 +1269,119 @@ test("server radar capability (WORKBENCH_PROJECTS_READ_ONLY) disables page mutat
   assert.doesNotMatch(container.textContent, /减少类似推荐/);
   assert.doesNotMatch(container.textContent, />撤销</);
   assert.doesNotMatch(container.textContent, />重置全部</);
+});
+
+const learningCapsFull = { read: true, create: true, edit: true, preview: true, confirm: true, activate: true, archive: true };
+
+test("a pending or failed learning capability keeps 加入学习 disabled conservatively", async (t) => {
+  const dayDash = deferred();
+  const learningCaps = deferred();
+  const { container } = await mountPage(t, (path) => {
+    if (path === "/api/ai-radar/capabilities") return jsonResponse({ capabilities: { read: true, collect: true, schedule: true } });
+    if (path === "/api/ai-radar/status") return jsonResponse({ running: false, lastAttemptAt: null, lastSuccessAt: null, nextRunAt: null, error: null });
+    if (path === "/api/ai-radar/preferences") return jsonResponse([]);
+    if (path === "/api/learning/capabilities") return learningCaps.promise;
+    if (path === "/api/ai-radar?period=day") return dayDash.promise;
+    return jsonResponse({});
+  });
+  await act(async () => { dayDash.resolve(jsonResponse(radarDashboard({ period: "day", marker: "dayrepo" }))); });
+  await settle();
+
+  // Pending learning capability: the join action stays hidden (conservative).
+  assert.doesNotMatch(container.textContent, /加入学习/);
+
+  // The server confirms a writable workspace: the join button becomes visible.
+  await act(async () => { learningCaps.resolve(jsonResponse({ capabilities: learningCapsFull })); });
+  await settle();
+  assert.ok([...container.querySelectorAll("button")].some((b) => b.textContent.trim() === "加入学习"), "join must appear once the capability confirms writable");
+});
+
+test("a failed learning capability disables 加入学习 and surfaces the reason with retry", async (t) => {
+  const dayDash = deferred();
+  const learningCaps = deferred();
+  const { container } = await mountPage(t, (path) => {
+    if (path === "/api/ai-radar/capabilities") return jsonResponse({ capabilities: { read: true, collect: true, schedule: true } });
+    if (path === "/api/ai-radar/status") return jsonResponse({ running: false, lastAttemptAt: null, lastSuccessAt: null, nextRunAt: null, error: null });
+    if (path === "/api/ai-radar/preferences") return jsonResponse([]);
+    if (path === "/api/learning/capabilities") return learningCaps.promise;
+    if (path === "/api/ai-radar?period=day") return dayDash.promise;
+    return jsonResponse({});
+  });
+  await act(async () => { dayDash.resolve(jsonResponse(radarDashboard({ period: "day", marker: "dayrepo" }))); });
+  await settle();
+  await act(async () => { learningCaps.reject(new Error("learning caps down")); });
+  await settle();
+
+  assert.match(container.textContent, /dayrepo/);
+  assert.equal([...container.querySelectorAll("button")].some((b) => b.textContent.trim() === "加入学习"), false, "join must stay hidden on a learning capability failure");
+  assert.match(container.textContent, /无法确认学习权限/);
+  assert.ok([...container.querySelectorAll("button")].some((b) => b.textContent === "重试"), "the capability failure must offer a retry");
+});
+
+test("the radar page restores and re-queries the learning filter from the URL", async (t) => {
+  const activeDash = deferred();
+  const allDash = deferred();
+  const requested = [];
+  const { container } = await mountPage(t, (path) => {
+    requested.push(path);
+    if (path === "/api/ai-radar/capabilities") return jsonResponse({ capabilities: { read: true, collect: true, schedule: true } });
+    if (path === "/api/ai-radar/status") return jsonResponse({ running: false, lastAttemptAt: null, lastSuccessAt: null, nextRunAt: null, error: null });
+    if (path === "/api/ai-radar/preferences") return jsonResponse([]);
+    if (path === "/api/learning/capabilities") return jsonResponse({ capabilities: learningCapsFull });
+    if (path === "/api/ai-radar?period=day&learning=active") return activeDash.promise;
+    if (path === "/api/ai-radar?period=day") return allDash.promise;
+    return jsonResponse({});
+  }, ["/ai-radar?period=day&learning=active"]);
+  await act(async () => { activeDash.resolve(jsonResponse(radarDashboard({ period: "day", marker: "activerepo" }))); });
+  await settle();
+
+  // The URL filter is restored into the dashboard query.
+  assert.ok(requested.includes("/api/ai-radar?period=day&learning=active"), `learning filter must be passed through, got ${requested}`);
+  assert.match(container.textContent, /activerepo/);
+
+  // Changing the learning filter select re-queries with the new value.
+  const select = container.querySelector('select[name="learning"]');
+  await act(() => { select.value = "all"; select.dispatchEvent(new window.Event("change", { bubbles: true })); });
+  await act(async () => { allDash.resolve(jsonResponse(radarDashboard({ period: "day", marker: "allrepo" }))); });
+  await settle();
+  assert.ok(requested.filter((path) => path === "/api/ai-radar?period=day").length >= 1, "dropping the learning filter re-queries the plain dashboard");
+  assert.match(container.textContent, /allrepo/);
+  assert.doesNotMatch(container.textContent, /activerepo/);
+});
+
+test("joining learning from a card opens the draft dialog and a confirm closes it and refreshes", async (t) => {
+  const dayFetches = [];
+  let confirmed = false;
+  const { container } = await mountPage(t, (path, options) => {
+    if (path === "/api/ai-radar/capabilities") return jsonResponse({ capabilities: { read: true, collect: true, schedule: true } });
+    if (path === "/api/ai-radar/status") return jsonResponse({ running: false, lastAttemptAt: null, lastSuccessAt: null, nextRunAt: null, error: null });
+    if (path === "/api/ai-radar/preferences") return jsonResponse([]);
+    if (path === "/api/learning/capabilities") return jsonResponse({ capabilities: learningCapsFull });
+    if (path === "/api/ai-radar?period=day") { dayFetches.push(1); return jsonResponse(radarDashboard({ period: "day", marker: "dayrepo" })); }
+    if (path === "/api/learning/drafts") return jsonResponse({ workspace: { workspaceId: "11111111-2222-4333-8444-555555555555", repositoryId: 101, fullName: "synthetic-lab/dayrepo", sourceUrl: "https://github.com/synthetic-lab/dayrepo", sourceCommitSha: "b".repeat(40), mission: { goal: "understand-architecture", notes: "" }, state: "draft", draftRevision: 1, createdAt: "2026-09-02T01:00:00.000Z", updatedAt: "2026-09-02T01:00:00.000Z" } });
+    if (path === "/api/learning/11111111-2222-4333-8444-555555555555/preview") return jsonResponse({ token: "token.1", expiresAt: "2026-09-03T01:00:00.000Z", draftRevision: 1, sourceCommitSha: "b".repeat(40), mission: { goal: "understand-architecture", notes: "" }, repositoryId: 101, fullName: "synthetic-lab/dayrepo", sourceUrl: "https://github.com/synthetic-lab/dayrepo" });
+    if (path === "/api/learning/confirm") {
+      confirmed = true;
+      return jsonResponse({ confirmed: "active", workspace: { workspaceId: "11111111-2222-4333-8444-555555555555", repositoryId: 101, fullName: "synthetic-lab/dayrepo", sourceUrl: "https://github.com/synthetic-lab/dayrepo", sourceCommitSha: "b".repeat(40), mission: { goal: "understand-architecture", notes: "" }, state: "active", draftRevision: 1, createdAt: "2026-09-02T01:00:00.000Z", updatedAt: "2026-09-02T01:00:00.000Z" } });
+    }
+    return jsonResponse({});
+  });
+  await settle();
+
+  await act(() => [...container.querySelectorAll("button")].find((b) => b.textContent === "加入学习").click());
+  await settle();
+  assert.match(container.textContent, /加入学习/);
+  assert.ok(container.querySelector(".learning-dialog"), "the draft dialog must open from the card");
+
+  await act(() => [...container.querySelectorAll("button")].find((b) => b.textContent === "预览确认").click());
+  await settle();
+  await act(() => [...container.querySelectorAll("button")].find((b) => b.textContent === "确认加入学习").click());
+  await settle();
+  await settle();
+
+  assert.equal(confirmed, true, "the confirm endpoint must be reached");
+  assert.equal(container.querySelector(".learning-dialog"), null, "the dialog closes after a successful confirm");
+  assert.ok(dayFetches.length >= 2, "the board refreshes after the joining flow");
 });
 
 // ---------------------------------------------------------------------------

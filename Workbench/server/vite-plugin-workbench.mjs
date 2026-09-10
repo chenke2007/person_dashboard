@@ -1100,17 +1100,21 @@ export function workbenchApiPlugin({
         if (!context) return null;
         const learning = options?.learning || "all";
         let learningState = null;
+        let learningWorkspaceIds = null;
         let learningStatus = "ok";
         try {
           const listed = await learningService.list({ includeArchived: true });
           learningState = new Map(listed.workspaces.map((workspace) => [workspace.repositoryId, workspace.state]));
+          // The workspace id rides along so the UI can deep-link "查看学习" from
+          // a radar card straight into the workspace detail page.
+          learningWorkspaceIds = new Map(listed.workspaces.map((workspace) => [workspace.repositoryId, workspace.workspaceId]));
         } catch (error) {
           learningStatus = "unavailable";
           if (learning !== "all") {
             throw new RadarRoutesError("RADAR_LEARNING_UNAVAILABLE", "学习状态当前不可用。", 503);
           }
         }
-        return context.store.getDashboard({ ...options, learningState, learningStatus });
+        return context.store.getDashboard({ ...options, learningState, learningWorkspaceIds, learningStatus });
       },
       async setDecision(repositoryId, status) {
         return (await radarRouteStore({ create: true })).setDecision(repositoryId, status);

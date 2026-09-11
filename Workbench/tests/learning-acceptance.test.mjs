@@ -346,6 +346,32 @@ test("real service: card 加入学习 → draft → preview → confirm → deta
   assert.match(container.textContent, /学习任务工作区/);
 });
 
+test("real service: AiRadarPage passes real learning capabilities into the join dialog", async (t) => {
+  const fixture = await startFixture(t);
+  const { container } = await mountApp(t, { origin: fixture.origin });
+  await settle();
+  await settle();
+
+  await waitText(container, /synthetic\/repo-101/);
+  await clickButton(container, "长期热门");
+  // The join button renders only after the real capabilities object arrived.
+  await waitText(container, /加入学习/, "join must appear once real learn caps arrive");
+  await act(() => button(container, "加入学习").click());
+  await settle();
+
+  // Strict dialog gating means the editing phase is reachable ONLY if the page
+  // handed its real capabilities object to the dialog; a missing capabilities
+  // prop would strand it on creating (no mutation is whitelisted by default).
+  await waitText(container, /预览确认/, "the real page must pass capabilities into the dialog");
+  const after = await fixture.learning.list({ includeArchived: true });
+  const draft = after.workspaces.find((item) => item.repositoryId === 101);
+  assert.equal(draft?.state, "draft", "the create request must land through the real server");
+
+  // Closing the dialog never depends on capabilities.
+  await clickButton(container, "关闭");
+  assert.equal(container.querySelector(".learning-dialog"), null, "close must dismiss the dialog");
+});
+
 test("real service: the fourth workspace queues, stays queued at capacity and activates after a slot frees", async (t) => {
   const fixture = await startFixture(t, { activeCount: 3 });
   const pre = await fixture.learning.list({ includeArchived: true });

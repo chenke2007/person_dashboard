@@ -48,10 +48,10 @@ export function LearningDraftDialog({
   onOpenWorkspace,
 }) {
   const repositoryId = repository?.repositoryId;
-  // Each step is gated by its own server capability field; a missing or failed
-  // capability conservatively disables that step. `readOnly` stays a hard
-  // override (hosted/read-only workspace).
-  const can = (key) => !readOnly && (capabilities ? capabilities[key] === true : true);
+  // Each step is gated by its own server capability field; a missing, pending
+  // or failed capability conservatively disables that step — never the inverse.
+  // `readOnly` stays a hard override (hosted/read-only workspace).
+  const can = (key) => !readOnly && capabilities?.[key] === true;
   const [workspace, setWorkspace] = useState(() => (existingWorkspace ? projectLearningWorkspace(existingWorkspace) : null));
   const [goal, setGoal] = useState(existingWorkspace?.mission?.goal ?? DEFAULT_GOAL);
   const [notes, setNotes] = useState(existingWorkspace?.mission?.notes ?? "");
@@ -122,13 +122,18 @@ export function LearningDraftDialog({
   };
 
   useEffect(() => {
+    // Never start the create while capabilities are missing/pending/failed:
+    // `created` is only claimed right before the request actually fires, so
+    // capabilities arriving later re-run this effect and the same instance
+    // resumes the pending creation exactly once instead of stranding it.
+    if (!can("create")) return;
     if (created.current) return;
     created.current = true;
     void createDraftNow();
-    // createDraftNow closes over initial prop state; a remount starts a fresh
-    // dialog anyway, so a stable closure is the correct behavior.
+    // createDraftNow closes over the render's capabilities/readOnly; the
+    // effect re-runs when either changes, which is when this gate can flip.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [capabilities, readOnly]);
 
   const saveDraft = async () => {
     if (!workspace || !can("edit")) return;
@@ -384,7 +389,7 @@ export function LearningDraftDialog({
         </header>
         {phase === "creating" ? (
           <div className="learning-dialog__loading">
-            <p>正在创建工作区…</p>
+            <p>{can("create") ? "正在创建工作区…" : "正在等待学习权限…"}</p>
             {errorBlock}
           </div>
         ) : null}

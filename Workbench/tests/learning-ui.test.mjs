@@ -114,6 +114,12 @@ const repository = {
   license: "MIT",
 };
 
+// Writable server capability set. Declared before the top-level await imports
+// below: node:test may start already-registered cases while a top-level import
+// is still pending, so anything a case touches at runtime must already be a
+// bound const before the first test() call.
+const fullCaps = { read: true, create: true, edit: true, preview: true, confirm: true, activate: true, archive: true };
+
 // Mounts LearningDraftDialog with a controllable fetch. `handlers` maps a
 // path (without query) to a handler returning a Response-like object; every
 // call is recorded for ordering assertions.
@@ -137,6 +143,9 @@ async function mountDialog(t, { props = {}, handlers = {} } = {}) {
       onDraftSaved: () => {},
       onConfirmed: () => {},
       onOpenWorkspace: () => {},
+      // Default to a writable server capability set so existing tests keep
+      // exercising the permitted path; capability-focused tests override it.
+      capabilities: fullCaps,
       ...props,
     }));
   });
@@ -1160,6 +1169,143 @@ test("a failed capability request disables every mutation and keeps the retry", 
   assert.equal([...container.querySelectorAll("button")].some((b) => /归档/.test(b.textContent)), false);
 });
 
+test("capabilities missing keeps every mutation silent and closing available", async (t) => {
+  let createCalls = 0;
+  const closed = [];
+  const { container } = await mountDialog(t, {
+    props: { capabilities: null, readOnly: false, onClose: () => closed.push(1) },
+    handlers: {
+      "/api/learning/drafts": () => { createCalls += 1; return jsonResponse({ workspace: draftWorkspace() }); },
+    },
+  });
+  await settle();
+  // Missing (pending or refresh-failed) capabilities must never issue a
+  // mutation request, even when readOnly is false.
+  assert.equal(createCalls, 0, "no mutation request may fire while capabilities are missing");
+  assert.match(container.textContent, /正在等待学习权限/);
+  await act(() => container.querySelector(".learning-dialog__close").click());
+  assert.equal(closed.length, 1, "closing must stay available while mutations are disabled");
+});
+
+test("capabilities arriving after open resume the pending creation exactly once", async (t) => {
+  let createCalls = 0;
+  const baseProps = {
+    repository,
+    capabilities: null,
+    onClose: () => {},
+    onDraftSaved: () => {},
+    onConfirmed: () => {},
+    onOpenWorkspace: () => {},
+  };
+  const { container, root } = await mountDialog(t, {
+    props: baseProps,
+    handlers: {
+      "/api/learning/drafts": () => { createCalls += 1; return jsonResponse({ workspace: draftWorkspace() }); },
+    },
+  });
+  await settle();
+  assert.equal(createCalls, 0, "pending capabilities must not create the draft");
+  assert.match(container.textContent, /正在等待学习权限/);
+
+  // The SAME dialog instance receives capabilities: the creation must resume
+  // instead of being stranded in the creating phase forever.
+  await act(() => root.render(React.createElement(compiled.exports.LearningDraftDialog, {
+    ...baseProps,
+    capabilities: fullCaps,
+  })));
+  await settle();
+  assert.equal(createCalls, 1, "the draft must be created exactly once when capabilities arrive");
+  assert.ok(button(container, "预览确认"), "the dialog must reach the editing phase");
+
+  // A later identical re-render must not create a second draft.
+  await act(() => root.render(React.createElement(compiled.exports.LearningDraftDialog, {
+    ...baseProps,
+    capabilities: fullCaps,
+  })));
+  await settle();
+  assert.equal(createCalls, 1, "later re-renders must not create a second draft");
+});
+
+test("create allowed but confirm denied creates the draft and never confirms", async (t) => {
+  let confirmCalls = 0;
+  const restrictedCaps = { ...fullCaps, confirm: false };
+  const { container, calls } = await mountDialog(t, {
+    props: { capabilities: restrictedCaps },
+    handlers: {
+      "/api/learning/drafts": () => jsonResponse({ workspace: draftWorkspace() }),
+      "/api/learning/11111111-2222-4333-8444-555555555555/preview": () => jsonResponse(previewPage()),
+      "/api/learning/confirm": () => { confirmCalls += 1; return jsonResponse({ confirmed: "active", workspace: draftWorkspace({ state: "active" }) }); },
+    },
+  });
+  await settle();
+  assert.equal(calls.filter((call) => call.method === "POST" && call.path === "/api/learning/drafts").length, 1, "create:true must allow the draft");
+  await act(() => button(container, "预览确认").click());
+  await settle();
+  const confirm = button(container, "确认加入学习");
+  assert.ok(confirm, "the confirm button stays rendered for a disabled branch");
+  assert.equal(confirm.disabled, true, "confirm:false must disable confirmation");
+  await act(() => confirm.click());
+  await settle();
+  assert.equal(confirmCalls, 0, "a denied confirm branch must never call the server");
+});
+
+test("capabilities disappearing after creation disable mutations but keep closing", async (t) => {
+  const closed = [];
+  const baseProps = {
+    repository,
+    capabilities: fullCaps,
+    onClose: () => closed.push(1),
+    onDraftSaved: () => {},
+    onConfirmed: () => {},
+    onOpenWorkspace: () => {},
+  };
+  const { container, root } = await mountDialog(t, {
+    props: baseProps,
+    handlers: {
+      "/api/learning/drafts": () => jsonResponse({ workspace: draftWorkspace() }),
+    },
+  });
+  await settle();
+  assert.ok(button(container, "保存修改"), "writable capabilities allow editing");
+
+  // A failed capability refresh drops capabilities to null: every mutation
+  // branch must stop, but closing the dialog stays available.
+  await act(() => root.render(React.createElement(compiled.exports.LearningDraftDialog, {
+    ...baseProps,
+    capabilities: null,
+  })));
+  await settle();
+  assert.equal(button(container, "保存修改").disabled, true, "save must be disabled without capabilities");
+  assert.equal(button(container, "预览确认").disabled, true, "preview must be disabled without capabilities");
+  await act(() => button(container, "关闭").click());
+  assert.equal(closed.length, 1, "closing must stay available when capabilities are gone");
+});
+
+test("a failed capability request keeps reads working and a retry restores the mutations", async (t) => {
+  let capsOk = false;
+  const anchors = {
+    "/api/learning/capabilities": () => capsOk
+      ? jsonResponse({ capabilities: learningCaps })
+      : apiError("LEARNING_INTERNAL_ERROR", "学习服务暂时不可用。", 500),
+    "/api/learning": () => jsonResponse({
+      workspaces: [learningWorkspace({ workspaceId: uuid("1"), state: "draft", repositoryId: 201 })],
+    }),
+  };
+  const { container } = await mountLearningPage(t, { handlers: anchors });
+  await settle();
+
+  assert.match(container.textContent, /无法确认学习权限/);
+  assert.ok(button(container, "重试"), "a retry entry must be available after the failure");
+  assert.ok(!button(container, "编辑任务"), "mutations stay disabled");
+  assert.match(container.textContent, /synthetic\/repo-201/, "reads keep working");
+
+  capsOk = true;
+  await act(() => button(container, "重试").click());
+  await settle();
+  assert.ok(button(container, "编辑任务"), "the retry restores the writable capability");
+  assert.doesNotMatch(container.textContent, /无法确认学习权限/);
+});
+
 test("closing the dialog is never blocked by read-only", async (t) => {
   const closed = [];
   const { container } = await mountDialog(t, {
@@ -1347,7 +1493,7 @@ test("StrictMode remount must not strand the draft dialog in the creating phase"
   const root = createRoot(container);
   await act(() => {
     root.render(React.createElement(React.StrictMode, null,
-      React.createElement(compiled.exports.LearningDraftDialog, { repository, onClose: () => {}, onDraftSaved: () => {}, onConfirmed: () => {}, onOpenWorkspace: () => {} }),
+      React.createElement(compiled.exports.LearningDraftDialog, { repository, capabilities: fullCaps, onClose: () => {}, onDraftSaved: () => {}, onConfirmed: () => {}, onOpenWorkspace: () => {} }),
     ));
   });
   t.after(() => { act(() => root.unmount()); container.remove(); globalThis.fetch = originalFetch; });

@@ -262,7 +262,12 @@ export function AiRadarPage() {
   const loadLearningCaps = useCallback(() => {
     loadLearningCapabilities()
       .then((body) => { setLearningCaps(body?.capabilities ?? null); setLearningCapsError(null); })
-      .catch((error) => setLearningCapsError(error?.message ?? "无法读取学习权限信息"));
+      .catch((error) => {
+        // A failed refresh must never keep the previous writable capabilities:
+        // the join branch and the dialog gate on `learningCaps` directly.
+        setLearningCaps(null);
+        setLearningCapsError(error?.message ?? "无法读取学习权限信息");
+      });
   }, []);
   useEffect(() => { void loadLearningCaps(); }, [loadLearningCaps]);
   const learningCreate = learningCaps?.create === true;
@@ -510,6 +515,7 @@ export function AiRadarPage() {
       />
       {joinCard ? (
         <LearningDraftDialog
+          capabilities={learningCaps}
           onClose={() => setJoinCard(null)}
           onConfirmed={() => {
             setJoinCard(null);

@@ -129,7 +129,13 @@ export function LearningPage() {
   const loadCaps = useCallback(() => {
     loadLearningCapabilities()
       .then((body) => { setCaps(body?.capabilities ?? null); setCapsError(null); })
-      .catch((error) => setCapsError(failMessage(error, "无法读取学习权限信息")));
+      .catch((error) => {
+        // A failed refresh must never keep advertising the previous writable
+        // capabilities: stale caps would leave mutations enabled with no
+        // fresh server confirmation. Null them so every gate stays false.
+        setCaps(null);
+        setCapsError(failMessage(error, "无法读取学习权限信息"));
+      });
   }, []);
 
   const loadList = useCallback(async () => {

@@ -40,12 +40,18 @@ export function LearningDraftDialog({
   repository,
   workspace: existingWorkspace,
   readOnly = false,
+  capabilities = null,
+  onRefreshWorkspace = null,
   onClose,
   onDraftSaved,
   onConfirmed,
   onOpenWorkspace,
 }) {
   const repositoryId = repository?.repositoryId;
+  // Each step is gated by its own server capability field; a missing or failed
+  // capability conservatively disables that step. `readOnly` stays a hard
+  // override (hosted/read-only workspace).
+  const can = (key) => !readOnly && (capabilities ? capabilities[key] === true : true);
   const [workspace, setWorkspace] = useState(() => (existingWorkspace ? projectLearningWorkspace(existingWorkspace) : null));
   const [goal, setGoal] = useState(existingWorkspace?.mission?.goal ?? DEFAULT_GOAL);
   const [notes, setNotes] = useState(existingWorkspace?.mission?.notes ?? "");
@@ -58,6 +64,29 @@ export function LearningDraftDialog({
   const [notice, setNotice] = useState(null);
   const [outcome, setOutcome] = useState(null);
   const created = useRef(Boolean(existingWorkspace));
+  const disposedRef = useRef(false);
+  const dialogRef = useRef(null);
+  const previouslyFocused = useRef(null);
+  // StrictMode simulates an unmount/remount at mount time, so the disposed
+  // marker must be re-armed by the effect setup; only a REAL unmount leaves
+  // it true. Otherwise the async continuation of an in-flight operation
+  // would see "disposed" and abandon the dialog.
+  useEffect(() => {
+    disposedRef.current = false;
+    return () => { disposedRef.current = true; };
+  }, []);
+  // Move focus into the dialog for keyboard users and restore it to the
+  // trigger when the dialog closes or unmounts.
+  useEffect(() => {
+    previouslyFocused.current = document.activeElement;
+    dialogRef.current?.focus({ preventScroll: true });
+    return () => {
+      const previous = previouslyFocused.current;
+      if (previous && typeof previous.focus === "function" && document.contains(previous)) {
+        previous.focus({ preventScroll: true });
+      }
+    };
+  }, []);
 
   useEffect(() => {
     if (!preview) return;
@@ -69,12 +98,14 @@ export function LearningDraftDialog({
   const dirty = Boolean(workspace) && (goal !== workspace.goal || notes !== workspace.notes);
 
   const createDraftNow = async () => {
+    if (!can("create")) return;
     setBusy("create");
     setError(null);
     setFailedAction(null);
     setNotice(null);
     try {
       const result = await createLearningDraft(repositoryId, { goal, notes });
+      if (disposedRef.current) return;
       const next = projectLearningWorkspace(result.workspace);
       setWorkspace(next);
       setGoal(next.goal);
@@ -82,10 +113,11 @@ export function LearningDraftDialog({
       setPhase("editing");
       onDraftSaved?.(result.workspace);
     } catch (createError) {
+      if (disposedRef.current) return;
       setError(messageOf(createError, "创建工作区失败，请重试。"));
       setFailedAction("create");
     } finally {
-      setBusy(null);
+      if (!disposedRef.current) setBusy(null);
     }
   };
 
@@ -99,13 +131,14 @@ export function LearningDraftDialog({
   }, []);
 
   const saveDraft = async () => {
-    if (!workspace || readOnly) return;
+    if (!workspace || !can("edit")) return;
     setBusy("edit");
     setError(null);
     setFailedAction(null);
     setNotice(null);
     try {
       const result = await editLearningDraft(workspace.workspaceId, workspace.draftRevision, { goal, notes });
+      if (disposedRef.current) return;
       const next = projectLearningWorkspace(result.workspace);
       setWorkspace(next);
       setGoal(next.goal);
@@ -113,15 +146,30 @@ export function LearningDraftDialog({
       setNotice("任务已保存。");
       onDraftSaved?.(result.workspace);
     } catch (editError) {
+      if (disposedRef.current) return;
+      if (editError?.code === "REVISION_CONFLICT" && typeof onRefreshWorkspace === "function") {
+        try {
+          // Adopt the store's fresh revision so a retry is not doomed, while
+          // the user's typed goal/notes stay in state (never discarded).
+          const fresh = projectLearningWorkspace(await onRefreshWorkspace(workspace.workspaceId));
+          if (disposedRef.current || !fresh.workspaceId) return;
+          setWorkspace(fresh);
+          setError("任务已被其他操作更新，已载入最新任务版本。你的修改仍未丢失，请再次保存或预览。");
+          setFailedAction("edit");
+          return;
+        } catch (refreshError) {
+          // Fall through to the generic save error below.
+        }
+      }
       setError(messageOf(editError, "保存失败，请重试。"));
       setFailedAction("edit");
     } finally {
-      setBusy(null);
+      if (!disposedRef.current) setBusy(null);
     }
   };
 
   const openPreview = async () => {
-    if (!workspace || readOnly) return;
+    if (!workspace || !can("preview")) return;
     setBusy("preview");
     setError(null);
     setFailedAction(null);
@@ -129,7 +177,13 @@ export function LearningDraftDialog({
     try {
       let current = workspace;
       if (goal !== workspace.goal || notes !== workspace.notes) {
+        if (!can("edit")) {
+          setError("当前工作区不允许修改任务内容，无法生成新预览。");
+          setFailedAction("preview");
+          return;
+        }
         const saved = await editLearningDraft(workspace.workspaceId, workspace.draftRevision, { goal, notes });
+        if (disposedRef.current) return;
         current = projectLearningWorkspace(saved.workspace);
         setWorkspace(current);
         setGoal(current.goal);
@@ -137,35 +191,55 @@ export function LearningDraftDialog({
         onDraftSaved?.(saved.workspace);
       }
       const page = await previewLearningDraft(current.workspaceId);
+      if (disposedRef.current) return;
       setPreview(page);
       setPreviewStale(false);
       setPhase("previewing");
     } catch (previewError) {
+      if (disposedRef.current) return;
       setError(messageOf(previewError, "无法生成预览，请重试。"));
       setFailedAction("preview");
     } finally {
-      setBusy(null);
+      if (!disposedRef.current) setBusy(null);
     }
   };
 
   const confirmJoin = async () => {
-    if (!preview || previewStale || readOnly) return;
+    if (!preview || previewStale || !can("confirm")) return;
     setBusy("confirm");
     setError(null);
     setFailedAction(null);
     setNotice(null);
     try {
       const result = await confirmLearning(preview.token);
+      if (disposedRef.current) return;
       // `confirmed` is the original confirm outcome; `workspace.state` is the
       // current state and may differ after a later activate/archive.
       setOutcome({ confirmed: result.confirmed, workspace: result.workspace });
       setPhase("confirmed");
       onConfirmed?.(result.workspace, result.confirmed);
     } catch (confirmError) {
-      setError("确认结果未收到，请重试（重复确认不会创建重复记录）。如仍失败请重新预览。");
-      setFailedAction("confirm");
+      if (disposedRef.current) return;
+      // A server-declared dead token can never succeed by replaying it: the
+      // only recovery is a fresh preview. Anything else (lost response,
+      // network, timeout) is idempotent on the server, so the SAME token may
+      // be safely retried.
+      const code = confirmError?.code;
+      const deadToken = code === "CONFIRM_TOKEN_INVALID" || code === "CONFIRM_TOKEN_CONSUMED"
+        || code === "REVISION_CONFLICT" || code === "LEARNING_INVALID_TRANSITION";
+      if (deadToken) {
+        if (code === "CONFIRM_TOKEN_INVALID" || code === "CONFIRM_TOKEN_CONSUMED") {
+          setError("确认凭证已失效，请重新预览后确认（任务内容会保留）。");
+        } else {
+          setError("任务内容已变化，请重新预览后确认（你的修改会保留）。");
+        }
+        setFailedAction("confirm-stale");
+      } else {
+        setError("确认结果未收到，请重试（重复确认不会创建重复记录）。如仍失败请重新预览。");
+        setFailedAction("confirm");
+      }
     } finally {
-      setBusy(null);
+      if (!disposedRef.current) setBusy(null);
     }
   };
 
@@ -174,10 +248,12 @@ export function LearningDraftDialog({
     else if (failedAction === "edit") void saveDraft();
     else if (failedAction === "preview") void openPreview();
     else if (failedAction === "confirm") void confirmJoin();
+    else if (failedAction === "confirm-stale") void openPreview();
   };
 
   const close = () => {
-    if (busy || readOnly) return;
+    // Read-only never blocks closing: the user can always dismiss the dialog.
+    if (busy) return;
     onClose?.();
   };
 
@@ -185,7 +261,10 @@ export function LearningDraftDialog({
     <div className="learning-dialog__error" role="alert">
       <p>{error}</p>
       <button disabled={Boolean(busy)} onClick={retry} type="button">
-        {failedAction === "create" ? "重试" : failedAction === "confirm" ? "重试确认" : "重试"}
+        {failedAction === "create" ? "重试"
+          : failedAction === "confirm" ? "重试确认"
+            : failedAction === "confirm-stale" ? "重新预览"
+              : "重试"}
       </button>
       {failedAction === "confirm" ? (
         <button disabled={Boolean(busy)} onClick={() => { setError(null); setFailedAction(null); void openPreview(); }} type="button">
@@ -231,8 +310,8 @@ export function LearningDraftDialog({
       {errorBlock}
       <div className="learning-dialog__actions">
         <button disabled={Boolean(busy)} onClick={close} type="button">关闭</button>
-        <button disabled={Boolean(busy) || !workspace} onClick={saveDraft} type="button">{busy === "edit" ? "保存中…" : "保存修改"}</button>
-        <button className="learning-dialog__primary" disabled={Boolean(busy) || !workspace} onClick={openPreview} type="button">{busy === "preview" ? "预览中…" : "预览确认"}</button>
+        <button disabled={Boolean(busy) || !workspace || !can("edit")} onClick={saveDraft} type="button">{busy === "edit" ? "保存中…" : "保存修改"}</button>
+        <button className="learning-dialog__primary" disabled={Boolean(busy) || !workspace || !can("preview")} onClick={openPreview} type="button">{busy === "preview" ? "预览中…" : "预览确认"}</button>
       </div>
     </>
   );
@@ -261,7 +340,7 @@ export function LearningDraftDialog({
       {errorBlock}
       <div className="learning-dialog__actions">
         <button disabled={Boolean(busy)} onClick={() => setPhase("editing")} type="button">返回编辑</button>
-        <button className="learning-dialog__primary" disabled={Boolean(busy) || previewStale} onClick={confirmJoin} type="button">
+        <button className="learning-dialog__primary" disabled={Boolean(busy) || previewStale || !can("confirm")} onClick={confirmJoin} type="button">
           {busy === "confirm" ? "确认中…" : "确认加入学习"}
         </button>
       </div>
@@ -298,7 +377,7 @@ export function LearningDraftDialog({
 
   return (
     <div className="learning-dialog-wrapper" role="presentation">
-      <div aria-label="学习任务" aria-modal="true" className="learning-dialog" role="dialog">
+      <div aria-label="学习任务" aria-modal="true" className="learning-dialog" ref={dialogRef} role="dialog" tabIndex={-1}>
         <header className="learning-dialog__head">
           <h2>{existingWorkspace ? "编辑学习任务" : "加入学习"}</h2>
           <button aria-label="关闭" className="learning-dialog__close" disabled={Boolean(busy)} onClick={close} type="button">×</button>

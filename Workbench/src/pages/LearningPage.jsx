@@ -29,12 +29,13 @@ function failMessage(error, fallback) {
   return typeof message === "string" && message.trim() ? message.trim() : fallback;
 }
 
-function WorkspaceRow({ workspace, canMutate, busy, onActivate, onArchive, onEdit, onOpenDetail }) {
+function WorkspaceRow({ workspace, canEdit, canActivate, canArchive, busy, onActivate, onArchive, onEdit, onOpenDetail }) {
   const goalLabel = LEARNING_GOAL_LABELS[workspace.goal] ?? workspace.goal;
   const activateBusy = busy?.activate?.has(workspace.workspaceId);
   const archiveBusy = busy?.archive?.has(workspace.workspaceId);
   const activateError = workspace.state === "queued" ? busy?.activateError?.[workspace.workspaceId] ?? null : null;
   const archiveError = busy?.archiveError?.[workspace.workspaceId] ?? null;
+  const rowBusy = activateBusy || archiveBusy;
   return (
     <li className="learning-item">
       <div className="learning-item__main">
@@ -47,16 +48,16 @@ function WorkspaceRow({ workspace, canMutate, busy, onActivate, onArchive, onEdi
         <p className="learning-item__meta">目标：{goalLabel} · 固定 {workspace.sourceCommitSha?.slice(0, 12)}…</p>
       </div>
       <div className="learning-item__actions">
-        {canMutate && workspace.state === "draft" ? (
-          <button disabled={activateBusy || archiveBusy} onClick={() => onEdit(workspace)} type="button">编辑任务</button>
+        {canEdit && workspace.state === "draft" ? (
+          <button disabled={rowBusy} onClick={() => onEdit(workspace)} type="button">编辑任务</button>
         ) : null}
-        {canMutate && workspace.state === "queued" ? (
-          <button disabled={activateBusy || archiveBusy} onClick={() => onActivate(workspace)} type="button">
+        {canActivate && workspace.state === "queued" ? (
+          <button disabled={rowBusy} onClick={() => onActivate(workspace)} type="button">
             {activateBusy ? "激活中…" : "激活"}
           </button>
         ) : null}
-        {canMutate && workspace.state !== "archived" ? (
-          <button disabled={activateBusy || archiveBusy || workspace.state === "queued" && activateBusy} onClick={() => onArchive(workspace)} type="button">
+        {canArchive && workspace.state !== "archived" ? (
+          <button disabled={rowBusy} onClick={() => onArchive(workspace)} type="button">
             {archiveBusy ? "归档中…" : archiveLabel(workspace)}
           </button>
         ) : null}
@@ -90,9 +91,40 @@ export function LearningPage() {
   const [busy, setBusy] = useState({ activate: new Set(), archive: new Set(), activateError: {}, archiveError: {} });
   const [notice, setNotice] = useState(null);
   const [editingWorkspace, setEditingWorkspace] = useState(null);
-  const loadedDetailId = useRef(null);
+  // Request-ordering and lifecycle guards. A route switch can leave several
+  // GETs in flight for the same or different workspace ids; comparing ids is
+  // not enough (A→B→A, or a refresh of the same id). Every load captures a
+  // monotonic sequence number and applies only if it is still the latest, the
+  // component is alive, and the route still targets that workspace.
+  const detailSeqRef = useRef(0);
+  const listSeqRef = useRef(0);
+  const aliveRef = useRef(true);
+  const workspaceIdRef = useRef(workspaceId);
+  // `busyRef` is the synchronous source of truth for in-flight mutations: two
+  // clicks in the same tick read it before any re-render can disable the
+  // button, so the handler itself rejects duplicate submissions.
+  const busyRef = useRef(busy);
+  const updateBusy = useCallback((updater) => {
+    const next = updater(busyRef.current);
+    busyRef.current = next;
+    setBusy(next);
+  }, []);
 
-  const canMutate = caps?.create === true;
+  useEffect(() => {
+    workspaceIdRef.current = workspaceId;
+  }, [workspaceId]);
+  // StrictMode simulates an unmount/remount on mount; re-arm the alive marker
+  // in the setup so only a real unmount leaves it false.
+  useEffect(() => {
+    aliveRef.current = true;
+    return () => { aliveRef.current = false; };
+  }, []);
+
+  // Each mutation is gated by its own server capability field; capability
+  // failure (caps null or an error) keeps every mutation disabled.
+  const canEdit = caps?.edit === true;
+  const canActivate = caps?.activate === true;
+  const canArchive = caps?.archive === true;
 
   const loadCaps = useCallback(() => {
     loadLearningCapabilities()
@@ -101,14 +133,17 @@ export function LearningPage() {
   }, []);
 
   const loadList = useCallback(async () => {
+    const seq = ++listSeqRef.current;
     try {
       const body = await loadLearningWorkspaces({ includeArchived: true });
+      if (!aliveRef.current || listSeqRef.current !== seq) return;
       setList(projectLearningList(body));
       setRawList(Array.isArray(body?.workspaces) ? body.workspaces : []);
       setListError(null);
       setListStale(false);
       setLoading(false);
     } catch (error) {
+      if (!aliveRef.current || listSeqRef.current !== seq) return;
       // A refresh failure over displayed data keeps the last good list and only
       // marks it stale; a first load with no data is a fatal error.
       if (listRef.current) {
@@ -125,17 +160,16 @@ export function LearningPage() {
   useEffect(() => { listRef.current = list; }, [list]);
 
   const loadDetail = useCallback(async (id) => {
-    if (!id) return;
-    loadedDetailId.current = id;
+    if (!id || id !== workspaceIdRef.current) return;
+    const seq = ++detailSeqRef.current;
     try {
       const body = await loadLearningWorkspace(id);
-      if (loadedDetailId.current !== id) return; // superseded by a newer route
+      if (!aliveRef.current || detailSeqRef.current !== seq || workspaceIdRef.current !== id) return;
       setRawDetail(body?.workspace ?? null);
       setDetailFor(id);
       setDetailError(null);
     } catch (error) {
-      if (loadedDetailId.current !== id) return;
-      setDetailFor((current) => current);
+      if (!aliveRef.current || detailSeqRef.current !== seq || workspaceIdRef.current !== id) return;
       setDetailError(failMessage(error, "学习任务详情加载失败。"));
     }
   }, []);
@@ -152,11 +186,18 @@ export function LearningPage() {
   }, [loadList, loadDetail, workspaceId]);
 
   const onActivate = useCallback(async (workspace) => {
-    setBusy((b) => ({ ...b, activate: new Set([...(b.activate ?? []), workspace.workspaceId]) }));
-    setBusy((b) => ({ ...b, activateError: { ...b.activateError, [workspace.workspaceId]: null } }));
+    if (busyRef.current.activate?.has(workspace.workspaceId)) return;
+    updateBusy((b) => ({
+      ...b,
+      activate: new Set([...(b.activate ?? []), workspace.workspaceId]),
+      activateError: { ...b.activateError, [workspace.workspaceId]: null },
+    }));
     setNotice(null);
     try {
       const result = await activateLearning(workspace.workspaceId, workspace.draftRevision);
+      // If the user left this workspace while the request was pending, the
+      // completion must not paint notices or refresh the OTHER workspace's view.
+      if (!aliveRef.current || (workspaceIdRef.current && workspaceIdRef.current !== workspace.workspaceId)) return;
       if (result?.outcome === "ACTIVE_LIMIT_REACHED") {
         setNotice({ level: "error", message: "已达 3 个活跃学习项目上限；该任务仍在队列中，请先归档一个学习项目后再激活。" });
       } else if (result?.outcome === "already-active") {
@@ -168,24 +209,47 @@ export function LearningPage() {
       // as an action failure — old data stays visible and marked stale.
       await refreshAfterMutation();
     } catch (error) {
-      setBusy((b) => ({ ...b, activateError: { ...b.activateError, [workspace.workspaceId]: failMessage(error, "激活失败，请重试。") } }));
+      if (error?.code === "REVISION_CONFLICT" && aliveRef.current) {
+        // The stored revision is stale; a bare retry would replay the same dead
+        // revision forever. Refresh first so the retry targets the latest one.
+        if (workspaceIdRef.current === workspace.workspaceId) void loadDetail(workspace.workspaceId);
+        else void loadList();
+      }
+      updateBusy((b) => ({
+        ...b,
+        activateError: { ...b.activateError, [workspace.workspaceId]: failMessage(error, "激活失败，请重试。") },
+      }));
     } finally {
-      setBusy((b) => ({ ...b, activate: new Set([...(b.activate ?? [])].filter((id) => id !== workspace.workspaceId)) }));
+      updateBusy((b) => ({
+        ...b,
+        activate: new Set([...(b.activate ?? [])].filter((id) => id !== workspace.workspaceId)),
+      }));
     }
-  }, [refreshAfterMutation]);
+  }, [refreshAfterMutation, loadDetail, loadList]);
 
-  const onArchive = useCallback(async (workspace) => {
-    setBusy((b) => ({ ...b, archive: new Set([...(b.archive ?? []), workspace.workspaceId]) }));
-    setBusy((b) => ({ ...b, archiveError: { ...b.archiveError, [workspace.workspaceId]: null } }));
+const onArchive = useCallback(async (workspace) => {
+    if (busyRef.current.archive?.has(workspace.workspaceId)) return;
+    updateBusy((b) => ({
+      ...b,
+      archive: new Set([...(b.archive ?? []), workspace.workspaceId]),
+      archiveError: { ...b.archiveError, [workspace.workspaceId]: null },
+    }));
     setNotice(null);
     try {
       await archiveLearning(workspace.workspaceId);
+      if (!aliveRef.current || (workspaceIdRef.current && workspaceIdRef.current !== workspace.workspaceId)) return;
       setNotice({ level: "success", message: "学习任务已归档，来源与任务内容仍然保留。" });
       await refreshAfterMutation();
     } catch (error) {
-      setBusy((b) => ({ ...b, archiveError: { ...b.archiveError, [workspace.workspaceId]: failMessage(error, "归档失败，请重试。") } }));
+      updateBusy((b) => ({
+        ...b,
+        archiveError: { ...b.archiveError, [workspace.workspaceId]: failMessage(error, "归档失败，请重试。") },
+      }));
     } finally {
-      setBusy((b) => ({ ...b, archive: new Set([...(b.archive ?? [])].filter((id) => id !== workspace.workspaceId)) }));
+      updateBusy((b) => ({
+        ...b,
+        archive: new Set([...(b.archive ?? [])].filter((id) => id !== workspace.workspaceId)),
+      }));
     }
   }, [refreshAfterMutation]);
 
@@ -204,6 +268,9 @@ export function LearningPage() {
   const detailMatches = isDetail && detailFor === workspaceId;
   const projectedDetail = detailMatches && rawDetail ? projectLearningWorkspace(rawDetail) : null;
   const staleDetail = isDetail && Boolean(detailError) && detailMatches;
+  const detailBusy = projectedDetail
+    ? busy.activate?.has(projectedDetail.workspaceId) || busy.archive?.has(projectedDetail.workspaceId)
+    : false;
 
   if (isDetail) {
     return (
@@ -263,18 +330,30 @@ export function LearningPage() {
             </dl>
             <div className="learning-detail__actions">
               <button onClick={() => navigate("/learning")} type="button">返回列表</button>
-              {canMutate && projectedDetail.state === "draft" ? (
+              {canEdit && projectedDetail.state === "draft" ? (
                 <button className="learning-detail__primary" onClick={() => setEditingWorkspace(projectedDetail)} type="button">编辑任务</button>
               ) : null}
-              {canMutate && projectedDetail.state === "queued" ? (
-                <button className="learning-detail__primary" disabled={busy.activate?.has(projectedDetail.workspaceId)} onClick={() => onActivate(projectedDetail)} type="button">
+              {canActivate && projectedDetail.state === "queued" ? (
+                <button className="learning-detail__primary" disabled={detailBusy} onClick={() => onActivate(projectedDetail)} type="button">
                   {busy.activate?.has(projectedDetail.workspaceId) ? "激活中…" : "激活"}
                 </button>
               ) : null}
-              {canMutate && projectedDetail.state !== "archived" ? (
-                <button onClick={() => onArchive(projectedDetail)} type="button">{archiveLabel(projectedDetail)}</button>
+              {canArchive && projectedDetail.state !== "archived" ? (
+                <button disabled={detailBusy} onClick={() => onArchive(projectedDetail)} type="button">{archiveLabel(projectedDetail)}</button>
               ) : null}
             </div>
+            {busy.activateError?.[projectedDetail.workspaceId] ? (
+              <div className="learning-notice learning-notice--error" role="alert">
+                <p>激活失败：{busy.activateError[projectedDetail.workspaceId]}</p>
+                <button disabled={detailBusy} onClick={() => onActivate(projectedDetail)} type="button">重试激活</button>
+              </div>
+            ) : null}
+            {busy.archiveError?.[projectedDetail.workspaceId] ? (
+              <div className="learning-notice learning-notice--error" role="alert">
+                <p>归档失败：{busy.archiveError[projectedDetail.workspaceId]}</p>
+                <button disabled={detailBusy} onClick={() => onArchive(projectedDetail)} type="button">重试归档</button>
+              </div>
+            ) : null}
           </>
         ) : null}
         {editingWorkspace && editingRepository ? (
@@ -287,7 +366,9 @@ export function LearningPage() {
             }}
             onDraftSaved={() => void refreshAfterMutation()}
             onOpenWorkspace={(id) => navigate(`/learning/${id}`)}
-            readOnly={!canMutate}
+            capabilities={caps}
+            onRefreshWorkspace={(id) => loadLearningWorkspace(id).then((body) => body?.workspace)}
+            readOnly={!canEdit}
             repository={editingRepository}
             workspace={rawDetail ?? editingWorkspace}
           />
@@ -342,7 +423,9 @@ export function LearningPage() {
                   {items.map((workspace) => (
                     <WorkspaceRow
                       busy={busy}
-                      canMutate={canMutate}
+                      canActivate={canActivate}
+                      canArchive={canArchive}
+                      canEdit={canEdit}
                       key={workspace.workspaceId}
                       onActivate={onActivate}
                       onArchive={onArchive}
@@ -373,7 +456,9 @@ export function LearningPage() {
           }}
           onDraftSaved={() => void loadList()}
           onOpenWorkspace={(id) => navigate(`/learning/${id}`)}
-          readOnly={!canMutate}
+          capabilities={caps}
+          onRefreshWorkspace={(id) => loadLearningWorkspace(id).then((body) => body?.workspace)}
+          readOnly={!canEdit}
           repository={editingRepository}
           workspace={rawList.find((current) => current.workspaceId === editingWorkspace.workspaceId) ?? editingWorkspace}
         />

@@ -269,7 +269,7 @@ test("confirm disables the button while pending, then reports the outcome once",
   const pending = [...container.querySelectorAll("button")].find((b) => b.textContent.trim() === "确认中…");
   assert.ok(pending, "confirm button should show 确认中… while pending");
   assert.equal(pending.disabled, true);
-  gate.resolve();
+  await act(async () => { gate.resolve(); await gate.promise.catch(() => {}); });
   await settle();
 
   assert.equal(calls.filter((call) => call.path === "/api/learning/confirm").length, 1);
@@ -382,7 +382,7 @@ pageCompiled.paths = Module._nodeModulePaths(fileURLToPath(new URL(".", import.m
 pageCompiled.require = createRequire(import.meta.url);
 pageCompiled._compile(pageBuild.outputFiles[0].text, pageFilename);
 
-const { createMemoryRouter, RouterProvider, MemoryRouter, Route, Routes } = await import("react-router-dom");
+const { createMemoryRouter, RouterProvider, MemoryRouter, Route, Routes, useLocation } = await import("react-router-dom");
 
 function learningWorkspace(overrides = {}) {
   const id = overrides.workspaceId ?? uuid("7");
@@ -616,4 +616,767 @@ test("navigating to another workspace never shows the previous workspace's data"
   await settle();
   assert.ok(container.textContent.includes("synthetic/repo-205"));
   assert.doesNotMatch(container.textContent, /repo-204/);
+});
+
+// Step 16 regressions: detail-page operation errors, shared mutex, request
+// ordering, capability fields, confirm recovery and unmount safety. Each test
+// targets a real defect found while hardening the S3 UI ----------------------
+
+test("detail activation failure is visible with retry and the queued entry stays", async (t) => {
+  let state = "queued";
+  const activateCalls = [];
+  const anchors = {
+    "/api/learning/capabilities": () => jsonResponse({ capabilities: learningCaps }),
+    "/api/learning": () => jsonResponse({ workspaces: [] }),
+    "/api/learning/88888888-2222-4333-8444-555555555555": () => jsonResponse({
+      workspace: learningWorkspace({ workspaceId: uuid("8"), state, repositoryId: 208, draftRevision: 4 }),
+    }),
+    "/api/learning/88888888-2222-4333-8444-555555555555/activate": ({ options }) => {
+      activateCalls.push(JSON.parse(options.body));
+      if (!state || state === "queued" && activateCalls.length === 1) {
+        // First attempt fails at the server; the workspace stays queued.
+        return apiError("LEARNING_INTERNAL_ERROR", "学习服务暂时不可用，请稍后重试。", 500);
+      }
+      state = "active";
+      return jsonResponse({ workspace: learningWorkspace({ workspaceId: uuid("8"), state: "active", repositoryId: 208 }), outcome: "active" });
+    },
+  };
+  const { container } = await mountLearningPage(t, { initialEntries: ["/learning/88888888-2222-4333-8444-555555555555"], handlers: anchors });
+  await settle();
+  assert.ok(button(container, "激活"));
+
+  await act(() => button(container, "激活").click());
+  await settle();
+
+  // The failure is visible on the detail page and the workspace stays queued
+  // with its original data and a retry entry.
+  assert.match(container.textContent, /学习服务暂时不可用/);
+  assert.match(container.textContent, /排队/);
+  assert.ok(button(container, "重试激活"), "a retry entry must appear after a failed activation");
+  assert.ok(button(container, "归档"), "the queued entry keeps its other actions");
+
+  await act(() => button(container, "重试激活").click());
+  await settle();
+
+  // The retry succeeded: the old error is gone, the notice reflects success
+  // and the detail shows the active state.
+  assert.equal(activateCalls.length, 2);
+  assert.doesNotMatch(container.textContent, /学习服务暂时不可用|激活失败/);
+  assert.match(container.textContent, /已激活/);
+  assert.match(container.textContent, /学习中/);
+});
+
+test("detail archive failure is visible and the original content stays", async (t) => {
+  let state = "active";
+  const archiveCalls = [];
+  const anchors = {
+    "/api/learning/capabilities": () => jsonResponse({ capabilities: learningCaps }),
+    "/api/learning": () => jsonResponse({ workspaces: [] }),
+    "/api/learning/33333333-2222-4333-8444-555555555555": () => jsonResponse({
+      workspace: learningWorkspace({ workspaceId: uuid("3"), state, repositoryId: 203, mission: { goal: "analyze-design", notes: "Original notes that must survive a failed archive." } }),
+    }),
+    "/api/learning/33333333-2222-4333-8444-555555555555/archive": () => {
+      archiveCalls.push(1);
+      if (archiveCalls.length === 1) return apiError("LEARNING_STORAGE_CORRUPT", "学习存储异常，归档未执行。", 500);
+      state = "archived";
+      return jsonResponse({ workspace: learningWorkspace({ workspaceId: uuid("3"), state: "archived", repositoryId: 203, mission: { goal: "analyze-design", notes: "Original notes that must survive a failed archive." } }) });
+    },
+  };
+  const { container } = await mountLearningPage(t, { initialEntries: ["/learning/33333333-2222-4333-8444-555555555555"], handlers: anchors });
+  await settle();
+  assert.ok(button(container, "归档学习"));
+
+  await act(() => button(container, "归档学习").click());
+  await settle();
+
+  // Failure visible; the original workspace content and state are retained.
+  assert.match(container.textContent, /学习存储异常/);
+  assert.ok(container.textContent.includes("Original notes that must survive a failed archive."));
+  assert.ok(container.textContent.includes(commitSha("c")));
+  assert.match(container.textContent, /学习中/);
+  assert.ok(button(container, "重试归档"), "a retry entry must appear after a failed archive");
+
+  await act(() => button(container, "重试归档").click());
+  await settle();
+  assert.equal(archiveCalls.length, 2);
+  assert.match(container.textContent, /学习已归档/);
+  assert.doesNotMatch(container.textContent, /学习存储异常/);
+});
+
+test("rapid repeated clicks on activate never produce duplicate requests", async (t) => {
+  const gate = deferred();
+  const calls = [];
+  const anchors = {
+    "/api/learning/capabilities": () => jsonResponse({ capabilities: learningCaps }),
+    "/api/learning": () => jsonResponse({ workspaces: [] }),
+    "/api/learning/88888888-2222-4333-8444-555555555555": () => jsonResponse({
+      workspace: learningWorkspace({ workspaceId: uuid("8"), state: "queued", repositoryId: 208, draftRevision: 4 }),
+    }),
+    "/api/learning/88888888-2222-4333-8444-555555555555/activate": () => {
+      calls.push(1);
+      return gate.promise.then(() => jsonResponse({ workspace: learningWorkspace({ workspaceId: uuid("8"), state: "active", repositoryId: 208 }), outcome: "active" }));
+    },
+  };
+  const { container } = await mountLearningPage(t, { initialEntries: ["/learning/88888888-2222-4333-8444-555555555555"], handlers: anchors });
+  await settle();
+
+  // Two clicks land in the same act, before any re-render can disable the
+  // button: the handler itself must reject the duplicate submission.
+  await act(() => {
+    button(container, "激活").click();
+    button(container, "激活").click();
+  });
+  assert.equal(calls.length, 1, "the second click must not fire a second request");
+  await act(async () => { gate.resolve(); await gate.promise.catch(() => {}); });
+  await settle();
+  assert.equal(calls.length, 1);
+  assert.match(container.textContent, /已激活/);
+});
+
+test("activation and archiving share the mutex on the detail page", async (t) => {
+  const gate = deferred();
+  const anchors = {
+    "/api/learning/capabilities": () => jsonResponse({ capabilities: learningCaps }),
+    "/api/learning": () => jsonResponse({ workspaces: [] }),
+    "/api/learning/88888888-2222-4333-8444-555555555555": () => jsonResponse({
+      workspace: learningWorkspace({ workspaceId: uuid("8"), state: "queued", repositoryId: 208, draftRevision: 4 }),
+    }),
+    "/api/learning/88888888-2222-4333-8444-555555555555/activate": () => gate.promise.then(() => jsonResponse({ workspace: learningWorkspace({ workspaceId: uuid("8"), state: "active", repositoryId: 208 }), outcome: "active" })),
+    "/api/learning/88888888-2222-4333-8444-555555555555/archive": () => jsonResponse({ workspace: learningWorkspace({ workspaceId: uuid("8"), state: "archived", repositoryId: 208 }) }),
+  };
+  const { container } = await mountLearningPage(t, { initialEntries: ["/learning/88888888-2222-4333-8444-555555555555"], handlers: anchors });
+  await settle();
+
+  // While activation is pending the archive action is disabled (conflict).
+  await act(() => button(container, "激活").click());
+  assert.ok([...container.querySelectorAll("button")].find((b) => b.textContent.trim() === "激活中…"));
+  assert.equal(button(container, "归档（退出队列）").disabled, true, "archive must be disabled while activation is pending");
+  await act(async () => { gate.resolve(); await gate.promise.catch(() => {}); });
+  await settle();
+  assert.equal(button(container, "归档（退出队列）").disabled, false);
+
+  // And the reverse: while archiving is pending activation is disabled.
+  const gate2 = deferred();
+  const anchors2 = {
+    ...anchors,
+    "/api/learning/88888888-2222-4333-8444-555555555555/archive": () => gate2.promise.then(() => jsonResponse({ workspace: learningWorkspace({ workspaceId: uuid("8"), state: "archived", repositoryId: 208 }) })),
+  };
+  const { container: container2 } = await mountLearningPage(t, { initialEntries: ["/learning/88888888-2222-4333-8444-555555555555"], handlers: anchors2 });
+  await settle();
+  await act(() => button(container2, "归档（退出队列）").click());
+  assert.equal(button(container2, "激活").disabled, true, "activate must be disabled while archiving is pending");
+  await act(async () => { gate2.resolve(); await gate2.promise.catch(() => {}); });
+  await settle();
+});
+
+test("detail mutation success followed by a refresh failure stays distinguishable from the action failing", async (t) => {
+  let detailCalls = 0;
+  let refreshFail = false;
+  let state = "queued";
+  const anchors = {
+    "/api/learning/capabilities": () => jsonResponse({ capabilities: learningCaps }),
+    "/api/learning": () => {
+      if (refreshFail) return Promise.reject(new TypeError("network down"));
+      return jsonResponse({ workspaces: [] });
+    },
+    "/api/learning/88888888-2222-4333-8444-555555555555": () => {
+      detailCalls += 1;
+      if (refreshFail && detailCalls > 1) return Promise.reject(new TypeError("network down"));
+      return jsonResponse({ workspace: learningWorkspace({ workspaceId: uuid("8"), state, repositoryId: 208, draftRevision: 4 }) });
+    },
+    "/api/learning/88888888-2222-4333-8444-555555555555/activate": () => {
+      state = "active";
+      return jsonResponse({ workspace: learningWorkspace({ workspaceId: uuid("8"), state: "active", repositoryId: 208 }), outcome: "active" });
+    },
+  };
+  const { container } = await mountLearningPage(t, { initialEntries: ["/learning/88888888-2222-4333-8444-555555555555"], handlers: anchors });
+  await settle();
+
+  refreshFail = true;
+  await act(() => button(container, "激活").click());
+  await settle();
+
+  // The action succeeded; the failed refresh is surfaced separately: success
+  // notice plus a stale/refresh marker, never "激活失败".
+  assert.match(container.textContent, /已激活/);
+  assert.match(container.textContent, /刷新失败|上次成功数据/);
+  assert.doesNotMatch(container.textContent, /激活失败/);
+});
+// Part 2: request ordering and lifecycle invalidation --------------------------
+
+function RemountingLearningPage() {
+  const location = useLocation();
+  // The real app renders <Routes key={pathname:revision}>, so every pathname
+  // change unmounts and remounts the page. Emulate that per-path remount so a
+  // route switch really creates a fresh component instance.
+  return React.createElement(pageCompiled.exports.LearningPage, { key: `${location.pathname}` });
+}
+
+test("same detail: an older GET arriving last never overwrites the refreshed state", async (t) => {
+  let detailCalls = 0;
+  const firstGet = deferred();
+  const secondGet = deferred();
+  const anchors = {
+    "/api/learning/capabilities": () => jsonResponse({ capabilities: learningCaps }),
+    "/api/learning": () => jsonResponse({ workspaces: [] }),
+    "/api/learning/88888888-2222-4333-8444-555555555555": () => {
+      detailCalls += 1;
+      if (detailCalls === 1) {
+        return firstGet.promise.then(() => jsonResponse({
+          workspace: learningWorkspace({ workspaceId: uuid("8"), state: "queued", repositoryId: 208, mission: { goal: "learn-usage", notes: "old payload" } }),
+        }));
+      }
+      return secondGet.promise.then(() => jsonResponse({
+        workspace: learningWorkspace({ workspaceId: uuid("8"), state: "active", repositoryId: 208, mission: { goal: "learn-usage", notes: "fresh payload" } }),
+      }));
+    },
+  };
+  const { container, router } = await mountLearningPage(t, { initialEntries: ["/learning/88888888-2222-4333-8444-555555555555"], handlers: anchors });
+  await settle();
+  // The first GET is still in flight: no content yet.
+  assert.match(container.textContent, /正在读取/);
+
+  // A second GET for the SAME id (leave the detail, come back) resolves first.
+  await act(() => router.navigate("/learning"));
+  await settle();
+  await act(() => router.navigate("/learning/88888888-2222-4333-8444-555555555555"));
+  await settle();
+  await act(async () => { secondGet.resolve(); await secondGet.promise.catch(() => {}); });
+  await settle();
+  assert.match(container.textContent, /fresh payload/);
+  assert.match(container.textContent, /学习中/);
+
+  // The OLD response arrives last: it must not overwrite the fresh state.
+  await act(async () => { firstGet.resolve(); await firstGet.promise.catch(() => {}); });
+  await settle();
+  assert.match(container.textContent, /fresh payload/);
+  assert.match(container.textContent, /学习中/);
+  assert.doesNotMatch(container.textContent, /old payload|排队/);
+});
+
+test("navigating A to B and back to A keeps the second A request authoritative over a late first-A response", async (t) => {
+  let aCalls = 0;
+  const firstAGet = deferred();
+  const secondAGet = deferred();
+  const anchors = {
+    "/api/learning/capabilities": () => jsonResponse({ capabilities: learningCaps }),
+    "/api/learning": () => jsonResponse({ workspaces: [] }),
+    "/api/learning/88888888-2222-4333-8444-555555555555": () => {
+      aCalls += 1;
+      if (aCalls === 1) {
+        return firstAGet.promise.then(() => jsonResponse({
+          workspace: learningWorkspace({ workspaceId: uuid("8"), state: "queued", repositoryId: 208, mission: { goal: "learn-usage", notes: "first A payload" } }),
+        }));
+      }
+      return secondAGet.promise.then(() => jsonResponse({
+        workspace: learningWorkspace({ workspaceId: uuid("8"), state: "active", repositoryId: 208, mission: { goal: "learn-usage", notes: "second A payload" } }),
+      }));
+    },
+    "/api/learning/55555555-2222-4333-8444-555555555555": () => jsonResponse({
+      workspace: learningWorkspace({ workspaceId: uuid("5"), state: "draft", repositoryId: 205, mission: { goal: "analyze-design", notes: "workspace B notes" } }),
+    }),
+  };
+  const { container, router } = await mountLearningPage(t, { initialEntries: ["/learning/88888888-2222-4333-8444-555555555555"], handlers: anchors });
+  await settle();
+  assert.match(container.textContent, /正在读取/);
+
+  await act(() => router.navigate("/learning/55555555-2222-4333-8444-555555555555"));
+  await settle();
+  assert.match(container.textContent, /workspace B notes/);
+
+  await act(() => router.navigate("/learning/88888888-2222-4333-8444-555555555555"));
+  await settle();
+  await act(async () => { secondAGet.resolve(); await secondAGet.promise.catch(() => {}); });
+  await settle();
+  assert.match(container.textContent, /second A payload/);
+
+  // The FIRST A request finishes last: it must not regress the second A state.
+  await act(async () => { firstAGet.resolve(); await firstAGet.promise.catch(() => {}); });
+  await settle();
+  assert.match(container.textContent, /second A payload/);
+  assert.match(container.textContent, /学习中/);
+  assert.doesNotMatch(container.textContent, /first A payload|排队/);
+});
+
+test("two list refreshes arriving out of order keep the latest result", async (t) => {
+  let listCalls = 0;
+  let listState = "queued";
+  const firstList = deferred();
+  const anchors = {
+    "/api/learning/capabilities": () => jsonResponse({ capabilities: learningCaps }),
+    "/api/learning": () => {
+      listCalls += 1;
+      if (listCalls === 1) {
+        return firstList.promise.then(() => jsonResponse({ workspaces: [learningWorkspace({ workspaceId: uuid("8"), state: "queued", repositoryId: 208 })] }));
+      }
+      return jsonResponse({ workspaces: [learningWorkspace({ workspaceId: uuid("8"), state: "archived", repositoryId: 208 })] });
+    },
+    "/api/learning/88888888-2222-4333-8444-555555555555": () => jsonResponse({
+      workspace: learningWorkspace({ workspaceId: uuid("8"), state: listState, repositoryId: 208 }),
+    }),
+    "/api/learning/88888888-2222-4333-8444-555555555555/archive": () => {
+      listState = "archived";
+      return jsonResponse({ workspace: learningWorkspace({ workspaceId: uuid("8"), state: "archived", repositoryId: 208 }) });
+    },
+  };
+  const { container, router } = await mountLearningPage(t, { initialEntries: ["/learning"], handlers: anchors });
+  await settle();
+
+  // The first list load is still in flight; archive on the detail page
+  // triggers a second, fresh list load.
+  await act(() => router.navigate("/learning/88888888-2222-4333-8444-555555555555"));
+  await settle();
+  await act(() => button(container, "归档（退出队列）").click());
+  await settle();
+  await act(() => router.navigate("/learning"));
+  await settle();
+  assert.match(container.textContent, /学习已归档/);
+
+  // The OLD list response (queued) arrives last and must be dropped.
+  await act(async () => { firstList.resolve(); await firstList.promise.catch(() => {}); });
+  await settle();
+  assert.match(container.textContent, /学习已归档/);
+  assert.equal([...container.querySelectorAll(".learning-section__title")].some((title) => /排队/.test(title.textContent)), false, "the stale queued list must not replace the archived list");
+});
+
+test("a pending activation completing after switching to another detail never touches the new workspace", async (t) => {
+  const gate = deferred();
+  const anchors = {
+    "/api/learning/capabilities": () => jsonResponse({ capabilities: learningCaps }),
+    "/api/learning": () => jsonResponse({ workspaces: [] }),
+    "/api/learning/88888888-2222-4333-8444-555555555555": () => jsonResponse({
+      workspace: learningWorkspace({ workspaceId: uuid("8"), state: "queued", repositoryId: 208 }),
+    }),
+    "/api/learning/55555555-2222-4333-8444-555555555555": () => jsonResponse({
+      workspace: learningWorkspace({ workspaceId: uuid("5"), state: "draft", repositoryId: 205, mission: { goal: "analyze-design", notes: "workspace B notes" } }),
+    }),
+    "/api/learning/88888888-2222-4333-8444-555555555555/activate": () => gate.promise.then(() => jsonResponse({
+      workspace: learningWorkspace({ workspaceId: uuid("8"), state: "active", repositoryId: 208 }), outcome: "active",
+    })),
+  };
+  const { container, router } = await mountLearningPage(t, { initialEntries: ["/learning/88888888-2222-4333-8444-555555555555"], handlers: anchors });
+  await settle();
+
+  await act(() => button(container, "激活").click());
+  assert.ok(button(container, "激活中…"));
+  // Switch to B while A's activation is still pending.
+  await act(() => router.navigate("/learning/55555555-2222-4333-8444-555555555555"));
+  await settle();
+  assert.match(container.textContent, /workspace B notes/);
+
+  await act(async () => { gate.resolve(); await gate.promise.catch(() => {}); });
+  await settle();
+
+  // A's completion must not change B's detail, its loading state or notices.
+  assert.match(container.textContent, /workspace B notes/);
+  assert.match(container.textContent, /草稿/);
+  assert.doesNotMatch(container.textContent, /已激活|激活失败|正在读取/);
+});
+
+test("real route remount: leaving the detail unmounts it, so a late response cannot reach the next workspace", async (t) => {
+  const firstGet = deferred();
+  const aCalls = [];
+  const calls = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (input, options = {}) => {
+    const path = String(input).split("?")[0];
+    calls.push({ method: options.method || "GET", path });
+    const handler = {
+      "/api/learning/capabilities": () => jsonResponse({ capabilities: learningCaps }),
+      "/api/learning": () => jsonResponse({ workspaces: [] }),
+      "/api/learning/44444444-2222-4333-8444-555555555555": () => {
+        aCalls.push(1);
+        return firstGet.promise.then(() => jsonResponse({ workspace: learningWorkspace({ workspaceId: uuid("4"), repositoryId: 204, fullName: "synthetic/repo-204" }) }));
+      },
+      "/api/learning/55555555-2222-4333-8444-555555555555": () => jsonResponse({ workspace: learningWorkspace({ workspaceId: uuid("5"), repositoryId: 205, fullName: "synthetic/repo-205" }) }),
+    }[path];
+    if (!handler) return Promise.reject(new Error(`unhandled ${path}`));
+    return Promise.resolve(handler({ path, method: options.method || "GET" }));
+  };
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root = createRoot(container);
+  const router = createMemoryRouter(
+    [
+      { path: "/learning", element: React.createElement(RemountingLearningPage) },
+      { path: "/learning/:workspaceId", element: React.createElement(RemountingLearningPage) },
+    ],
+    { initialEntries: ["/learning/44444444-2222-4333-8444-555555555555"] },
+  );
+  await act(() => { root.render(React.createElement(RouterProvider, { router })); });
+  t.after(() => {
+    act(() => root.unmount());
+    container.remove();
+    globalThis.fetch = originalFetch;
+  });
+  await settle();
+  assert.equal(aCalls.length, 1, "the first mount requests the first detail");
+
+  // Navigate to B: the real-app key remount creates a fresh page instance.
+  await act(() => router.navigate("/learning/55555555-2222-4333-8444-555555555555"));
+  await settle();
+  assert.match(container.textContent, /synthetic\/repo-205/);
+
+  // The old mount's response lands after its unmount: it must not reach B.
+  await act(async () => { firstGet.resolve(); await firstGet.promise.catch(() => {}); });
+  await settle();
+  assert.match(container.textContent, /synthetic\/repo-205/);
+  assert.doesNotMatch(container.textContent, /repo-204/);
+  assert.doesNotMatch(container.textContent, /加载失败|刷新失败/);
+});
+
+test("closing the draft dialog while an operation is pending leaves no stale callback on a later dialog", async (t) => {
+  const gate = deferred();
+  const savedA = [];
+  const savedB = [];
+  const mountRoot = async (props, handlers) => {
+    const calls = [];
+    const innerFetch = globalThis.fetch;
+    globalThis.fetch = (input, options = {}) => {
+      const path = String(input).split("?")[0];
+      calls.push({ method: options.method || "GET", path });
+      const handler = handlers[path];
+      if (!handler) return Promise.reject(new Error(`unhandled ${path}`));
+      return Promise.resolve(handler({ path, method: options.method || "GET", options }));
+    };
+    const el = document.createElement("div");
+    document.body.append(el);
+    const rootEl = createRoot(el);
+    await act(() => { rootEl.render(React.createElement(compiled.exports.LearningDraftDialog, props)); });
+    return { container: el, root: rootEl, calls, restore: () => { globalThis.fetch = innerFetch; } };
+  };
+  const originalFetch = globalThis.fetch;
+
+  const A = await mountRoot(
+    {
+      repository,
+      workspace: draftWorkspace(),
+      onClose: () => {},
+      onDraftSaved: () => savedA.push(1),
+      onConfirmed: () => {},
+      onOpenWorkspace: () => {},
+    },
+    {
+      "/api/learning/11111111-2222-4333-8444-555555555555/draft": ({ options }) => gate.promise.then(() => {
+        const body = JSON.parse(options.body);
+        return jsonResponse({ workspace: draftWorkspace({ draftRevision: body.expectedRevision + 1, mission: body.mission }) });
+      }),
+    },
+  );
+  await settle();
+  await act(() => button(A.container, "保存修改").click());
+  assert.equal(savedA.length, 0);
+
+  // Close/unmount A while its save is pending, then mount a fresh dialog B.
+  act(() => A.root.unmount());
+  A.container.remove();
+  const B = await mountRoot(
+    {
+      repository: { ...repository, repositoryId: 202, fullName: "synthetic/repo-202", htmlUrl: "https://github.com/synthetic/repo-202" },
+      workspace: { ...draftWorkspace(), repositoryId: 202, workspaceId: uuid("2"), fullName: "synthetic/repo-202" },
+      onClose: () => {},
+      onDraftSaved: () => savedB.push(1),
+      onConfirmed: () => {},
+      onOpenWorkspace: () => {},
+    },
+    {
+      "/api/learning/22222222-2222-4333-8444-555555555555/draft": ({ options }) => {
+        const body = JSON.parse(options.body);
+        return jsonResponse({ workspace: draftWorkspace({ workspaceId: uuid("2"), repositoryId: 202, fullName: "synthetic/repo-202", draftRevision: body.expectedRevision + 1, mission: body.mission }) });
+      },
+    },
+  );
+  await settle();
+  assert.match(B.container.textContent, /synthetic\/repo-202/);
+
+  // A's old save completes now: the disposed dialog must not fire callbacks
+  // or touch the new dialog's content.
+  await act(async () => { gate.resolve(); await gate.promise.catch(() => {}); });
+  await settle();
+  assert.equal(savedA.length, 0, "the unmounted dialog must not fire onDraftSaved");
+  assert.equal(savedB.length, 0);
+  assert.match(B.container.textContent, /synthetic\/repo-202/);
+  assert.doesNotMatch(B.container.textContent, /任务已保存/);
+
+  act(() => B.root.unmount());
+  B.container.remove();
+  A.restore();
+  globalThis.fetch = originalFetch;
+});
+
+// Part 3: capability fields, close semantics and confirm/revision recovery ---
+
+test("per-field capabilities gate each mutation independently", async (t) => {
+  const caps = { read: true, create: true, edit: false, preview: true, confirm: true, activate: true, archive: false };
+  const anchors = {
+    "/api/learning/capabilities": () => jsonResponse({ capabilities: caps }),
+    "/api/learning": () => jsonResponse({
+      workspaces: [
+        learningWorkspace({ workspaceId: uuid("1"), state: "draft", repositoryId: 201 }),
+        learningWorkspace({ workspaceId: uuid("8"), state: "queued", repositoryId: 208 }),
+      ],
+    }),
+  };
+  const { container } = await mountLearningPage(t, { handlers: anchors });
+  await settle();
+
+  // create:true alone must not enable edit or archive; each field controls its
+  // own operation. (`assert.ok(!...)` instead of a direct element compare: a
+  // failing element-equality assertion makes node inspect the happy-dom node,
+  // which explodes instead of failing cleanly.)
+  assert.ok(!button(container, "编辑任务"), "edit:false hides 编辑任务");
+  assert.ok(button(container, "激活"), "activate:true keeps activation");
+  assert.equal([...container.querySelectorAll("button")].some((b) => /归档/.test(b.textContent)), false, "archive:false hides every archive action");
+
+  // The detail page respects the same fields.
+  const detail = await mountLearningPage(t, { initialEntries: ["/learning/88888888-2222-4333-8444-555555555555"], handlers: {
+    ...anchors,
+    "/api/learning/88888888-2222-4333-8444-555555555555": () => jsonResponse({
+      workspace: learningWorkspace({ workspaceId: uuid("8"), state: "queued", repositoryId: 208 }),
+    }),
+  } });
+  await settle();
+  assert.ok(button(detail.container, "激活"));
+  assert.equal([...detail.container.querySelectorAll("button")].some((b) => /归档/.test(b.textContent)), false);
+});
+
+test("a failed capability request disables every mutation and keeps the retry", async (t) => {
+  const anchors = {
+    "/api/learning/capabilities": () => apiError("LEARNING_INTERNAL_ERROR", "学习服务暂时不可用。", 500),
+    "/api/learning": () => jsonResponse({
+      workspaces: [
+        learningWorkspace({ workspaceId: uuid("1"), state: "draft", repositoryId: 201 }),
+        learningWorkspace({ workspaceId: uuid("8"), state: "queued", repositoryId: 208 }),
+      ],
+    }),
+  };
+  const { container } = await mountLearningPage(t, { handlers: anchors });
+  await settle();
+
+  assert.match(container.textContent, /无法确认学习权限/);
+  assert.ok(button(container, "重试"), "a retry entry must restore capabilities");
+  assert.ok(!button(container, "编辑任务"));
+  assert.ok(!button(container, "激活"));
+  assert.equal([...container.querySelectorAll("button")].some((b) => /归档/.test(b.textContent)), false);
+});
+
+test("closing the dialog is never blocked by read-only", async (t) => {
+  const closed = [];
+  const { container } = await mountDialog(t, {
+    props: { readOnly: true, workspace: draftWorkspace({ draftRevision: 2 }), onClose: () => closed.push(1) },
+    handlers: {},
+  });
+  await settle();
+  // Read-only blocks mutations; it must never block closing the dialog.
+  await act(() => button(container, "关闭").click());
+  assert.equal(closed.length, 1);
+});
+
+test("confirm: network uncertainty keeps the same-token retry", async (t) => {
+  const confirmCalls = [];
+  let networkFail = true;
+  const { container } = await mountDialog(t, {
+    handlers: {
+      "/api/learning/drafts": () => jsonResponse({ workspace: draftWorkspace() }),
+      "/api/learning/11111111-2222-4333-8444-555555555555/preview": () => jsonResponse(previewPage()),
+      "/api/learning/confirm": ({ options }) => {
+        confirmCalls.push(JSON.parse(options.body).token);
+        if (networkFail) return Promise.reject(new TypeError("network down"));
+        return jsonResponse({ confirmed: "active", workspace: draftWorkspace({ state: "active" }) });
+      },
+    },
+  });
+  await settle();
+  await act(() => button(container, "预览确认").click());
+  await settle();
+  await act(() => button(container, "确认加入学习").click());
+  await settle();
+
+  // Network uncertainty: retrying the ORIGINAL token is safe and idempotent.
+  assert.match(container.textContent, /结果未收到/);
+  assert.ok(button(container, "重试确认"));
+  networkFail = false;
+  await act(() => button(container, "重试确认").click());
+  await settle();
+  assert.equal(confirmCalls.length, 2);
+  assert.equal(confirmCalls[1], confirmCalls[0], "a network retry reuses the same token");
+  assert.match(container.textContent, /已加入学习/);
+});
+
+test("confirm: an explicit CONFIRM_TOKEN_INVALID rejection refuses a doomed retry and recovers via a fresh preview that keeps the input", async (t) => {
+  const previews = [];
+  const confirmCalls = [];
+  let notes = "input the user typed";
+  const { container } = await mountDialog(t, {
+    handlers: {
+      "/api/learning/drafts": () => jsonResponse({ workspace: draftWorkspace() }),
+      "/api/learning/11111111-2222-4333-8444-555555555555/draft": ({ options }) => {
+        const body = JSON.parse(options.body);
+        return jsonResponse({ workspace: draftWorkspace({ draftRevision: body.expectedRevision + 1, mission: body.mission }) });
+      },
+      "/api/learning/11111111-2222-4333-8444-555555555555/preview": () => {
+        previews.push(previews.length + 1);
+        return jsonResponse(previewPage({ token: `token.${previews.length}`, mission: { goal: "learn-usage", notes } }));
+      },
+      "/api/learning/confirm": ({ options }) => {
+        confirmCalls.push(JSON.parse(options.body).token);
+        return apiError("CONFIRM_TOKEN_INVALID", "确认凭证已失效，请重新预览。", 409);
+      },
+    },
+  });
+  await settle();
+  await setNotes(container, notes);
+  await act(() => button(container, "预览确认").click());
+  await settle();
+  await act(() => button(container, "确认加入学习").click());
+  await settle();
+
+  // An explicit business rejection must not offer a doomed same-token retry.
+  assert.match(container.textContent, /确认凭证已失效/);
+  assert.ok(!button(container, "重试确认"), "no doomed retry for a dead token");
+  assert.ok(button(container, "重新预览"));
+
+  // Recovery: a fresh preview keeps the typed input and issues a new token.
+  await act(() => button(container, "重新预览").click());
+  await settle();
+  assert.equal(previews.length, 2);
+  assert.match(container.textContent, /input the user typed/);
+  assert.ok(button(container, "确认加入学习"));
+  await act(() => button(container, "确认加入学习").click());
+  await settle();
+  assert.notEqual(confirmCalls[confirmCalls.length - 1], confirmCalls[0], "recovery must use a fresh token");
+});
+
+test("activate revision conflict refreshes the latest revision so a retry is not doomed", async (t) => {
+  // The store is at revision 5 while the client's initial copy is still 4.
+  let revision = 5;
+  let state = "queued";
+  let detailCalls = 0;
+  const activateBodies = [];
+  const anchors = {
+    "/api/learning/capabilities": () => jsonResponse({ capabilities: learningCaps }),
+    "/api/learning": () => jsonResponse({ workspaces: [] }),
+    "/api/learning/88888888-2222-4333-8444-555555555555": () => {
+      detailCalls += 1;
+      // The first GET is the stale client copy; the auto-refresh after the
+      // conflict sees the store's actual current revision.
+      return jsonResponse({
+        workspace: learningWorkspace({ workspaceId: uuid("8"), state, repositoryId: 208, draftRevision: detailCalls === 1 ? 4 : revision }),
+      });
+    },
+    "/api/learning/88888888-2222-4333-8444-555555555555/activate": ({ options }) => {
+      const body = JSON.parse(options.body);
+      activateBodies.push(body);
+      if (body.expectedRevision !== revision) {
+        return apiError("REVISION_CONFLICT", "任务已发生较新的编辑，请刷新后重试。", 409);
+      }
+      state = "active";
+      return jsonResponse({ workspace: learningWorkspace({ workspaceId: uuid("8"), state: "active", repositoryId: 208, draftRevision: revision }), outcome: "active" });
+    },
+  };
+  const { container } = await mountLearningPage(t, { initialEntries: ["/learning/88888888-2222-4333-8444-555555555555"], handlers: anchors });
+  await settle();
+
+  await act(() => button(container, "激活").click());
+  await settle();
+  assert.match(container.textContent, /较新的编辑/);
+  // The page refreshed the detail, so the retry sends the fresh revision.
+  await act(() => button(container, "重试激活").click());
+  await settle();
+  assert.equal(activateBodies.length, 2);
+  assert.equal(activateBodies[0].expectedRevision, 4);
+  assert.equal(activateBodies[1].expectedRevision, 5, "the retry must use the refreshed revision, not replay the dead one");
+  assert.match(container.textContent, /已激活/);
+  assert.match(container.textContent, /学习中/);
+});
+
+test("editing after a revision conflict keeps the user input and retries against the fresh revision", async (t) => {
+  let currentRevision = 2; // the store is ahead of the dialog's copy (revision 1)
+  const patches = [];
+  const existing = draftWorkspace({ draftRevision: 1 });
+  const { container } = await mountDialog(t, {
+    props: {
+      workspace: existing,
+      onRefreshWorkspace: async () => ({ ...draftWorkspace({ draftRevision: currentRevision }) }),
+    },
+    handlers: {
+      "/api/learning/11111111-2222-4333-8444-555555555555/draft": ({ options }) => {
+        const body = JSON.parse(options.body);
+        patches.push(body);
+        if (body.expectedRevision !== currentRevision) {
+          return apiError("REVISION_CONFLICT", "任务已发生较新的编辑，请刷新后重试。", 409);
+        }
+        currentRevision += 1;
+        return jsonResponse({ workspace: draftWorkspace({ draftRevision: currentRevision, mission: body.mission }) });
+      },
+    },
+  });
+  await settle();
+  await setNotes(container, "typed by the user");
+  await act(() => button(container, "保存修改").click());
+  await settle();
+
+  assert.deepEqual(patches[0], { expectedRevision: 1, mission: { goal: "learn-usage", notes: "typed by the user" } });
+  assert.match(container.textContent, /已被其他操作更新|较新的编辑/);
+  const textarea = container.querySelector("textarea[name='notes']");
+  assert.equal(textarea.value, "typed by the user", "the user input survives a revision conflict");
+
+  await act(() => button(container, "重试").click());
+  await settle();
+  assert.deepEqual(patches[1], { expectedRevision: 2, mission: { goal: "learn-usage", notes: "typed by the user" } });
+  assert.match(container.textContent, /任务已保存/);
+});
+
+// The real app mounts under React <StrictMode>, which simulates an
+// unmount/remount on first mount. A lifecycle "disposed" marker armed only by
+// the cleanup would strand in-flight completions after that simulation; the
+// marker must be re-armed by the effect setup. These regressions guard the
+// exact defect found in the real-browser acceptance.
+
+test("StrictMode remount must not strand the draft dialog in the creating phase", async (t) => {
+  const calls = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (input, options = {}) => {
+    const path = String(input).split("?")[0];
+    calls.push({ method: options.method || "GET", path });
+    if (path === "/api/learning/drafts") return Promise.resolve(jsonResponse({ workspace: draftWorkspace() }));
+    return Promise.reject(new Error(`unhandled ${path}`));
+  };
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root = createRoot(container);
+  await act(() => {
+    root.render(React.createElement(React.StrictMode, null,
+      React.createElement(compiled.exports.LearningDraftDialog, { repository, onClose: () => {}, onDraftSaved: () => {}, onConfirmed: () => {}, onOpenWorkspace: () => {} }),
+    ));
+  });
+  t.after(() => { act(() => root.unmount()); container.remove(); globalThis.fetch = originalFetch; });
+  await settle();
+  assert.equal(calls.filter((call) => call.method === "POST" && call.path === "/api/learning/drafts").length, 1);
+  assert.ok(button(container, "预览确认"), "the create completion must reach the editing phase under StrictMode");
+});
+
+test("StrictMode remount must not drop list/detail loads on the learning page", async (t) => {
+  const anchors = {
+    "/api/learning/capabilities": () => jsonResponse({ capabilities: learningCaps }),
+    "/api/learning": () => jsonResponse({ workspaces: [learningWorkspace({ workspaceId: uuid("3"), state: "active", repositoryId: 203 })] }),
+  };
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (input, options = {}) => {
+    const path = String(input).split("?")[0];
+    const handler = anchors[path];
+    if (!handler) return Promise.reject(new Error(`unhandled ${path}`));
+    return Promise.resolve(handler({ path, method: options.method || "GET" }));
+  };
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root = createRoot(container);
+  const router = createMemoryRouter(
+    [{ path: "/learning", element: React.createElement(React.StrictMode, null, React.createElement(pageCompiled.exports.LearningPage)) }],
+    { initialEntries: ["/learning"] },
+  );
+  await act(() => { root.render(React.createElement(RouterProvider, { router })); });
+  t.after(() => { act(() => root.unmount()); container.remove(); globalThis.fetch = originalFetch; });
+  await settle();
+  assert.ok(container.textContent.includes("synthetic/repo-203"), "the list must render under StrictMode");
 });

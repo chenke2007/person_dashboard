@@ -155,7 +155,31 @@ async function startFixture(t, { readOnly = false, projectReadOnly = false, acti
   const server = http.createServer(vite.middlewares);
   await listenOnFetchSafePort(server);
   const origin = `http://127.0.0.1:${server.address().port}`;
+
+  // Pre-warm the cold server paths with plain node fetch (no 12s client abort):
+  // the first radar/dashboard GET pays one-time file+lock+AV costs that can
+  // spike past the app's own request timeout. Warming them here keeps the
+  // mounted app on the warm path, so the real-UI assertions never race a
+  // cold-start timeout. GETs only — no mutations, no state change.
+  for (const warmPath of [
+    "/api/ai-radar/capabilities",
+    "/api/ai-radar?period=day&state=all&focus=all&learning=all",
+    "/api/ai-radar/preferences",
+    "/api/learning",
+  ]) {
+    const warmed = await fetch(`${origin}${warmPath}`);
+    if (!warmed.ok) {
+      await warmed.text();
+      throw new Error(`fixture warm-up failed for ${warmPath} (${warmed.status})`);
+    }
+    await warmed.text();
+  }
+
   t.after(async () => {
+    // The page keeps fetch keep-alives open; without force-closing them,
+    // server.close() would wait out each idle keep-alive timeout and the
+    // fixture roots would linger while the next test runs.
+    server.closeAllConnections?.();
     await new Promise((resolve) => server.close(resolve));
     await vite.close();
     await rm(root, { recursive: true, force: true });
@@ -203,29 +227,36 @@ const { createRoot } = await import("react-dom/client");
 const { createMemoryRouter, RouterProvider } = await import("react-router-dom");
 
 async function settle() {
-  await new Promise((resolve) => setTimeout(resolve, 0));
-  await act(async () => { await new Promise((resolve) => setTimeout(resolve, 40)); });
-  await new Promise((resolve) => setTimeout(resolve, 0));
-  await act(async () => { await new Promise((resolve) => setTimeout(resolve, 40)); });
+  // One act scope per flush: real-HTTP continuations that arrive during the
+  // wait are wrapped in act. A response can physically only resolve on a
+  // network macrotask, so a single scope (instead of two scopes with a
+  // between-act gap) leaves no unbatched window.
+  await act(async () => { await new Promise((resolve) => setTimeout(resolve, 60)); });
 }
 
 // Polls up to ~40 real-HTTP flush rounds until the container text matches.
+// The polling loop itself runs inside ONE act scope, so dashboard/list/detail
+// responses that arrive between rounds are wrapped instead of warning.
 async function waitText(container, pattern, label) {
-  for (let round = 0; round < 40; round += 1) {
-    if (pattern.test(container.textContent)) return;
-    await settle();
-  }
+  await act(async () => {
+    for (let round = 0; round < 40; round += 1) {
+      if (pattern.test(container.textContent)) return;
+      await new Promise((resolve) => setTimeout(resolve, 60));
+    }
+  });
   assert.match(container.textContent, pattern, label ?? "waiting for text");
 }
 
 const button = (container, text) => [...container.querySelectorAll("button")].find((b) => b.textContent.trim().includes(text));
 
 async function waitCardText(container, repoName, badge, label) {
-  for (let round = 0; round < 60; round += 1) {
-    const card = [...container.querySelectorAll(".radar-card")].find((article) => article.textContent.includes(repoName));
-    if (card && card.textContent.includes(badge)) return;
-    await settle();
-  }
+  await act(async () => {
+    for (let round = 0; round < 60; round += 1) {
+      const card = [...container.querySelectorAll(".radar-card")].find((article) => article.textContent.includes(repoName));
+      if (card && card.textContent.includes(badge)) return;
+      await new Promise((resolve) => setTimeout(resolve, 60));
+    }
+  });
   const card = [...container.querySelectorAll(".radar-card")].find((article) => article.textContent.includes(repoName));
   assert.ok(card, `expected a radar card for ${repoName}`);
   assert.match(card.textContent, new RegExp(badge), label);
@@ -234,8 +265,12 @@ async function waitCardText(container, repoName, badge, label) {
 async function clickButton(container, text) {
   const target = button(container, text);
   assert.ok(target, `expected a button labelled ${text}`);
-  await act(() => target.click());
-  await settle();
+  // Click and its network round-trip share one act scope so the response
+  // paints inside act.
+  await act(async () => {
+    target.click();
+    await new Promise((resolve) => setTimeout(resolve, 60));
+  });
 }
 
 async function mountApp(t, { origin, initialEntries = ["/ai-radar?period=day"] }) {

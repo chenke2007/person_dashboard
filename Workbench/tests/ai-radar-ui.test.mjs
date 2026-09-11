@@ -708,8 +708,7 @@ test("radar navigation stays behind the local Workbench gate and labels the entr
   assert.match(app, /localWorkbench\s*\?\s*<Route path="\/ai-radar"/);
   assert.match(shell, /to: "\/ai-radar",\s*label: "AI 雷达"/);
   assert.match(shell, /\.\.\.\(localWorkbench\s*\?\s*\[\{\s*to: "\/ai-radar"/);
-  // The obsidian read-only profile curates a narrow nav that omits AI radar.
-  assert.match(shell, /\["\/", "\/graph", "\/wiki", "\/materials", "\/projects"\]\.includes/);
+  // The obsidian-profile nav contract is covered by tests/appshell-nav.test.mjs.
 });
 
 test("learning routes and navigation stay behind the local Workbench gate", async () => {
@@ -717,13 +716,11 @@ test("learning routes and navigation stay behind the local Workbench gate", asyn
     readFile(new URL("../src/App.jsx", import.meta.url), "utf8"),
     readFile(new URL("../src/components/AppShell.jsx", import.meta.url), "utf8"),
   ]);
-  // All learning surfaces are local-only: hosted builds never expose the
-  // routes, and the obsidian read-only profile's curated nav omits them too.
+  // All learning surfaces are local-only: hosted builds never expose the routes.
   assert.match(app, /localWorkbench\s*\?\s*<Route path="\/learning"/);
   assert.match(app, /localWorkbench\s*\?\s*<Route path="\/learning\/:workspaceId"/);
   assert.match(shell, /to: "\/learning",\s*label: "学习任务"/);
   assert.match(shell, /\.\.\.\(localWorkbench\s*\?\s*\[\{\s*to: "\/learning"/);
-  assert.match(shell, /\["\/", "\/graph", "\/wiki", "\/materials", "\/projects"\]\.includes/);
 });
 test("schedule form reflects persisted values once they arrive after the initial render", async (t) => {
   const { container, renderSchedule } = await mountStatus(t);

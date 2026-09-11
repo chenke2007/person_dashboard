@@ -114,7 +114,7 @@ export function AppShell({ children, onOpenSearch, onOpenKnowledge, knowledgeOpe
 
           <nav aria-label="主要导航" className="sidebar__nav">
             {onOpenKnowledge && <button type="button" className={`sidebar__nav-item knowledge-nav${knowledgeOpen ? " sidebar__nav-item--active" : ""}`} onClick={() => { onOpenKnowledge(); setMobileOpen(false); }}><IconMessageChatbot aria-hidden="true" className="sidebar__nav-icon" stroke={1.7} /><span>知识库助手</span></button>}
-            {primaryNavigation.filter((item) => !obsidianWorkbench || ["/", "/graph", "/wiki", "/materials", "/projects"].includes(item.to)).map((item) => {
+            {primaryNavigation.map((item) => {
               const Icon = item.icon;
               return (
                 <NavLink

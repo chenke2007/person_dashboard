@@ -576,7 +576,7 @@ test("formal backup restore round-trips learning and invalidates old confirm tok
 
   const previewRestore = await request(origin, "/api/workspace/restore/preview", { method: "POST", body: bundle });
   assert.equal(previewRestore.response.status, 200);
-  assert.deepEqual(previewRestore.body.providers.map(({ id }) => id).sort(), ["ai-radar", "learning", "projects"]);
+  assert.deepEqual(previewRestore.body.providers.map(({ id }) => id).sort(), ["ai-radar", "learning", "projects", "summaries"]);
   const restored = await request(origin, "/api/workspace/restore/confirm", {
     method: "POST",
     body: { token: previewRestore.body.token },

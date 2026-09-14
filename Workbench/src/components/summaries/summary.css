@@ -1,0 +1,23 @@
+.summary-dialog-wrapper{position:fixed;inset:0;background:rgba(24,28,26,.42);display:flex;align-items:center;justify-content:center;padding:20px;z-index:60}
+.summary-dialog{background:#fff;border:1px solid #ddd7cb;border-radius:18px;box-shadow:0 24px 64px rgba(33,40,36,.22);width:min(640px,100%);max-height:min(86vh,760px);overflow:auto;padding:22px 24px}
+.summary-dialog__head{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:14px}
+.summary-dialog__head h2{margin:0;font-size:18px;color:#1e3d35}
+.summary-dialog__close{border:0;background:transparent;font-size:22px;line-height:1;color:#68726d;cursor:pointer;padding:4px 8px}
+.summary-dialog__loading{padding:28px 0;text-align:center;color:#68726d}
+.summary-dialog__empty{padding:24px 0;text-align:center;color:#68726d}
+.summary-dialog__notice,.summary-dialog__error,.summary-dialog__stale{border-radius:10px;padding:8px 12px;font-size:13px;margin:0 0 12px}
+.summary-dialog__notice{background:#fbf3dd;color:#7a5b14}
+.summary-dialog__error{background:#fbe9e7;color:#a02b1d}
+.summary-dialog__stale{background:#eef2ef;color:#4c5a52}
+.summary-dialog__repo{margin-bottom:14px;border:1px solid #ece8df;border-radius:12px;padding:12px 14px;background:#faf8f3}
+.summary-dialog__repolink{margin:0 0 4px;font-weight:600;color:#1e3d35}
+.summary-dialog__repolink a{color:#1e3d35;text-decoration:none}
+.summary-dialog__repolink a:hover{text-decoration:underline}
+.summary-dialog__meta{list-style:none;display:flex;flex-wrap:wrap;gap:6px 14px;margin:8px 0 0;padding:0;font-size:12px;color:#68726d}
+.summary-dialog__meta code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:#efece4;border-radius:6px;padding:1px 6px;color:#3c443f}
+.summary-dialog__content{display:grid;gap:10px;margin:0 0 12px}
+.summary-dialog__section{border:1px solid #ece8df;border-radius:10px;padding:10px 12px;background:#fdfcf9}
+.summary-dialog__section dt{margin:0 0 4px;font-size:12px;font-weight:700;color:#1e3d35}
+.summary-dialog__section dd{margin:0;font-size:14px;line-height:1.55;color:#2d3530;white-space:pre-wrap}
+.summary-dialog__footer{display:flex;justify-content:flex-end;align-items:center;gap:10px;margin-top:14px}
+.summary-dialog__hint{font-size:12px;color:#8a948e;margin-right:auto}

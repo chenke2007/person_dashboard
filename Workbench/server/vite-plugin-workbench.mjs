@@ -63,6 +63,10 @@ import { LearningWorkspaceError } from "./learning/learning-repository.mjs";
 import { createLearningRepository } from "./learning/learning-repository.mjs";
 import { createLearningService } from "./learning/learning-service.mjs";
 import { createLearningRoutes } from "./learning/learning-routes.mjs";
+import { createSummaryRepository, SummaryRepositoryError } from "./summaries/summary-repository.mjs";
+import { createRepositorySummaryService } from "./summaries/summary-service.mjs";
+import { createSummaryRoutes } from "./summaries/summary-routes.mjs";
+import { createSummaryModelAdapter } from "./summaries/summary-model-adapter.mjs";
 import { WorkspaceRegistryError } from "./workspace-state/workspace-registry.mjs";
 import { createWorkspaceBackup } from "./workspace-state/workspace-backup.mjs";
 import { createWorkspaceRegistry } from "./workspace-state/workspace-registry.mjs";
@@ -841,6 +845,7 @@ export function workbenchApiPlugin({
   projectDirectory = null,
   radarDirectory = null,
   radarOptions = {},
+  summaryOptions = {},
   appDataRoot = process.env.LOCALAPPDATA || path.join(os.homedir(), ".local", "share"),
   hosted = process.env.VITE_WORKBENCH_HOSTED === "true",
 } = {}) {
@@ -954,6 +959,31 @@ export function workbenchApiPlugin({
     }
     const repository = createLearningRepository({ directory: resolvedDirectory, now: () => new Date() });
     learningRepositoryPromise = repository;
+    return repository;
+  }
+  let summaryRepositoryPromise = null;
+  async function summaryRepository({ create = true } = {}) {
+    // Cache only a concrete repository, never a null resolution: a read on a
+    // fresh unbound vault must stay side-effect free, and the next legitimate
+    // mutation must still be able to bind and write.
+    if (summaryRepositoryPromise) return summaryRepositoryPromise;
+    let resolvedDirectory = null;
+    const workspace = await currentWorkspace({ create });
+    if (!workspace) return null;
+    const stateRoot = workspace.storageLayout === "legacy"
+      ? path.join(workspaceRegistryDirectory, workspace.workspaceId)
+      : path.join(workspaceRegistryDirectory, "workspaces", workspace.workspaceId);
+    resolvedDirectory = path.join(stateRoot, "summaries");
+    if (!create) {
+      try {
+        await lstat(resolvedDirectory);
+      } catch (error) {
+        if (error?.code === "ENOENT") return null;
+        throw error;
+      }
+    }
+    const repository = createSummaryRepository({ directory: resolvedDirectory, now: () => new Date() });
+    summaryRepositoryPromise = repository;
     return repository;
   }
   let radarContextPromise = null;
@@ -1114,7 +1144,44 @@ export function workbenchApiPlugin({
             throw new RadarRoutesError("RADAR_LEARNING_UNAVAILABLE", "学习状态当前不可用。", 503);
           }
         }
-        return context.store.getDashboard({ ...options, learningState, learningWorkspaceIds, learningStatus });
+        const dashboard = await context.store.getDashboard({ ...options, learningState, learningWorkspaceIds, learningStatus });
+        // Read-time summary overlay: the last generated summary per repository
+        // rides onto each card as a pure read that never writes to the radar
+        // decision or the learning store. A corrupt summaries store signals
+        // "unavailable" without hiding the reliable base lists, exactly like
+        // the learning overlay above.
+        let summaryState = new Map();
+        let summaryStatus = "ok";
+        try {
+          const summariesStore = await summaryRepository({ create: false });
+          if (summariesStore) {
+            const listed = await summariesStore.listLatest();
+            summaryState = new Map(listed.summaries.map((summary) => [summary.repositoryId, summary]));
+          }
+        } catch (error) {
+          summaryStatus = "unavailable";
+        }
+        const withSummary = (entry) => {
+        const record = summaryStatus === "unavailable" ? null : (summaryState.get(entry.repositoryId) ?? null);
+        // The overlay carries only card-level metadata; the full summary body
+        // is fetched on demand through GET /api/summaries/repository/:id.
+        return {
+          ...entry,
+          summary: record ? {
+            summaryId: record.summaryId,
+            sourceCommitSha: record.sourceCommitSha,
+            generatedAt: record.generatedAt,
+            model: record.model,
+          } : null,
+        };
+      };
+        return {
+          ...dashboard,
+          summaryStatus,
+          lists: Object.fromEntries(
+            Object.entries(dashboard.lists).map(([key, entries]) => [key, entries.map(withSummary)]),
+          ),
+        };
       },
       async setDecision(repositoryId, status) {
         return (await radarRouteStore({ create: true })).setDecision(repositoryId, status);
@@ -1158,33 +1225,40 @@ export function workbenchApiPlugin({
   // directory. The createDraft flow captures its expected binding before the
   // slow remote work, so a rebind landing mid-request rejects the write
   // instead of silently continuing against the new workspace.
+  // Shared workspace-binding guard for radar-family mutations (learning,
+  // summaries): withBoundWorkspace verifies the current binding under the
+  // registry lock, then the operation proceeds; a rebind landing mid-request
+  // rejects with WORKSPACE_BINDING_CHANGED before any write. Slow remote work
+  // (GitHub/model) always runs before this guard.
+  const captureWorkspaceBinding = async () => {
+    if (!registry) return null;
+    const workspace = await currentWorkspace({ create: true });
+    if (!workspace) return null;
+    return { fingerprint: vaultFingerprint, workspaceId: workspace.workspaceId };
+  };
+  const boundWorkspace = async (binding, operation, ErrorClass = LearningWorkspaceError) => {
+    if (!registry) return operation();
+    let expected = binding;
+    if (!expected) {
+      const workspace = await currentWorkspace({ create: true });
+      if (workspace) expected = { fingerprint: vaultFingerprint, workspaceId: workspace.workspaceId };
+    }
+    if (!expected) {
+      throw new ErrorClass("WORKSPACE_NOT_FOUND", "当前 Vault 尚未绑定工作区。", 404);
+    }
+    try {
+      return await registry.withBoundWorkspace(expected, operation);
+    } catch (error) {
+      if (error instanceof WorkspaceRegistryError && error.code === "WORKSPACE_BINDING_CHANGED") {
+        throw new ErrorClass(error.code, "工作区绑定已改变，请重新加载后重试。", 409);
+      }
+      throw error;
+    }
+  };
   const learningService = createLearningService({
     getLearning: (options) => learningRepository(options),
-    captureBinding: async () => {
-      if (!registry) return null;
-      const workspace = await currentWorkspace({ create: true });
-      if (!workspace) return null;
-      return { fingerprint: vaultFingerprint, workspaceId: workspace.workspaceId };
-    },
-    bound: async (binding, operation) => {
-      if (!registry) return operation();
-      let expected = binding;
-      if (!expected) {
-        const workspace = await currentWorkspace({ create: true });
-        if (workspace) expected = { fingerprint: vaultFingerprint, workspaceId: workspace.workspaceId };
-      }
-      if (!expected) {
-        throw new LearningWorkspaceError("WORKSPACE_NOT_FOUND", "当前 Vault 尚未绑定工作区。", 404);
-      }
-      try {
-        return await registry.withBoundWorkspace(expected, operation);
-      } catch (error) {
-        if (error instanceof WorkspaceRegistryError && error.code === "WORKSPACE_BINDING_CHANGED") {
-          throw new LearningWorkspaceError(error.code, "工作区绑定已改变，请重新加载后重试。", 409);
-        }
-        throw error;
-      }
-    },
+    captureBinding: captureWorkspaceBinding,
+    bound: (binding, operation) => boundWorkspace(binding, operation, LearningWorkspaceError),
     resolveRepository: async (repositoryId) => {
       const store = await radarApi.getStore();
       if (!store) return null;
@@ -1199,6 +1273,34 @@ export function workbenchApiPlugin({
   });
   const learningRoutes = createLearningRoutes({
     service: learningService,
+    readOnly: projectReadOnly,
+    hosted,
+  });
+  // Summary service + routes over the summary store. Generation pins a fixed
+  // commit (caller-supplied or resolved from HEAD), reads the bounded README at
+  // exactly that ref, drives the injected optional model adapter, validates the
+  // structured output and persists idempotently by generation key. The model
+  // adapter stays provider-neutral and is never imported by this module.
+  const summaryService = createRepositorySummaryService({
+    getSummaries: (options) => summaryRepository(options),
+    captureBinding: captureWorkspaceBinding,
+    bound: (binding, operation) => boundWorkspace(binding, operation, SummaryRepositoryError),
+    resolveRepository: async (repositoryId) => {
+      const store = await radarApi.getStore();
+      if (!store) return null;
+      const state = await store.getState();
+      const repository = state.repositories.find((item) => item.id === repositoryId);
+      return repository ? { ...repository } : null;
+    },
+    getHeadCommit: (input) => radarGithub().getHeadCommit(input),
+    getReadme: (input) => radarGithub().getReadme(input),
+    model: summaryOptions.model ?? createSummaryModelAdapter({ env: process.env }),
+    mutatable: radarMutable,
+    readable: !hosted,
+    hosted,
+  });
+  const summaryRoutes = createSummaryRoutes({
+    service: summaryService,
     readOnly: projectReadOnly,
     hosted,
   });
@@ -1242,7 +1344,7 @@ export function workbenchApiPlugin({
         throw error;
       }
       const backup = createWorkspaceBackup({
-        providers: [await projectRepository(), await radarRepository(), (await learningRepository()).registerBackupProvider()],
+        providers: [await projectRepository(), await radarRepository(), (await learningRepository()).registerBackupProvider(), (await summaryRepository()).registerBackupProvider()],
         secret: backupSecret,
         workspaceId: workspace.workspaceId,
       });
@@ -1270,6 +1372,7 @@ export function workbenchApiPlugin({
       projectRepositoryPromise = null;
       radarRepositoryPromise = null;
       learningRepositoryPromise = null;
+      summaryRepositoryPromise = null;
       radarContextPromise = null;
       radarLifecyclePromise = null;
       workspaceBackupPromise = null;
@@ -1461,6 +1564,7 @@ export function workbenchApiPlugin({
           if (projectRoutes.matches(req, url)) return await projectRoutes.handle(req, res, url);
           if (radarRoutes.matches(req, url)) return await radarRoutes.handle(req, res, url);
           if (learningRoutes.matches(req, url)) return await learningRoutes.handle(req, res, url);
+          if (summaryRoutes.matches(req, url)) return await summaryRoutes.handle(req, res, url);
           if (readOnly && (!['GET', 'HEAD'].includes(req.method) || /^\/api\/(?:wiki-ingest|workflows|reader-explanations)(?:\/|$)/.test(url.pathname))) {
             return json(res, 403, { error: { code: "VAULT_READ_ONLY", message: "当前知识库为只读接入，不允许写入、执行脚本或启动 AI 工作流。" } });
           }

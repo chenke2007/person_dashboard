@@ -5,6 +5,7 @@ import { AiRadarCard } from "../components/ai-radar/AiRadarCard";
 import { AiRadarFilters } from "../components/ai-radar/AiRadarFilters";
 import { AiRadarStatus } from "../components/ai-radar/AiRadarStatus";
 import { LearningDraftDialog } from "../components/learning/LearningDraftDialog";
+import { SummaryDialog } from "../components/summaries/SummaryDialog";
 import { RADAR_FOCUSES, RADAR_LEARNING_LABELS, RADAR_LEARNING_STATES, RADAR_LISTS, RADAR_PERIODS, RADAR_STATES, projectRadarDashboard } from "../lib/ai-radar-model.js";
 import {
   addRadarPreference,
@@ -20,6 +21,7 @@ import {
   updateRadarSchedule,
 } from "../lib/ai-radar-api.js";
 import { loadLearningCapabilities } from "../lib/learning-api.js";
+import { generateRepositorySummary, loadRepositorySummary, loadSummaryCapabilities } from "../lib/summary-api.js";
 import "../components/ai-radar/ai-radar.css";
 
 export function radarFilterFromSearch(params) {
@@ -94,6 +96,8 @@ export function AiRadarView({
   canJoinLearning = true,
   learningStatus = "ok",
   learningCapsError = null,
+  canGenerateSummary = false,
+  summaryCapsError = null,
 }) {
   const cards = view && !view.empty && Array.isArray(view.cards) ? view.cards : [];
   return (
@@ -116,6 +120,14 @@ export function AiRadarView({
           <p>无法确认学习权限：{learningCapsError}。已停用“加入学习”等操作。</p>
           {actions?.onRetryLearningCapabilities ? (
             <button onClick={() => actions.onRetryLearningCapabilities()} type="button">重试</button>
+          ) : null}
+        </div>
+      ) : null}
+      {summaryCapsError ? (
+        <div className="radar-message radar-message--error" role="alert">
+          <p>无法确认摘要权限：{summaryCapsError}。已停用“生成摘要”操作。</p>
+          {actions?.onRetrySummaryCapabilities ? (
+            <button onClick={() => actions.onRetrySummaryCapabilities()} type="button">重试</button>
           ) : null}
         </div>
       ) : null}
@@ -176,13 +188,16 @@ export function AiRadarView({
             <AiRadarCard
               actionErrors={actionErrors}
               busy={busy}
+              canGenerateSummary={canGenerateSummary}
               canJoinLearning={!readOnly && canJoinLearning && learningStatus === "ok"}
               card={card}
               key={card.repositoryId}
               onDecide={actions.onDecide}
+              onGenerateSummary={actions.onGenerateSummary}
               onJoinLearning={actions.onJoinLearning}
               onLessLike={actions.onLessLike}
               onOpenLearning={actions.onOpenLearning}
+              onViewSummary={actions.onViewSummary}
               readOnly={readOnly}
             />
           ))}
@@ -271,6 +286,22 @@ export function AiRadarPage() {
   }, []);
   useEffect(() => { void loadLearningCaps(); }, [loadLearningCaps]);
   const learningCreate = learningCaps?.create === true;
+  // Summary generation stays an optional capability: radar and learning keep
+  // working without a configured model, and the page only exposes "生成摘要"
+  // once the server confirms an adapter. A failed refresh must never fall back
+  // to writable, so the catch clears any previous capabilities.
+  const [summaryCaps, setSummaryCaps] = useState(null);
+  const [summaryCapsError, setSummaryCapsError] = useState(null);
+  const loadSummaryCaps = useCallback(() => {
+    loadSummaryCapabilities()
+      .then((body) => { setSummaryCaps(body?.capabilities ?? null); setSummaryCapsError(null); })
+      .catch((error) => {
+        setSummaryCaps(null);
+        setSummaryCapsError(error?.message ?? "无法读取摘要权限信息");
+      });
+  }, []);
+  useEffect(() => { void loadSummaryCaps(); }, [loadSummaryCaps]);
+  const summaryGenerate = summaryCaps?.generate === true;
   const [joinCard, setJoinCard] = useState(null);
   const [searchParams, setSearchParams] = useSearchParams();
   const filter = useMemo(() => radarFilterFromSearch(searchParams), [searchParams]);
@@ -470,6 +501,43 @@ export function AiRadarPage() {
     }
   }, [refreshAfter]);
 
+  // Summary overlay state: a modal, per-repository dialog that preserves the
+  // previous valid summary on failure, shows a clear "unconfigured model"
+  // notice without fabricating content, and never joins learning by itself.
+  const [summaryDialog, setSummaryDialog] = useState(null);
+  const openSummary = useCallback(async (repositoryId, mode) => {
+    const card = view?.cards.find((item) => item.repositoryId === repositoryId);
+    if (!card) return;
+    setSummaryDialog((prev) => ({
+      repositoryId,
+      card,
+      mode,
+      summary: prev?.repositoryId === repositoryId ? prev.summary : (card.summary ?? null),
+      loading: true,
+      error: null,
+      notice: null,
+    }));
+    try {
+      const result = mode === "generate"
+        ? await generateRepositorySummary({ repositoryId })
+        : await loadRepositorySummary(repositoryId);
+      if (result?.status === "unavailable") {
+        setSummaryDialog((current) => (current?.repositoryId === repositoryId
+          ? { ...current, loading: false, notice: result?.message ?? "尚未配置摘要模型。" }
+          : current));
+      } else {
+        setSummaryDialog((current) => (current?.repositoryId === repositoryId
+          ? { ...current, loading: false, summary: result?.summary ?? current.summary }
+          : current));
+      }
+      await refreshAfter();
+    } catch (error) {
+      setSummaryDialog((current) => (current?.repositoryId === repositoryId
+        ? { ...current, loading: false, error: error?.message ?? "摘要加载失败，请重试。" }
+        : current));
+    }
+  }, [view, refreshAfter]);
+
   const actions = useMemo(() => ({
     onCollect,
     onDecide,
@@ -482,11 +550,14 @@ export function AiRadarPage() {
       if (card) setJoinCard(card);
     },
     onOpenLearning: (workspaceId) => navigate(`/learning/${encodeURIComponent(workspaceId)}`),
+    onGenerateSummary: (repositoryId) => void openSummary(repositoryId, "generate"),
+    onViewSummary: (repositoryId) => void openSummary(repositoryId, "view"),
     onRetry: retry,
     onRetryCapabilities: loadCaps,
     onRetryLearningCapabilities: loadLearningCaps,
+    onRetrySummaryCapabilities: loadSummaryCaps,
     onRetryAux: refreshExtras,
-  }), [onCollect, onDecide, onLessLike, onRevertPreference, onResetPreferences, onUpdateSchedule, retry, loadCaps, loadLearningCaps, refreshExtras, view, navigate]);
+  }), [onCollect, onDecide, onLessLike, onRevertPreference, onResetPreferences, onUpdateSchedule, openSummary, retry, loadCaps, loadLearningCaps, loadSummaryCaps, refreshExtras, view, navigate]);
 
   return (
     <>
@@ -494,6 +565,7 @@ export function AiRadarPage() {
         actionErrors={actionErrors}
         actions={actions}
         busy={busy}
+        canGenerateSummary={summaryGenerate}
         canJoinLearning={learningCreate}
         capabilitiesError={capabilitiesError}
         collectFeedback={collectFeedback}
@@ -510,6 +582,7 @@ export function AiRadarPage() {
         stale={stale}
         status={status}
         statusError={statusError}
+        summaryCapsError={summaryCapsError}
         view={view}
         learningStatus={view?.learningStatus ?? "ok"}
       />
@@ -525,6 +598,18 @@ export function AiRadarPage() {
           onOpenWorkspace={(id) => navigate(`/learning/${encodeURIComponent(id)}`)}
           readOnly={!learningCreate}
           repository={joinCard}
+        />
+      ) : null}
+      {summaryDialog ? (
+        <SummaryDialog
+          capabilities={summaryCaps}
+          error={summaryDialog.error}
+          loading={summaryDialog.loading}
+          notice={summaryDialog.notice}
+          onClose={() => setSummaryDialog(null)}
+          onGenerate={() => openSummary(summaryDialog.repositoryId, summaryDialog.mode)}
+          repository={summaryDialog.card}
+          summary={summaryDialog.summary}
         />
       ) : null}
     </>

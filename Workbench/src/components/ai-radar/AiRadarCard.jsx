@@ -10,7 +10,7 @@ export const RADAR_DECISION_LABELS = Object.freeze({
   ignored: "已忽略",
 });
 
-export function AiRadarCard({ card, readOnly, busy, actionErrors, onDecide, onLessLike, canJoinLearning = true, onJoinLearning, onOpenLearning }) {
+export function AiRadarCard({ card, readOnly, busy, actionErrors, onDecide, onLessLike, canJoinLearning = true, onJoinLearning, onOpenLearning, canGenerateSummary = false, onGenerateSummary, onViewSummary }) {
   const repositoryId = card.repositoryId;
   const decisionBusy = busy?.decision instanceof Set && busy.decision.has(repositoryId);
   const lessLikeBusy = busy?.lessLike instanceof Set && busy.lessLike.has(repositoryId);
@@ -93,8 +93,41 @@ export function AiRadarCard({ card, readOnly, busy, actionErrors, onDecide, onLe
           ) : null}
         </div>
       ) : null}
+      {card.summary ? (
+        <div className="radar-card__learning-row">
+          <button
+            aria-label={`查看摘要 ${card.fullName}`}
+            onClick={() => onViewSummary?.(repositoryId)}
+            type="button"
+          >
+            查看摘要
+          </button>
+        </div>
+      ) : null}
       {!readOnly ? (
         <div className="radar-card__actions">
+          {!card.summary ? (
+            canGenerateSummary ? (
+              <button
+                aria-label={`生成摘要 ${card.fullName}`}
+                onClick={() => onGenerateSummary?.(repositoryId)}
+                type="button"
+              >
+                生成摘要
+              </button>
+            ) : (
+              <>
+                <button
+                  aria-label={`生成摘要不可用 ${card.fullName}`}
+                  disabled
+                  type="button"
+                >
+                  生成摘要
+                </button>
+                <span className="radar-card__hint">尚未配置摘要模型</span>
+              </>
+            )
+          ) : null}
           {!card.hasLearning && canJoinLearning ? (
             <button
               aria-label={`加入学习 ${card.fullName}`}

@@ -998,6 +998,8 @@ test("real route remount: leaving the detail unmounts it, so a late response can
         return firstGet.promise.then(() => jsonResponse({ workspace: learningWorkspace({ workspaceId: uuid("4"), repositoryId: 204, fullName: "synthetic/repo-204" }) }));
       },
       "/api/learning/55555555-2222-4333-8444-555555555555": () => jsonResponse({ workspace: learningWorkspace({ workspaceId: uuid("5"), repositoryId: 205, fullName: "synthetic/repo-205" }) }),
+      "/api/learning/44444444-2222-4333-8444-555555555555/content": () => jsonResponse({ content: null }),
+      "/api/learning/55555555-2222-4333-8444-555555555555/content": () => jsonResponse({ content: null }),
     }[path];
     if (!handler) return Promise.reject(new Error(`unhandled ${path}`));
     return Promise.resolve(handler({ path, method: options.method || "GET" }));

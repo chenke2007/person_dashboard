@@ -156,5 +156,58 @@ export function createLearningService({
     return result;
   }
 
-  return Object.freeze({ capabilities, list, get, createDraft, editDraft, preview, confirm, activate, archive });
+  // --- Authored learning content (plan / notes / artifacts) ---
+  // Content is bound to the learning workspace's fixed source: the binding is
+  // derived HERE from the workspace record (browser-supplied identities are
+  // never trusted), then the content store enforces binding equality against
+  // the persisted record, so a drifted commit or repository is rejected
+  // instead of being silently migrated. Content writes are fast local ops:
+  // the expected binding is captured and verified by the same binding guard
+  // that serializes every other learning mutation.
+
+  async function readContent(workspaceId, operation) {
+    if (hosted) fail("LEARNING_UNAVAILABLE", "托管模式下学习数据不可用。", 404);
+    const repository = await store({ create: false });
+    if (!repository) fail("WORKSPACE_NOT_FOUND", "学习工作区不存在。", 404);
+    await repository.get(workspaceId);
+    return operation(repository);
+  }
+
+  async function mutateContent({ workspaceId, expectedRevision, payload, save }) {
+    return mutation(async () => {
+      const repository = await store();
+      const { workspace } = await repository.get(workspaceId);
+      const binding = {
+        repositoryId: workspace.repositoryId,
+        sourceCommitSha: workspace.sourceCommitSha,
+        sourceUrl: workspace.sourceUrl,
+      };
+      return save(repository.content, { workspaceId, expectedRevision, binding, ...payload });
+    });
+  }
+
+  async function getContent({ workspaceId }) {
+    return readContent(workspaceId, (repository) => repository.content.getContent({ workspaceId }));
+  }
+
+  async function listArtifacts({ workspaceId }) {
+    return readContent(workspaceId, (repository) => repository.content.listArtifacts({ workspaceId }));
+  }
+
+  async function savePlan({ workspaceId, expectedRevision, plan }) {
+    return mutateContent({ workspaceId, expectedRevision, payload: { plan }, save: (instance, input) => instance.savePlan(input) });
+  }
+
+  async function saveNotes({ workspaceId, expectedRevision, notes }) {
+    return mutateContent({ workspaceId, expectedRevision, payload: { notes }, save: (instance, input) => instance.saveNotes(input) });
+  }
+
+  async function addArtifact({ workspaceId, expectedRevision, artifact }) {
+    return mutateContent({ workspaceId, expectedRevision, payload: { artifact }, save: (instance, input) => instance.addArtifact(input) });
+  }
+
+  return Object.freeze({
+    capabilities, list, get, createDraft, editDraft, preview, confirm, activate, archive,
+    getContent, listArtifacts, savePlan, saveNotes, addArtifact,
+  });
 }

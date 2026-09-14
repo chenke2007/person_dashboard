@@ -75,3 +75,40 @@
 .learning-detail__actions .learning-detail__primary{background:#172b26;color:#fff;border-color:#172b26}
 .learning-detail__actions button:disabled{opacity:.55;cursor:default}
 @media(max-width:720px){.learning-page{padding:24px 18px 88px}.learning-item__actions{justify-content:flex-start}.learning-detail{grid-template-columns:1fr}}
+
+/* Learning content editor: editable plan / notes / artifacts are rendered by
+   LearningContentEditor on the workspace detail page. Styling mirrors the
+   learning list/detail surfaces. */
+.learning-content{display:flex;flex-direction:column;gap:18px;margin-top:22px}
+.learning-content-block{border:1px solid #ddd7cb;border-radius:14px;background:#fff;padding:16px 18px}
+.learning-content-block h3{margin:0 0 12px;font-size:16px;color:#3c443f;display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
+h3 .learning-content--muted{font-size:11px;color:#7b8480;font-weight:400}
+.learning-content--muted{color:#7b8480;font-size:12px}
+.learning-content-field{display:flex;flex-direction:column;gap:6px;margin:0 0 12px}
+.learning-content-field span{font-size:12px;color:#55605b;font-weight:600}
+.learning-content-field textarea,.learning-content-field input,.learning-content-field select{border:1px solid #d8d2c5;border-radius:8px;background:#fdfcf9;color:#222;padding:8px 10px;font:inherit;font-size:13px;line-height:1.5}
+.learning-content-field textarea:disabled,.learning-content-field input:disabled,.learning-content-field select:disabled{background:#f4f1ea;color:#68726d;cursor:not-allowed}
+.learning-content-field textarea{resize:vertical;min-height:56px}
+.learning-content .learning-content-block>button{border:1px solid #4a8c78;border-radius:8px;background:#eef5f1;color:#1e3d35;min-height:32px;padding:0 12px;font:inherit;font-size:12px;cursor:pointer;margin-bottom:12px}
+.learning-content .learning-content-block>button:disabled{opacity:.55;cursor:default}
+.learning-content-hint{color:#55605b;font-size:12px;margin:-6px 0 10px}
+.learning-milestones{display:flex;flex-direction:column;gap:8px;margin-bottom:12px}
+.learning-milestones h4{margin:0;font-size:13px;color:#55605b}
+.learning-milestone{display:flex;gap:8px;align-items:center}
+.learning-milestone input[type="text"]{flex:1;border:1px solid #d8d2c5;border-radius:8px;background:#fdfcf9;padding:6px 8px;font:inherit;font-size:13px}
+.learning-milestone button{border:1px solid #d8d2c5;border-radius:8px;background:#fff;color:#222;min-height:28px;padding:0 10px;font:inherit;font-size:12px;cursor:pointer}
+.learning-milestones>button{border:1px dashed #b9b2a3;border-radius:8px;background:#fff;color:#55605b;min-height:28px;padding:0 10px;font:inherit;font-size:12px;cursor:pointer;align-self:flex-start}
+.learning-content-notes{width:100%;box-sizing:border-box;border:1px solid #d8d2c5;border-radius:8px;background:#fdfcf9;color:#222;padding:10px 12px;font:inherit;font-size:13px;line-height:1.6;resize:vertical}
+.learning-content-notes:disabled{background:#f4f1ea;color:#68726d;cursor:not-allowed}
+.learning-artifacts{list-style:none;margin:0 0 12px;padding:0;display:flex;flex-direction:column;gap:10px}
+.learning-artifacts li{border:1px solid #e6e1d6;border-radius:10px;background:#faf8f4;padding:10px 12px}
+.learning-artifacts h4{margin:0 0 6px;font-size:14px;color:#222;display:flex;align-items:center;gap:8px}
+.learning-artifacts p{margin:0 0 4px;font-size:13px;color:#333;white-space:pre-wrap;overflow-wrap:anywhere}
+.learning-artifact-type{font:500 11px var(--font-mono,monospace);color:#5f6a65;background:#f0eee8;border-radius:10px;padding:2px 8px}
+.learning-artifact-form{border-top:1px dashed #d8d2c5;padding-top:12px}
+.learning-content-save{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:4px}
+.learning-content-save button{border:1px solid #172b26;border-radius:8px;background:#172b26;color:#fff;min-height:34px;padding:0 14px;font:inherit;font-size:12px;cursor:pointer}
+.learning-content-save button:disabled{opacity:.55;cursor:default}
+.learning-content-save .learning-content-retry{border:1px solid #b14f49;background:#fff;color:#b14f49}
+.learning-content-ok{color:#2e7d5b;font-size:12px;margin:0}
+.learning-content-error{color:#b14f49;font-size:12px;margin:0}

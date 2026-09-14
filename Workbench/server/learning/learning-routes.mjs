@@ -1,3 +1,4 @@
+import { LearningContentError } from "./learning-content-repository.mjs";
 import { LearningWorkspaceError } from "./learning-repository.mjs";
 
 const ROOT = "/api/learning";
@@ -35,7 +36,7 @@ async function bodyJson(req, maximum = MAX_BODY_BYTES) {
 }
 
 function publicError(error) {
-  if (error instanceof LearningWorkspaceError) {
+  if (error instanceof LearningWorkspaceError || error instanceof LearningContentError) {
     const status = Number.isInteger(error.status) && error.status >= 400 && error.status <= 599 ? error.status : 500;
     return { code: error.code, message: error.message, status };
   }
@@ -109,6 +110,28 @@ export function createLearningRoutes({ service, readOnly = false, hosted = false
             return sendJson(res, 200, await service.activate({ workspaceId: id, expectedRevision: body.expectedRevision }));
           }
           if (method === "POST" && action === "archive") return sendJson(res, 200, await service.archive({ workspaceId: id }));
+        }
+
+        // Authored content endpoints: plan / notes / artifacts are versioned by
+        // the content revision and stay bound to the workspace's fixed source.
+        const contentMatch = /^\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/(content|plan|notes|artifacts)$/.exec(route);
+        if (contentMatch) {
+          const [, id, action] = contentMatch;
+          if (method === "GET" && action === "content") return sendJson(res, 200, await service.getContent({ workspaceId: id }));
+          if (method === "GET" && action === "artifacts") return sendJson(res, 200, await service.listArtifacts({ workspaceId: id }));
+          requireMutable();
+          if (method === "PATCH" && action === "plan") {
+            const body = requireObject(await bodyJson(req), new Set(["expectedRevision", "plan"]));
+            return sendJson(res, 200, await service.savePlan({ workspaceId: id, expectedRevision: body.expectedRevision, plan: body.plan }));
+          }
+          if (method === "PATCH" && action === "notes") {
+            const body = requireObject(await bodyJson(req), new Set(["expectedRevision", "notes"]));
+            return sendJson(res, 200, await service.saveNotes({ workspaceId: id, expectedRevision: body.expectedRevision, notes: body.notes }));
+          }
+          if (method === "POST" && action === "artifacts") {
+            const body = requireObject(await bodyJson(req), new Set(["expectedRevision", "artifact"]));
+            return sendJson(res, 200, await service.addArtifact({ workspaceId: id, expectedRevision: body.expectedRevision, artifact: body.artifact }));
+          }
         }
 
         throw new LearningWorkspaceError("LEARNING_ROUTE_NOT_FOUND", "学习操作不存在。", 404);

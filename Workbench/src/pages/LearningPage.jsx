@@ -1,14 +1,20 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { PageHeader } from "../components/PageHeader";
+import { LearningContentEditor } from "../components/learning/LearningContentEditor";
 import { LearningDraftDialog } from "../components/learning/LearningDraftDialog";
 import {
   activateLearning,
+  addLearningArtifact,
   archiveLearning,
   loadLearningCapabilities,
+  loadLearningContent,
   loadLearningWorkspace,
   loadLearningWorkspaces,
+  saveLearningNotes,
+  saveLearningPlan,
 } from "../lib/learning-api.js";
+import { loadRepositorySummaryByCommit } from "../lib/summary-api.js";
 import {
   LEARNING_GOAL_LABELS,
   LEARNING_STATE_LABELS,
@@ -278,6 +284,21 @@ const onArchive = useCallback(async (workspace) => {
     ? busy.activate?.has(projectedDetail.workspaceId) || busy.archive?.has(projectedDetail.workspaceId)
     : false;
 
+  // Stable per-workspace wire functions for the content editor: identities are
+  // keyed on the workspace id only, so editor effect guards never re-fire on
+  // unrelated page re-renders.
+  const contentHandlers = useMemo(() => {
+    if (!isDetail || !projectedDetail) return null;
+    const id = projectedDetail.workspaceId;
+    return Object.freeze({
+      loadContent: () => loadLearningContent(id),
+      loadSummary: (repositoryId, sourceCommitSha) => loadRepositorySummaryByCommit(repositoryId, sourceCommitSha),
+      savePlan: (revision, plan) => saveLearningPlan(id, revision, plan),
+      saveNotes: (revision, text) => saveLearningNotes(id, revision, { markdownText: text }),
+      addArtifact: (revision, artifact) => addLearningArtifact(id, revision, artifact),
+    });
+  }, [isDetail, projectedDetail?.workspaceId]);
+
   if (isDetail) {
     return (
       <section className="learning-page page-shell">
@@ -359,6 +380,21 @@ const onArchive = useCallback(async (workspace) => {
                 <p>归档失败：{busy.archiveError[projectedDetail.workspaceId]}</p>
                 <button disabled={detailBusy} onClick={() => onArchive(projectedDetail)} type="button">重试归档</button>
               </div>
+            ) : null}
+            {contentHandlers ? (
+              <LearningContentEditor
+                onAddArtifact={contentHandlers.addArtifact}
+                onLoadContent={contentHandlers.loadContent}
+                onLoadSummary={contentHandlers.loadSummary}
+                onSaveNotes={contentHandlers.saveNotes}
+                onSavePlan={contentHandlers.savePlan}
+                readOnly={!canEdit}
+                workspace={{
+                  workspaceId: projectedDetail.workspaceId,
+                  repositoryId: projectedDetail.repositoryId,
+                  sourceCommitSha: projectedDetail.sourceCommitSha,
+                }}
+              />
             ) : null}
           </>
         ) : null}

@@ -572,9 +572,17 @@ test("real browser: desktop and narrow viewports keep controls visible, clickabl
         const r = b.getBoundingClientRect();
         if (r.width <= 0 || r.height <= 0) continue;
         const cs = getComputedStyle(b);
-        const visible = r.left >= -1 && r.top >= -1 && r.right <= innerWidth + 1 && r.bottom <= innerHeight + 1;
+        let rect = r;
+        let visible = rect.left >= -1 && rect.top >= -1 && rect.right <= innerWidth + 1 && rect.bottom <= innerHeight + 1;
+        // A form-style detail page legitimately scrolls: reach each control
+        // the way a user would before calling it broken.
+        if (!visible) {
+          b.scrollIntoView({ block: "center", inline: "nearest" });
+          rect = b.getBoundingClientRect();
+          visible = rect.left >= -1 && rect.top >= -1 && rect.right <= innerWidth + 1 && rect.bottom <= innerHeight + 1;
+        }
         const actionable = visible && cs.pointerEvents !== "none" && !b.disabled;
-        if (!actionable) bad.push({ text: b.textContent.trim().slice(0, 24), disabled: b.disabled, left: Math.round(r.left), right: Math.round(r.right), top: Math.round(r.top), bottom: Math.round(r.bottom) });
+        if (!actionable) bad.push({ text: b.textContent.trim().slice(0, 24), disabled: b.disabled, left: Math.round(rect.left), right: Math.round(rect.right), top: Math.round(rect.top), bottom: Math.round(rect.bottom) });
       }
       return {
         overflow: root.scrollWidth > root.clientWidth + 1,

@@ -2,6 +2,7 @@ import { constants, lstat, mkdir, open, realpath, rename, unlink } from "node:fs
 import path from "node:path";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { createTicketLock } from "../workspace-state/ticket-lock.mjs";
+import { createLearningContentRepository } from "./learning-content-repository.mjs";
 import {
   CONFIRM_RECEIPT_TTL_MS,
   CONFIRM_TOKEN_TTL_MS,
@@ -89,6 +90,11 @@ export function createLearningRepository({ directory, now = () => new Date() } =
   // so a write either fully lands (atomic tmp -> fsync -> rename) or leaves the
   // prior file intact; there is no multi-file commit to prove atomic.
   const withWriteLock = createTicketLock({ directory: path.join(root, "learning.lock"), ensureDirectory, fail, codePrefix: "LEARNING_STORAGE" });
+  // The authored content store (plan / notes / artifacts) lives beside the
+  // lifecycle store in the same directory with its own file, lock and
+  // revision. It is composed here because this module owns the directory
+  // resolution; the content deep module itself shares no lifecycle state.
+  const content = createLearningContentRepository({ directory: root, now });
 
   async function readRawStore() {
     if (!await ensureDirectory({ create: false })) return null;
@@ -334,20 +340,38 @@ export function createLearningRepository({ directory, now = () => new Date() } =
     });
   }
 
+  // The unified backup provider bundles the lifecycle store (token-free) with
+  // the authored content store under the "learning" provider id, so a single
+  // backup round-trips both and an old learning-only backup imports cleanly
+  // while preserving existing content. Authorization material is never
+  // imported, and content is only touched when the bundle carries it.
   async function validatedImport(value) {
+    const contentRecords = value && typeof value === "object" && !Array.isArray(value) && Object.hasOwn(value, "contentRecords")
+      ? value.contentRecords
+      : undefined;
+    const learningValue = value && typeof value === "object" && !Array.isArray(value)
+      ? { ...value }
+      : value;
+    if (contentRecords !== undefined) delete learningValue.contentRecords;
     try {
       if (Buffer.byteLength(JSON.stringify(value)) > MAX_BYTES) fail("LEARNING_STORAGE_TOO_LARGE", "学习数据超过容量限制。", 413);
-      const checkedValue = await learningStoreSchema.parseAsync(value);
+      const checkedLearning = await learningStoreSchema.parseAsync(learningValue);
       // Authorization material (confirmation records) is never imported from an
       // external source: a backup must be token-free. Legitimate exports always
       // carry an empty array, so this stays compatible with current backups.
-      if (checkedValue.confirmations.length > 0) {
+      if (checkedLearning.confirmations.length > 0) {
         fail("LEARNING_IMPORT_CONFIRMATIONS_REJECTED", "导入数据包含确认授权信息，已拒绝。", 400);
       }
-      if (Buffer.byteLength(`${JSON.stringify(checkedValue, null, 2)}\n`) > MAX_BYTES) fail("LEARNING_STORAGE_TOO_LARGE", "学习数据超过容量限制。", 413);
-      return structuredClone(checkedValue);
+      let checkedContent = null;
+      if (contentRecords !== undefined) {
+        checkedContent = await content.validateImport(contentRecords);
+      }
+      const merged = { ...structuredClone(checkedLearning), ...(checkedContent ? { contentRecords: checkedContent } : {}) };
+      if (Buffer.byteLength(`${JSON.stringify(merged, null, 2)}\n`) > MAX_BYTES) fail("LEARNING_STORAGE_TOO_LARGE", "学习数据超过容量限制。", 413);
+      return structuredClone(merged);
     } catch (error) {
       if (error instanceof LearningWorkspaceError) throw error;
+      if (error?.name === "LearningContentError") throw error;
       if (value && typeof value === "object" && value.version !== undefined && value.version !== 1) {
         fail("LEARNING_STORAGE_VERSION_UNSUPPORTED", "学习数据版本不受支持。", 500);
       }
@@ -359,9 +383,12 @@ export function createLearningRepository({ directory, now = () => new Date() } =
     return serialized(async () => {
       const store = await readStore();
       // Raw confirm tokens and their digests are authorization material and are
-      // never exported; after restore a fresh preview is required.
+      // never exported; after restore a fresh preview is required. Content is
+      // carried under `contentRecords`, a field name the backup scanner does
+      // not treat as a Vault body.
       const clean = { ...store, confirmations: [] };
-      return structuredClone(clean);
+      const contentRecords = await content.exportState();
+      return structuredClone({ ...clean, contentRecords });
     });
   }
 
@@ -376,9 +403,15 @@ export function createLearningRepository({ directory, now = () => new Date() } =
   }
 
   async function stageImport(value) {
-    const checkedValue = await validatedImport(value);
-    const body = `${JSON.stringify(checkedValue, null, 2)}\n`;
+    const merged = await validatedImport(value);
+    const learningChecked = { ...merged };
+    const contentRecords = Object.hasOwn(learningChecked, "contentRecords") ? learningChecked.contentRecords : undefined;
+    if (contentRecords !== undefined) delete learningChecked.contentRecords;
+    const body = `${JSON.stringify(learningChecked, null, 2)}\n`;
     if (Buffer.byteLength(body) > MAX_BYTES) fail("LEARNING_STORAGE_TOO_LARGE", "学习数据超过容量限制。", 413);
+    // Lock order is fixed: the learning exclusive transaction first, then the
+    // content store's own exclusive transaction. Nothing ever acquires the
+    // content lock before the learning lock, so there is no cycle.
     const release = await acquireExclusiveTransaction();
     let stagedPath = null;
     let rollbackPath = null;
@@ -386,6 +419,7 @@ export function createLearningRepository({ directory, now = () => new Date() } =
     let committed = false;
     let preserveRollback = false;
     let closed = false;
+    let contentTransaction = null;
     try {
       const previous = await readRawStore();
       hadOriginal = previous !== null;
@@ -398,9 +432,13 @@ export function createLearningRepository({ directory, now = () => new Date() } =
         rollbackPath = await writeTemporary(previous, "rollback");
       }
       stagedPath = await writeTemporary(body, "stage");
+      if (contentRecords !== undefined) {
+        contentTransaction = await content.stageImport(contentRecords);
+      }
     } catch (error) {
       if (stagedPath) await unlink(stagedPath).catch(() => {});
       if (rollbackPath) await unlink(rollbackPath).catch(() => {});
+      if (contentTransaction) await contentTransaction.cleanup().catch(() => {});
       await release();
       throw error;
     }
@@ -411,10 +449,12 @@ export function createLearningRepository({ directory, now = () => new Date() } =
       await rename(stagedPath, target);
       stagedPath = null;
       committed = true;
+      if (contentTransaction) await contentTransaction.commit();
     }
     async function rollback() {
       if (closed || !committed) return;
       try {
+        if (contentTransaction) await contentTransaction.rollback();
         await ensureDirectory();
         if (hadOriginal) {
           await rename(rollbackPath, target);
@@ -433,6 +473,7 @@ export function createLearningRepository({ directory, now = () => new Date() } =
       closed = true;
       if (stagedPath) await unlink(stagedPath).catch(() => {});
       if (rollbackPath && !preserveRollback) await unlink(rollbackPath).catch(() => {});
+      if (contentTransaction) await contentTransaction.cleanup();
       await release();
     }
 
@@ -458,6 +499,7 @@ export function createLearningRepository({ directory, now = () => new Date() } =
 
   return Object.freeze({
     createDraft, editDraft, preview, confirm, activate, list, get, archive,
+    content,
     registerBackupProvider, exportState, validateImport: validatedImport, replaceState,
   });
 }

@@ -87,6 +87,10 @@ export function createSummaryRoutes({ service, readOnly = false, hosted = false 
 
         const repositoryMatch = REPOSITORY_ID.exec(route);
         if (method === "GET" && repositoryMatch) {
+          const sourceCommitSha = url.searchParams.get("sourceCommitSha");
+          if (sourceCommitSha !== null) {
+            return sendJson(res, 200, await service.getSummaryByCommit({ repositoryId: Number(repositoryMatch[1]), sourceCommitSha }));
+          }
           return sendJson(res, 200, await service.getSummary({ repositoryId: Number(repositoryMatch[1]) }));
         }
 

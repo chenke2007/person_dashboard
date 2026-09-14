@@ -16,3 +16,11 @@ export const confirmLearning = (token) => command("/api/learning/confirm", "POST
 export const activateLearning = (workspaceId, expectedRevision) =>
   command(`/api/learning/${encodeURIComponent(workspaceId)}/activate`, "POST", { expectedRevision });
 export const archiveLearning = (workspaceId) => command(`/api/learning/${encodeURIComponent(workspaceId)}/archive`, "POST");
+export const loadLearningContent = (workspaceId) => request(`/api/learning/${encodeURIComponent(workspaceId)}/content`, { method: "GET" });
+export const loadLearningArtifacts = (workspaceId) => request(`/api/learning/${encodeURIComponent(workspaceId)}/artifacts`, { method: "GET" });
+export const saveLearningPlan = (workspaceId, expectedRevision, plan) =>
+  command(`/api/learning/${encodeURIComponent(workspaceId)}/plan`, "PATCH", { expectedRevision, plan });
+export const saveLearningNotes = (workspaceId, expectedRevision, notes) =>
+  command(`/api/learning/${encodeURIComponent(workspaceId)}/notes`, "PATCH", { expectedRevision, notes });
+export const addLearningArtifact = (workspaceId, expectedRevision, artifact) =>
+  command(`/api/learning/${encodeURIComponent(workspaceId)}/artifacts`, "POST", { expectedRevision, artifact });

@@ -1,4 +1,5 @@
 import { LearningContentError } from "./learning-content-repository.mjs";
+import { LearningIngestionError } from "./learning-ingestion-repository.mjs";
 import { LearningWorkspaceError } from "./learning-repository.mjs";
 
 const ROOT = "/api/learning";
@@ -36,7 +37,7 @@ async function bodyJson(req, maximum = MAX_BODY_BYTES) {
 }
 
 function publicError(error) {
-  if (error instanceof LearningWorkspaceError || error instanceof LearningContentError) {
+  if (error instanceof LearningWorkspaceError || error instanceof LearningContentError || error instanceof LearningIngestionError) {
     const status = Number.isInteger(error.status) && error.status >= 400 && error.status <= 599 ? error.status : 500;
     return { code: error.code, message: error.message, status };
   }
@@ -54,7 +55,7 @@ function requireObject(body, allowed = new Set()) {
   return body;
 }
 
-export function createLearningRoutes({ service, readOnly = false, hosted = false } = {}) {
+export function createLearningRoutes({ service, ingest = null, readOnly = false, hosted = false } = {}) {
   if (!service) throw new TypeError("learning service is required");
 
   function requireMutable() {
@@ -69,17 +70,57 @@ export function createLearningRoutes({ service, readOnly = false, hosted = false
     async handle(req, res, url) {
       try {
         const method = req.method || "";
-        if (readOnly && MUTATION_METHODS.includes(method)) {
+        const route = url.pathname.slice(ROOT.length);
+        // Read-only mode still allows an ingestion preview (a pure read that
+        // mints no token); every other mutation stays blocked.
+        const isIngestPreview = Boolean(
+          ingest && method === "POST" && /^\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/ingestions\/preview$/.test(route),
+        );
+        if (readOnly && MUTATION_METHODS.includes(method) && !isIngestPreview) {
           throw new LearningWorkspaceError("LEARNING_READ_ONLY", "当前工作区不允许修改学习项目。", 403);
         }
-        const route = url.pathname.slice(ROOT.length);
 
         if (method === "GET" && route === "/capabilities") {
-          return sendJson(res, 200, { capabilities: service.capabilities() });
+          const capabilities = { ...service.capabilities() };
+          if (ingest) capabilities.ingest = ingest.capabilities();
+          return sendJson(res, 200, { capabilities });
         }
         if (method === "GET" && route === "") {
           const includeArchived = url.searchParams.get("includeArchived") === "1" || url.searchParams.get("includeArchived") === "true";
           return sendJson(res, 200, await service.list({ includeArchived }));
+        }
+
+        // Obsidian ingestion surface: target selection, preview/confirm and
+        // history. Matched before the generic workspace routes so suffixed
+        // paths never fall through to them.
+        const ingestMatch = /^\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/(targets|target|ingestions\/preview|ingestions\/confirm|ingestions)$/.exec(route);
+        if (ingest && ingestMatch) {
+          const [, id, action] = ingestMatch;
+          if (method === "GET" && action === "targets") {
+            return sendJson(res, 200, await ingest.listTargets({ workspaceId: id }));
+          }
+          if (method === "POST" && action === "target") {
+            requireMutable();
+            const body = requireObject(await bodyJson(req), new Set(["vaultId"]));
+            return sendJson(res, 200, await ingest.setTarget({ workspaceId: id, vaultId: body.vaultId }));
+          }
+          if (method === "POST" && action === "ingestions/preview") {
+            if (hosted) throw new LearningWorkspaceError("INGESTION_UNAVAILABLE", "托管模式下学习摄取不可用。", 404);
+            const body = requireObject(await bodyJson(req), new Set(["selectedContentTypes", "targetVaultId"]));
+            return sendJson(res, 200, await ingest.preview({
+              workspaceId: id,
+              selectedContentTypes: body.selectedContentTypes,
+              targetVaultId: body.targetVaultId,
+            }));
+          }
+          if (method === "POST" && action === "ingestions/confirm") {
+            requireMutable();
+            const body = requireObject(await bodyJson(req), new Set(["token", "conflictResolution"]));
+            return sendJson(res, 200, await ingest.confirm({ token: body.token, conflictResolution: body.conflictResolution }));
+          }
+          if (method === "GET" && action === "ingestions") {
+            return sendJson(res, 200, await ingest.listIngestions({ workspaceId: id }));
+          }
         }
 
         if (method === "GET" && WORKSPACE_ID.test(route.slice(1))) {

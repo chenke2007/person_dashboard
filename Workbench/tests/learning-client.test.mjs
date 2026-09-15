@@ -26,6 +26,13 @@ test("learning browser client emits exact request methods, urls, and JSON bodies
   await api.activateLearning(uuid("1"), 3);
   await api.archiveLearning(uuid("1"));
 
+  await api.loadLearningTargets(uuid("1"));
+  await api.setLearningTarget(uuid("1"), "a".repeat(64));
+  await api.previewLearningIngestion(uuid("1"), ["plan", "notes", `artifact:${uuid("9")}`], "a".repeat(64));
+  await api.confirmLearningIngestion(uuid("1"), "ingestion.token");
+  await api.confirmLearningIngestion(uuid("1"), "ingestion.token", "skip");
+  await api.loadLearningIngestions(uuid("1"));
+
   assert.deepEqual(calls.map(({ url, options }) => ({
     url,
     method: options.method,
@@ -41,6 +48,12 @@ test("learning browser client emits exact request methods, urls, and JSON bodies
     { url: "/api/learning/confirm", method: "POST", body: { token: "synthetic.token" } },
     { url: `/api/learning/${uuid("1")}/activate`, method: "POST", body: { expectedRevision: 3 } },
     { url: `/api/learning/${uuid("1")}/archive`, method: "POST", body: {} },
+    { url: `/api/learning/${uuid("1")}/targets`, method: "GET", body: undefined },
+    { url: `/api/learning/${uuid("1")}/target`, method: "POST", body: { vaultId: "a".repeat(64) } },
+    { url: `/api/learning/${uuid("1")}/ingestions/preview`, method: "POST", body: { selectedContentTypes: ["plan", "notes", `artifact:${uuid("9")}`], targetVaultId: "a".repeat(64) } },
+    { url: `/api/learning/${uuid("1")}/ingestions/confirm`, method: "POST", body: { token: "ingestion.token" } },
+    { url: `/api/learning/${uuid("1")}/ingestions/confirm`, method: "POST", body: { token: "ingestion.token", conflictResolution: "skip" } },
+    { url: `/api/learning/${uuid("1")}/ingestions`, method: "GET", body: undefined },
   ]);
 });
 

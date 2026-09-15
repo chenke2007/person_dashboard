@@ -236,6 +236,206 @@ test("backup provider contract round-trips, omits raw tokens and rejects unknown
   await assert.rejects(learning.confirm({ token: page.token }), isCode("CONFIRM_TOKEN_INVALID"));
 });
 
+const uuidFor = (char) => char.repeat(8) + "-2222-4333-8444-555555555555";
+const filePlanHashFor = (paths) => createHash("sha256").update(JSON.stringify(paths)).digest("hex");
+function contentBinding() {
+  return {
+    repositoryId: 101,
+    sourceCommitSha: commitSha("a"),
+    sourceUrl: "https://github.com/synthetic/repository-101",
+  };
+}
+function contentPlan() {
+  return {
+    learningGoal: "理解该仓库的核心架构",
+    expectedOutcome: "能够说明关键取舍并完成小实验",
+    milestones: [
+      { milestoneId: uuidFor("1"), title: "阅读架构文档", done: false },
+      { milestoneId: uuidFor("2"), title: "复现核心流程", done: false },
+    ],
+    currentMilestone: uuidFor("1"),
+  };
+}
+// Seeds a written ingestion record (selection + preview token + written record)
+// through the composed learning repository's ingestion store, returning the
+// raw preview token so tests can assert it never crosses a backup boundary.
+async function seedIngestion(learning, workspace) {
+  const workspaceId = workspace.workspaceId;
+  const targetVaultId = "a".repeat(64);
+  const ingestionBinding = { fingerprint: "f".repeat(64), workspaceId: "workspace-abc123" };
+  const selectedTypes = ["plan", "notes"];
+  const files = [
+    { relativePath: "Wiki/学习/synthetic-repository-101/学习计划.md", kind: "plan", artifactId: null, existed: false },
+    { relativePath: "Wiki/学习/synthetic-repository-101/学习笔记.md", kind: "notes", artifactId: null, existed: false },
+  ];
+  const planHash = filePlanHashFor(files.map((file) => file.relativePath).sort());
+  await learning.ingestion.setSelection({ workspaceId, targetVaultId, targetVaultDisplayName: "目标知识库", targetMaskedPath: "…/目标知识库" });
+  const preview = await learning.ingestion.issuePreview({
+    workspaceId,
+    binding: ingestionBinding,
+    sourceCommitSha: commitSha("a"),
+    contentRevision: 3,
+    selectedContentTypes: selectedTypes,
+    files,
+    filePlanHash: planHash,
+    target: { targetVaultId, targetVaultDisplayName: "目标知识库", targetMaskedPath: "…/目标知识库" },
+  });
+  await learning.ingestion.beginConfirm({
+    token: preview.token,
+    sourceCommitSha: commitSha("a"),
+    contentRevision: 3,
+    targetVaultId,
+    selectedContentTypes: selectedTypes,
+    filePlanHash: planHash,
+    binding: ingestionBinding,
+  });
+  await learning.ingestion.finishConfirm({
+    token: preview.token,
+    outcome: { status: "written", writtenFiles: files.map((file) => file.relativePath) },
+  });
+  return { token: preview.token };
+}
+
+test("bundle export carries token-free ingestion state and restore round-trips records and selections", async (t) => {
+  const { directory, learning } = await fixture(t);
+  const provider = learning.registerBackupProvider();
+  const { workspace } = await learning.createDraft(draftInput(101));
+  const page = await learning.preview({ workspaceId: workspace.workspaceId });
+  await learning.confirm({ token: page.token }); // active + receipt persisted in the store
+  // Authored content and a written ingestion record so the bundle carries all three stores.
+  await learning.content.savePlan({ workspaceId: workspace.workspaceId, expectedRevision: null, plan: contentPlan(), binding: contentBinding() });
+  await learning.content.saveNotes({ workspaceId: workspace.workspaceId, expectedRevision: 1, notes: { markdownText: "合成学习笔记正文" }, binding: contentBinding() });
+  await learning.content.addArtifact({ workspaceId: workspace.workspaceId, expectedRevision: 2, artifact: { type: "总结", title: "架构分析", markdownText: "合成产出正文" }, binding: contentBinding() });
+  const { token } = await seedIngestion(learning, workspace);
+
+  const exported = await provider.exportState();
+  assert.ok(exported.ingestionRecords, "bundle export must carry the ingestion store");
+  assert.ok(!Object.hasOwn(exported.ingestionRecords, "tokens"), "ingestion tokens must never be exported");
+  assert.equal(exported.ingestionRecords.records[0].status, "written");
+  assert.equal(JSON.stringify(exported).includes(token), false);
+
+  const backup = createWorkspaceBackup({ providers: [provider], now, secret: Buffer.alloc(32, 7) });
+  const bundle = await backup.exportBundle();
+  const previewImport = await backup.previewImport(bundle);
+  assert.deepEqual(previewImport.providers, [{ id: "learning", version: 1, count: 1 }]);
+  await backup.confirmImport(previewImport.token);
+
+  // Records, selections and authored content all came back with the restore.
+  const records = await learning.ingestion.listRecords(workspace.workspaceId);
+  assert.equal(records.records[0].status, "written");
+  const selection = await learning.ingestion.getSelection(workspace.workspaceId);
+  assert.equal(selection.selection.targetVaultDisplayName, "目标知识库");
+  const content = await learning.content.getContent({ workspaceId: workspace.workspaceId });
+  assert.equal(content.content.artifacts.length, 1);
+  assert.equal(content.content.notes.markdownText, "合成学习笔记正文");
+  // The pre-restore preview token was stripped with all token material.
+  assert.equal(await learning.ingestion.ownerOf({ token }), null);
+});
+
+test("restoring a legacy bundle without ingestion fields imports cleanly and preserves existing state", async (t) => {
+  const { directory, learning } = await fixture(t);
+  const provider = learning.registerBackupProvider();
+  const { workspace } = await learning.createDraft(draftInput(101));
+  const page = await learning.preview({ workspaceId: workspace.workspaceId });
+  await learning.confirm({ token: page.token });
+  await learning.content.saveNotes({ workspaceId: workspace.workspaceId, expectedRevision: 1, notes: { markdownText: "既有学习笔记" }, binding: contentBinding() });
+  const { token } = await seedIngestion(learning, workspace);
+  const beforeSelection = await learning.ingestion.getSelection(workspace.workspaceId);
+
+  // A legacy backup predates both the content and ingestion bundles.
+  const legacyExport = await provider.exportState();
+  delete legacyExport.contentRecords;
+  delete legacyExport.ingestionRecords;
+  const legacyProvider = {
+    id: "learning",
+    schemaVersion: 1,
+    optionalForImport: true,
+    exportState: async () => legacyExport,
+    validateImport: provider.validateImport,
+    replaceState: provider.replaceState,
+    stageImport: provider.stageImport,
+  };
+  const backup = createWorkspaceBackup({ providers: [legacyProvider], now, secret: Buffer.alloc(32, 7) });
+  const bundle = await backup.exportBundle();
+  const previewImport = await backup.previewImport(bundle);
+  assert.deepEqual(previewImport.providers.map(({ id }) => id), ["learning"]);
+  await backup.confirmImport(previewImport.token);
+
+  // Import succeeded and the absent stores were left untouched.
+  assert.equal((await learning.list()).workspaces.length, 1);
+  assert.deepEqual(await learning.ingestion.getSelection(workspace.workspaceId), beforeSelection);
+  assert.equal((await learning.ingestion.listRecords(workspace.workspaceId)).records[0].status, "written");
+  assert.equal((await learning.ingestion.ownerOf({ token })) !== null, true);
+  assert.equal((await learning.content.getContent({ workspaceId: workspace.workspaceId })).content.notes.markdownText, "既有学习笔记");
+});
+
+test("bundle import rejects ingestion token material and restores strip issued preview tokens", async (t) => {
+  const { directory, learning } = await fixture(t);
+  const provider = learning.registerBackupProvider();
+  const { workspace } = await learning.createDraft(draftInput(101));
+  const { token } = await seedIngestion(learning, workspace);
+
+  const exported = await provider.exportState();
+  const tainted = {
+    ...exported,
+    ingestionRecords: { ...exported.ingestionRecords, tokens: [{ tokenDigest: "0".repeat(64) }] },
+  };
+  await assert.rejects(
+    provider.validateImport(tainted),
+    (error) => error.code === "INGESTION_IMPORT_TOKEN_MATERIAL_REJECTED",
+  );
+  await assert.rejects(
+    provider.replaceState(tainted),
+    (error) => error.code === "INGESTION_IMPORT_TOKEN_MATERIAL_REJECTED",
+  );
+
+  // A legitimate token-free restore cannot resurrect the live preview token.
+  await provider.replaceState(await provider.exportState());
+  assert.equal(await learning.ingestion.ownerOf({ token }), null);
+});
+
+test("a later bundle commit failure rolls back learning, content and ingestion together", async (t) => {
+  const { directory, learning } = await fixture(t);
+  const provider = learning.registerBackupProvider();
+  const { workspace } = await learning.createDraft(draftInput(101));
+  const page = await learning.preview({ workspaceId: workspace.workspaceId });
+  await learning.confirm({ token: page.token }); // active + receipt persisted in the store
+  await learning.content.saveNotes({ workspaceId: workspace.workspaceId, expectedRevision: 1, notes: { markdownText: "既有学习笔记" }, binding: contentBinding() });
+  const { token } = await seedIngestion(learning, workspace);
+  const beforeSelection = await learning.ingestion.getSelection(workspace.workspaceId);
+  const beforeRecords = await learning.ingestion.listRecords(workspace.workspaceId);
+  await learning.createDraft(draftInput(102)); // live change after the snapshot
+
+  const failingProjects = {
+    id: "projects",
+    schemaVersion: 1,
+    optionalForImport: false,
+    exportState: async () => ({ version: 1, revision: 0, updatedAt: null, projects: [], columns: [] }),
+    validateImport: async (value) => structuredClone(value),
+    replaceState: async () => {},
+    async stageImport() {
+      return {
+        async commit() { throw new Error("synthetic later provider commit failure"); },
+        async rollback() {},
+        async cleanup() {},
+      };
+    },
+  };
+  const backup = createWorkspaceBackup({ providers: [provider, failingProjects], secret: Buffer.alloc(32, 7) });
+  const bundle = await backup.exportBundle();
+  await assert.rejects(
+    backup.confirmImport((await backup.previewImport(bundle)).token),
+    { code: "WORKSPACE_RESTORE_COMMIT_FAILED" },
+  );
+  // Live state (including the post-snapshot draft) survived the failed restore.
+  assert.deepEqual((await learning.list()).workspaces.map((w) => w.repositoryId).sort((a, b) => a - b), [101, 102]);
+  assert.deepEqual(await learning.ingestion.getSelection(workspace.workspaceId), beforeSelection);
+  assert.deepEqual(await learning.ingestion.listRecords(workspace.workspaceId), beforeRecords);
+  assert.equal((await learning.content.getContent({ workspaceId: workspace.workspaceId })).content.notes.markdownText, "既有学习笔记");
+  // Internal rollback restores the original store bytes, so the original preview token still authorizes.
+  assert.ok(await learning.ingestion.ownerOf({ token }));
+});
+
 test("independent instances and processes keep at most three active under concurrent confirms", async (t) => {
   const { directory } = await fixture(t);
   const first = createLearningRepository({ directory, now });

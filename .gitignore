@@ -36,3 +36,6 @@ secrets.*.json
 Workbench/config/attention.local.json
 个人知识库/10_raw/my-thoughts/reading-notes/*
 !个人知识库/10_raw/my-thoughts/reading-notes/.gitkeep
+
+# Local Obsidian vault allowlist for the learning ingestion picker (contains private root paths).
+Workbench/config/vaults.local.json

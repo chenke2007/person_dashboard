@@ -60,9 +60,12 @@ import { createRadarScheduler } from "./ai-radar/radar-scheduler.mjs";
 import { createRadarRoutes } from "./ai-radar/radar-routes.mjs";
 import { RadarRoutesError } from "./ai-radar/radar-errors.mjs";
 import { LearningWorkspaceError } from "./learning/learning-repository.mjs";
+import { LearningIngestionError } from "./learning/learning-ingestion-repository.mjs";
 import { createLearningRepository } from "./learning/learning-repository.mjs";
 import { createLearningService } from "./learning/learning-service.mjs";
 import { createLearningRoutes } from "./learning/learning-routes.mjs";
+import { createLearningIngestionService } from "./learning/learning-ingestion-service.mjs";
+import { createLearningVaultCatalog } from "./learning/learning-vault-catalog.mjs";
 import { createSummaryRepository, SummaryRepositoryError } from "./summaries/summary-repository.mjs";
 import { createRepositorySummaryService } from "./summaries/summary-service.mjs";
 import { createSummaryRoutes } from "./summaries/summary-routes.mjs";
@@ -846,6 +849,7 @@ export function workbenchApiPlugin({
   radarDirectory = null,
   radarOptions = {},
   summaryOptions = {},
+  learningIngestOptions = {},
   appDataRoot = process.env.LOCALAPPDATA || path.join(os.homedir(), ".local", "share"),
   hosted = process.env.VITE_WORKBENCH_HOSTED === "true",
 } = {}) {
@@ -1271,8 +1275,44 @@ export function workbenchApiPlugin({
     readable: !hosted,
     hosted,
   });
+  // Obsidian ingestion service over the same learning store directory. Vault
+  // candidates come only from the catalog (current vault + the ignored local
+  // `config/vaults.local.json` allowlist); the browser can never submit an
+  // absolute vault path because only catalog fingerprints resolve to roots.
+  const learningVaultCatalog = createLearningVaultCatalog({
+    vaultRoot,
+    configPath: learningIngestOptions.configPath ?? path.join(workbenchRoot, "config", "vaults.local.json"),
+    probeWritable: learningIngestOptions.probeWritable,
+  });
+  const learningIngestService = createLearningIngestionService({
+    learning: {
+      get: async (workspaceId, options = {}) => {
+        const repository = await learningRepository(options);
+        if (!repository) throw new LearningWorkspaceError("WORKSPACE_NOT_FOUND", "学习工作区不存在。", 404);
+        return repository.get(workspaceId);
+      },
+      content: {
+        getContent: async (input, options = {}) => {
+          const repository = await learningRepository(options);
+          if (!repository) throw new LearningWorkspaceError("WORKSPACE_NOT_FOUND", "学习工作区不存在。", 404);
+          return repository.content.getContent(input);
+        },
+      },
+    },
+    store: async (options) => {
+      const repository = await learningRepository(options);
+      return repository ? repository.ingestion : null;
+    },
+    catalog: learningVaultCatalog,
+    bound: (binding, operation) => boundWorkspace(binding, operation, LearningIngestionError),
+    captureBinding: captureWorkspaceBinding,
+    lookupBoundWorkspace: registry ? async (fingerprint) => registry.lookupVault({ fingerprint }) : null,
+    readOnly: projectReadOnly,
+    hosted,
+  });
   const learningRoutes = createLearningRoutes({
     service: learningService,
+    ingest: learningIngestService,
     readOnly: projectReadOnly,
     hosted,
   });

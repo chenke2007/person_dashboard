@@ -229,6 +229,7 @@ test("capabilities reflect runtime gates and never touch GitHub or a store", asy
   assert.equal(caps.response.status, 200);
   assert.deepEqual(caps.body.capabilities, {
     read: true, create: true, edit: true, preview: true, confirm: true, activate: true, archive: true,
+    ingest: { read: true, select: true, preview: true, confirm: true },
   });
   assert.equal(writable.github.calls.length, 0);
 
@@ -236,12 +237,14 @@ test("capabilities reflect runtime gates and never touch GitHub or a store", asy
   const roCaps = await request(readOnly.origin, "/api/learning/capabilities");
   assert.deepEqual(roCaps.body.capabilities, {
     read: true, create: false, edit: false, preview: false, confirm: false, activate: false, archive: false,
+    ingest: { read: true, select: false, preview: true, confirm: false },
   });
 
   const hosted = await startFixture(t, { hosted: true });
   const hCaps = await request(hosted.origin, "/api/learning/capabilities");
   assert.deepEqual(hCaps.body.capabilities, {
     read: false, create: false, edit: false, preview: false, confirm: false, activate: false, archive: false,
+    ingest: { read: false, select: false, preview: false, confirm: false },
   });
 });
 

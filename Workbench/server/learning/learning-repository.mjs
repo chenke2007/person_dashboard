@@ -3,6 +3,7 @@ import path from "node:path";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { createTicketLock } from "../workspace-state/ticket-lock.mjs";
 import { createLearningContentRepository } from "./learning-content-repository.mjs";
+import { createLearningIngestionRepository } from "./learning-ingestion-repository.mjs";
 import {
   CONFIRM_RECEIPT_TTL_MS,
   CONFIRM_TOKEN_TTL_MS,
@@ -95,6 +96,9 @@ export function createLearningRepository({ directory, now = () => new Date() } =
   // revision. It is composed here because this module owns the directory
   // resolution; the content deep module itself shares no lifecycle state.
   const content = createLearningContentRepository({ directory: root, now });
+  // The Obsidian ingestion store (target selections, preview token digests and
+  // ingestion history) shares the same directory with its own file and lock.
+  const ingestion = createLearningIngestionRepository({ directory: root, now });
 
   async function readRawStore() {
     if (!await ensureDirectory({ create: false })) return null;
@@ -349,10 +353,14 @@ export function createLearningRepository({ directory, now = () => new Date() } =
     const contentRecords = value && typeof value === "object" && !Array.isArray(value) && Object.hasOwn(value, "contentRecords")
       ? value.contentRecords
       : undefined;
+    const ingestionRecords = value && typeof value === "object" && !Array.isArray(value) && Object.hasOwn(value, "ingestionRecords")
+      ? value.ingestionRecords
+      : undefined;
     const learningValue = value && typeof value === "object" && !Array.isArray(value)
       ? { ...value }
       : value;
     if (contentRecords !== undefined) delete learningValue.contentRecords;
+    if (ingestionRecords !== undefined) delete learningValue.ingestionRecords;
     try {
       if (Buffer.byteLength(JSON.stringify(value)) > MAX_BYTES) fail("LEARNING_STORAGE_TOO_LARGE", "学习数据超过容量限制。", 413);
       const checkedLearning = await learningStoreSchema.parseAsync(learningValue);
@@ -366,12 +374,21 @@ export function createLearningRepository({ directory, now = () => new Date() } =
       if (contentRecords !== undefined) {
         checkedContent = await content.validateImport(contentRecords);
       }
-      const merged = { ...structuredClone(checkedLearning), ...(checkedContent ? { contentRecords: checkedContent } : {}) };
+      let checkedIngestion = null;
+      if (ingestionRecords !== undefined) {
+        checkedIngestion = await ingestion.validateImport(ingestionRecords);
+      }
+      const merged = {
+        ...structuredClone(checkedLearning),
+        ...(checkedContent ? { contentRecords: checkedContent } : {}),
+        ...(checkedIngestion ? { ingestionRecords: checkedIngestion } : {}),
+      };
       if (Buffer.byteLength(`${JSON.stringify(merged, null, 2)}\n`) > MAX_BYTES) fail("LEARNING_STORAGE_TOO_LARGE", "学习数据超过容量限制。", 413);
       return structuredClone(merged);
     } catch (error) {
       if (error instanceof LearningWorkspaceError) throw error;
       if (error?.name === "LearningContentError") throw error;
+      if (error?.name === "LearningIngestionError") throw error;
       if (value && typeof value === "object" && value.version !== undefined && value.version !== 1) {
         fail("LEARNING_STORAGE_VERSION_UNSUPPORTED", "学习数据版本不受支持。", 500);
       }
@@ -384,11 +401,14 @@ export function createLearningRepository({ directory, now = () => new Date() } =
       const store = await readStore();
       // Raw confirm tokens and their digests are authorization material and are
       // never exported; after restore a fresh preview is required. Content is
-      // carried under `contentRecords`, a field name the backup scanner does
-      // not treat as a Vault body.
+      // carried under `contentRecords` and ingestion under `ingestionRecords`,
+      // field names the backup scanner does not treat as a Vault body. The
+      // ingestion export strips its own token records, so a restore can never
+      // resurrect a stale preview token.
       const clean = { ...store, confirmations: [] };
       const contentRecords = await content.exportState();
-      return structuredClone({ ...clean, contentRecords });
+      const ingestionRecords = await ingestion.exportState();
+      return structuredClone({ ...clean, contentRecords, ingestionRecords });
     });
   }
 
@@ -407,11 +427,16 @@ export function createLearningRepository({ directory, now = () => new Date() } =
     const learningChecked = { ...merged };
     const contentRecords = Object.hasOwn(learningChecked, "contentRecords") ? learningChecked.contentRecords : undefined;
     if (contentRecords !== undefined) delete learningChecked.contentRecords;
+    const ingestionRecords = Object.hasOwn(learningChecked, "ingestionRecords") ? learningChecked.ingestionRecords : undefined;
+    if (ingestionRecords !== undefined) delete learningChecked.ingestionRecords;
     const body = `${JSON.stringify(learningChecked, null, 2)}\n`;
     if (Buffer.byteLength(body) > MAX_BYTES) fail("LEARNING_STORAGE_TOO_LARGE", "学习数据超过容量限制。", 413);
     // Lock order is fixed: the learning exclusive transaction first, then the
-    // content store's own exclusive transaction. Nothing ever acquires the
-    // content lock before the learning lock, so there is no cycle.
+    // content store's own exclusive transaction, then the ingestion store's.
+    // Nothing ever acquires a content or ingestion lock before the learning
+    // lock, so there is no cycle. Commit runs forward (learning, content,
+    // ingestion); rollback runs in reverse so a mid-chain failure restores all
+    // three stores to their pre-import bytes, never a half-migrated mix.
     const release = await acquireExclusiveTransaction();
     let stagedPath = null;
     let rollbackPath = null;
@@ -420,6 +445,7 @@ export function createLearningRepository({ directory, now = () => new Date() } =
     let preserveRollback = false;
     let closed = false;
     let contentTransaction = null;
+    let ingestionTransaction = null;
     try {
       const previous = await readRawStore();
       hadOriginal = previous !== null;
@@ -435,10 +461,14 @@ export function createLearningRepository({ directory, now = () => new Date() } =
       if (contentRecords !== undefined) {
         contentTransaction = await content.stageImport(contentRecords);
       }
+      if (ingestionRecords !== undefined) {
+        ingestionTransaction = await ingestion.stageImport(ingestionRecords);
+      }
     } catch (error) {
       if (stagedPath) await unlink(stagedPath).catch(() => {});
       if (rollbackPath) await unlink(rollbackPath).catch(() => {});
       if (contentTransaction) await contentTransaction.cleanup().catch(() => {});
+      if (ingestionTransaction) await ingestionTransaction.cleanup().catch(() => {});
       await release();
       throw error;
     }
@@ -450,10 +480,12 @@ export function createLearningRepository({ directory, now = () => new Date() } =
       stagedPath = null;
       committed = true;
       if (contentTransaction) await contentTransaction.commit();
+      if (ingestionTransaction) await ingestionTransaction.commit();
     }
     async function rollback() {
       if (closed || !committed) return;
       try {
+        if (ingestionTransaction) await ingestionTransaction.rollback();
         if (contentTransaction) await contentTransaction.rollback();
         await ensureDirectory();
         if (hadOriginal) {
@@ -474,6 +506,7 @@ export function createLearningRepository({ directory, now = () => new Date() } =
       if (stagedPath) await unlink(stagedPath).catch(() => {});
       if (rollbackPath && !preserveRollback) await unlink(rollbackPath).catch(() => {});
       if (contentTransaction) await contentTransaction.cleanup();
+      if (ingestionTransaction) await ingestionTransaction.cleanup();
       await release();
     }
 
@@ -499,7 +532,7 @@ export function createLearningRepository({ directory, now = () => new Date() } =
 
   return Object.freeze({
     createDraft, editDraft, preview, confirm, activate, list, get, archive,
-    content,
+    content, ingestion,
     registerBackupProvider, exportState, validateImport: validatedImport, replaceState,
   });
 }

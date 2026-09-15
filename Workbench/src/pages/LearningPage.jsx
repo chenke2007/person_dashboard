@@ -3,6 +3,7 @@ import { useNavigate, useParams } from "react-router-dom";
 import { PageHeader } from "../components/PageHeader";
 import { LearningContentEditor } from "../components/learning/LearningContentEditor";
 import { LearningDraftDialog } from "../components/learning/LearningDraftDialog";
+import { LearningIngestionPanel } from "../components/learning/LearningIngestionPanel";
 import {
   activateLearning,
   addLearningArtifact,
@@ -396,6 +397,11 @@ const onArchive = useCallback(async (workspace) => {
                 }}
               />
             ) : null}
+            <LearningIngestionPanel
+              caps={caps}
+              readOnly={!canEdit}
+              workspaceId={projectedDetail.workspaceId}
+            />
           </>
         ) : null}
         {editingWorkspace && editingRepository ? (

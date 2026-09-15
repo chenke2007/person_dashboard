@@ -24,3 +24,14 @@ export const saveLearningNotes = (workspaceId, expectedRevision, notes) =>
   command(`/api/learning/${encodeURIComponent(workspaceId)}/notes`, "PATCH", { expectedRevision, notes });
 export const addLearningArtifact = (workspaceId, expectedRevision, artifact) =>
   command(`/api/learning/${encodeURIComponent(workspaceId)}/artifacts`, "POST", { expectedRevision, artifact });
+export const loadLearningTargets = (workspaceId) => request(`/api/learning/${encodeURIComponent(workspaceId)}/targets`, { method: "GET" });
+export const setLearningTarget = (workspaceId, vaultId) =>
+  command(`/api/learning/${encodeURIComponent(workspaceId)}/target`, "POST", { vaultId });
+export const previewLearningIngestion = (workspaceId, selectedContentTypes, targetVaultId) =>
+  command(`/api/learning/${encodeURIComponent(workspaceId)}/ingestions/preview`, "POST", { selectedContentTypes, targetVaultId });
+export const confirmLearningIngestion = (workspaceId, token, conflictResolution) => {
+  const body = { token };
+  if (conflictResolution !== undefined) body.conflictResolution = conflictResolution;
+  return command(`/api/learning/${encodeURIComponent(workspaceId)}/ingestions/confirm`, "POST", body);
+};
+export const loadLearningIngestions = (workspaceId) => request(`/api/learning/${encodeURIComponent(workspaceId)}/ingestions`, { method: "GET" });

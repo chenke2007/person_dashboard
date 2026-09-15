@@ -146,6 +146,31 @@ async function startFixture(t, { activeCount = 0 } = {}) {
     const page = await learning.preview({ workspaceId: draft.workspace.workspaceId });
     const confirmed = await learning.confirm({ token: page.token });
     assert.equal(confirmed.confirmed, "active");
+    if (index === 0) {
+      // The first seeded workspace carries authored content and a stored
+      // ingestion target (the current temp vault), so the Obsidian panel on
+      // its detail page is in its normal interactive state.
+      const workspaceId = draft.workspace.workspaceId;
+      const binding = { repositoryId: id, sourceCommitSha: commitSha("a"), sourceUrl: `https://github.com/synthetic/repo-${id}` };
+      await learning.content.savePlan({
+        workspaceId,
+        expectedRevision: null,
+        plan: { learningGoal: "理解该仓库的核心架构", expectedOutcome: "能够说明关键取舍并完成小实验", milestones: [], currentMilestone: null },
+        binding,
+      });
+      await learning.content.saveNotes({
+        workspaceId,
+        expectedRevision: 1,
+        notes: { markdownText: "合成学习笔记正文，用于浏览器验收。" },
+        binding,
+      });
+      await learning.ingestion.setSelection({
+        workspaceId,
+        targetVaultId: fingerprint,
+        targetVaultDisplayName: "Synthetic Acceptance Vault",
+        targetMaskedPath: "…/vault",
+      });
+    }
   }
 
   const github = syntheticGitHub();
@@ -719,4 +744,57 @@ test("real browser: dialog scrolls, receives keyboard focus and restores focus a
   const restored = await evaluate(session, "document.activeElement === window.__learningTrigger && !!window.__learningTrigger");
   assert.equal(restored, true, "focus must return to the trigger after close");
   await screenshot(session, "11-focus-restored.png");
+});
+
+test("real browser: the Obsidian panel previews into the selected vault and confirm writes real files", async (t) => {
+  const fixture = await startFixture(t, { activeCount: 1 });
+  const seededList = await fixture.learning.list({ includeArchived: true });
+  const workspaceTarget = seededList.workspaces.find((item) => item.repositoryId === 102);
+  assert.ok(workspaceTarget, "the seeded active workspace must exist for the ingestion flow");
+
+  const page = await openPage(t, fixture.origin, `/learning/${workspaceTarget.workspaceId}`);
+  if (!page) return;
+  const { session } = page;
+
+  // The panel renders with the seeded target vault selected (the current temp
+  // vault) and the writable candidate marked with its vault status.
+  await waitFor(session, "!!document.querySelector('#learning-ingestion-target')", "ingestion target selector");
+  await waitFor(session, "[...document.querySelectorAll('#learning-ingestion-target option')].some((o) => o.textContent.includes('当前'))", "current-vault candidate");
+  await waitFor(session, "document.querySelector('#learning-ingestion-target').value.length === 64", "seeded target selected");
+  assert.equal(await evaluate(session, "document.querySelector('#learning-ingestion-target').value"), createHash("sha256").update(path.resolve(fixture.root, "vault").toLowerCase()).digest("hex"));
+
+  // Preview surfaces the plan/notes files with relative paths and content.
+  await clickText(session, "预览写入");
+  await waitFor(session, "document.body.textContent.includes('Wiki/学习/synthetic-repo-102/学习计划.md')", "plan preview path");
+  await waitFor(session, "document.body.textContent.includes('Wiki/学习/synthetic-repo-102/学习笔记.md')", "notes preview path");
+  await waitFor(session, "document.body.textContent.includes('理解该仓库的核心架构')", "plan content preview");
+  await waitFor(session, "[...document.querySelectorAll('button')].some((b) => b.textContent.includes('确认写入 Obsidian'))", "confirm button");
+  await screenshot(session, "12-ingestion-preview.png");
+
+  // Confirming writes the real files into the target vault and records the write.
+  await clickText(session, "确认写入 Obsidian");
+  await waitFor(session, "document.body.textContent.includes('已写入 Obsidian')", "write success");
+  await waitFor(session, "document.body.textContent.includes('synthetic-repo-102/学习计划.md')", "written file listed");
+  await screenshot(session, "13-ingestion-written.png");
+
+  const planFile = path.join(fixture.root, "vault", "Wiki", "学习", "synthetic-repo-102", "学习计划.md");
+  const notesFile = path.join(fixture.root, "vault", "Wiki", "学习", "synthetic-repo-102", "学习笔记.md");
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    if (existsSync(planFile) && existsSync(notesFile)) break;
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  assert.ok(existsSync(planFile), "学习计划.md must land in the target vault");
+  assert.ok(existsSync(notesFile), "学习笔记.md must land in the target vault");
+  assert.match(await readFile(planFile, "utf8"), /理解该仓库的核心架构/);
+  assert.match(await readFile(notesFile, "utf8"), /合成学习笔记/);
+
+  // The success never flips the learning workspace state: it stays active and
+  // the ingestion history records a written entry.
+  assert.equal((await fixture.learning.get(workspaceTarget.workspaceId)).workspace.state, "active");
+  const records = await fixture.learning.ingestion.listRecords(workspaceTarget.workspaceId);
+  assert.equal(records.records[0].status, "written");
+  assert.deepEqual(records.records[0].writtenFiles.map((file) => file.replace(/\\/g, "/")), [
+    "Wiki/学习/synthetic-repo-102/学习计划.md",
+    "Wiki/学习/synthetic-repo-102/学习笔记.md",
+  ]);
 });

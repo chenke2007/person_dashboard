@@ -6,7 +6,6 @@ const DISPLAY_NAMES = Object.freeze({
   "codex-sessions": "Codex 活动",
   "deep-reading": "深度阅读",
   "diagnosis-cases": "诊断案例",
-  douyin: "抖音资料",
   "my-thoughts": "我的想法",
   "personal-reviews": "个人复盘",
   podcasts: "播客",

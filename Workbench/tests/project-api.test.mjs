@@ -461,23 +461,6 @@ test("runtime advertises independent recovery capabilities for actual Obsidian a
   }
 });
 
-test("Obsidian overview hides Douyin metrics and their notices while default keeps missing-data semantics", async (t) => {
-  for (const profile of ["obsidian", "default"]) {
-    const fixture = await startFixture(t, { profile, readOnly: true });
-    const overview = (await request(fixture.origin, "/api/overview")).body;
-    assert.equal(overview.capabilities.douyin, profile === "default");
-    if (profile === "obsidian") {
-      assert.equal("publishedWorks" in overview.metrics, false);
-      assert.equal("totalPlays" in overview.metrics, false);
-      assert.deepEqual(overview.qualityNotices, []);
-    } else {
-      assert.equal(overview.metrics.publishedWorks, null);
-      assert.equal(overview.metrics.totalPlays, null);
-      assert.match(overview.qualityNotices.join(" "), /抖音数据源不可用/);
-    }
-  }
-});
-
 
 test("readonly backup of direct projects includes absent radar without creating its directory", async (t) => {
   const fixture = await startFixture(t, { readOnly: true });

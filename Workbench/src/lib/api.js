@@ -1,6 +1,5 @@
 import {
   fallbackCollections,
-  fallbackDouyinWorks,
   fallbackOverview,
   fallbackSearchResults,
 } from "../data/fallback";
@@ -327,81 +326,6 @@ export function loadGraph() {
     nodes: [],
     edges: [],
   });
-}
-
-export function loadDouyinWorks(params = {}) {
-  const search = new URLSearchParams();
-  Object.entries(params).forEach(([key, value]) => {
-    if (value) search.set(key, String(value));
-  });
-
-  return withFallback(
-    () => request(`/api/douyin/works?${search.toString()}`),
-    {
-      generatedAt: null,
-      total: fallbackDouyinWorks.length,
-      items: fallbackDouyinWorks,
-      comparableCount: null,
-      summary: {},
-      summaryLowerBounds: {},
-      contentLines: [],
-      formats: [],
-      roles: [],
-      monthly: [],
-      reviewStatusCounts: {
-        public: null,
-        private: null,
-      },
-      available: false,
-      sourcePath: null,
-      sourceUpdatedAt: null,
-      range: {
-        from: null,
-        to: null,
-      },
-      qualityIssues: [],
-      qualityFlags: ["data_service_unavailable"],
-      analytics: null,
-    },
-  );
-}
-
-export function loadSocialInsights() {
-  return withFallback(
-    () => request("/api/social-insights"),
-    {
-      available: false,
-      generatedAt: null,
-      total: null,
-      items: [],
-    },
-  );
-}
-
-export function loadSocialInsight(reportId) {
-  return withFallback(
-    () => request(`/api/social-insights/${encodeURIComponent(reportId)}`),
-    null,
-  );
-}
-
-export function loadSocialTrends() {
-  return withFallback(
-    () => request("/api/social-trends"),
-    {
-      available: false,
-      generatedAt: null,
-      total: null,
-      items: [],
-    },
-  );
-}
-
-export function loadSocialTrend(reportId) {
-  return withFallback(
-    () => request(`/api/social-trends/${encodeURIComponent(reportId)}`),
-    null,
-  );
 }
 
 export function refreshVault() {

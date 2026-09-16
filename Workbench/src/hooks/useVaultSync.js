@@ -7,8 +7,6 @@ function scopeForPath(pathname) {
   if (pathname.startsWith("/graph")) return "graph";
   if (pathname.startsWith("/topics")) return "topics";
   if (pathname.startsWith("/content")) return "content";
-  if (pathname.startsWith("/douyin")) return "douyin";
-  if (pathname.startsWith("/social-insights")) return "social_insights";
   if (pathname.startsWith("/system")) return "runtime";
   return "overview";
 }

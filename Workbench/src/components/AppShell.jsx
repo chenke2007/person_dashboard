@@ -1,7 +1,6 @@
 import { useEffect, useState } from "react";
 import { NavLink } from "react-router-dom";
 import {
-  IconBrandTiktok,
   IconBooks,
   IconBulb,
   IconBriefcase,
@@ -15,7 +14,6 @@ import {
   IconCapRounded,
   IconSearch,
   IconSettings,
-  IconSocial,
   IconStack2,
   IconTopologyStar3,
   IconX,
@@ -33,15 +31,11 @@ const primaryNavigation = [
   { to: "/materials", label: obsidianWorkbench ? "DBA 资料与脚本" : "素材层", icon: IconStack2 },
   { to: "/books", label: "书架", icon: IconBooks },
   { to: "/daily-hot", label: "每日热点", icon: IconRadar2 },
-  ...(localWorkbench
-    ? [{ to: "/social-insights", label: "社媒洞察", icon: IconSocial }]
-    : []),
   ...(localWorkbench ? [{ to: "/projects", label: "项目", icon: IconBriefcase }] : []),
   ...(localWorkbench ? [{ to: "/ai-radar", label: "AI 雷达", icon: IconRadar }] : []),
   ...(localWorkbench ? [{ to: "/learning", label: "学习任务", icon: IconCapRounded }] : []),
   { to: "/topics", label: "灵感库", icon: IconBulb },
   { to: "/content", label: "内容中心", icon: IconClipboardList },
-  { to: "/douyin", label: "抖音数据", icon: IconBrandTiktok },
 ];
 
 export function AppShell({ children, onOpenSearch, onOpenKnowledge, knowledgeOpen, sync }) {

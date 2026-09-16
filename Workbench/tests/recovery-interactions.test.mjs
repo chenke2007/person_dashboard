@@ -76,18 +76,4 @@ test("restoring archived tasks keeps the remaining archive visible and restorabl
   assert.equal((await repository.getProject(project.project.id)).tasks.length, 2);
 });
 
-for (const douyin of [false, true]) {
-  test(`overview renders metrics and source notices together (douyin=${douyin})`, async (t) => {
-    const data = { capabilities: { douyin }, metrics: { raw: 2, wiki: 3, publishedWorks: null, totalPlays: null }, wikiStatus: {}, recent: [], activity: [], qualityNotices: ["抖音 synthetic source notice"] };
-    const container = await mount(t, compiled.exports.overview(), async (url) => response(url === "/api/overview" ? data : { nodes: [], edges: [], stats: {} }));
-    await settle(() => container.textContent.includes("索引实时"));
-    if (douyin) {
-      assert.match(container.textContent, /已发布作品/); assert.match(container.textContent, /总播放/); assert.match(container.textContent, /synthetic source notice/);
-    } else {
-      assert.doesNotMatch(container.textContent, /已发布作品|总播放|synthetic source notice/);
-    }
-    assert.match(container.textContent, /WIKI 页面/);
-  });
-}
-
 test.after(async () => { await window.happyDOM.close(); });

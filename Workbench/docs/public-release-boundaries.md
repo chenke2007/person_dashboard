@@ -23,9 +23,7 @@ Demo records are authored from scratch. They use clearly fictional names, ids, d
 | Raw / reader / books | Included | Generic local-first capability |
 | Wiki concepts and frameworks | Included with synthetic examples | Demonstrates graph and knowledge views without personal judgment |
 | Daily Hot | Included with editable neutral defaults | Uses an anonymous public source |
-| Social insights | Read-only | Reports remain local and user-owned |
 | Topics and content | Included with synthetic examples | Demonstrates the content pipeline |
-| Douyin analytics | Included with schema and synthetic demo | Users must supply their own authorized export |
 | Brainstorm | Hidden | Depends on a private runtime Skill and writeback policy |
 | Run archive | Hidden | Commonly contains internal strategy and audit history |
 | WeChat Official Account | Hidden | Depends on account-specific data and operating boundaries |

@@ -35,12 +35,6 @@ import {
   materialsHomePayload,
 } from "./materials.mjs";
 import { booksPayload } from "./books.mjs";
-import {
-  getSocialInsight,
-  getSocialTrend,
-  listSocialInsights,
-  listSocialTrends,
-} from "./social-insights.mjs";
 import { validateVaultSelections } from "./security.mjs";
 import {
   WIKI_INGEST_STATUS,
@@ -483,7 +477,6 @@ function materialGroup(document) {
   const section = document.section;
   if (["articles", "deep-reading", "web-search"].includes(section)) return "reading";
   if (["my-thoughts", "personal-reviews", "diagnosis-cases"].includes(section)) return "personal";
-  if (section === "douyin") return "douyin";
   if (section === "codex-sessions") return "sessions";
   return "other";
 }
@@ -494,8 +487,7 @@ function collectionPayload(index, kind) {
       .filter(
         (item) =>
           item.layer === "raw" &&
-          !item.path.startsWith("10_raw/books/") &&
-          !item.path.startsWith("10_raw/social-insights/"),
+          !item.path.startsWith("10_raw/books/")
       )
       .map((item) => ({ ...item, group: materialGroup(item) }));
     const counts = Object.groupBy
@@ -509,7 +501,6 @@ function collectionPayload(index, kind) {
       groups: [
         groupDefinition("reading", "阅读与研究", counts.reading?.length ?? 0, "文章、深度阅读与网页研究"),
         groupDefinition("personal", "个人输入", counts.personal?.length ?? 0, "每日想法、读后思考与诊断案例"),
-        groupDefinition("douyin", "抖音证据", counts.douyin?.length ?? 0, "作品数据、截图与复盘证据包"),
         groupDefinition("sessions", "Codex 活动", counts.sessions?.length ?? 0, "每周 Session 轻量索引"),
       ],
       items,
@@ -596,42 +587,6 @@ function overviewPayload(index) {
       !topic.isFilmed &&
       !topic.isPublished,
   ).length;
-  const showDouyin = index.profile !== "obsidian";
-  const douyinAvailable = showDouyin && index.douyin.available === true;
-  const personalKnowledgeLine = douyinAvailable
-    ? index.douyin.contentLines.find((line) =>
-        String(line.name || "").includes("个人知识库"),
-      )
-    : null;
-  let cumulativePlays = 0;
-  const douyinTrend = [...(douyinAvailable ? index.douyin.monthly ?? [] : [])]
-    .filter((item) => item.month && Number.isFinite(item.views))
-    .sort((left, right) => String(left.month).localeCompare(String(right.month)))
-    .map((item) => {
-      cumulativePlays += item.views;
-      return {
-        date: item.month,
-        plays: item.views,
-        cumulativePlays,
-        workCount: item.workCount,
-      };
-    });
-  const douyinRange = index.douyin.range ?? {};
-  const douyinRangeLabel =
-    douyinRange.from && douyinRange.to
-      ? `${douyinRange.from} → ${douyinRange.to}`
-      : null;
-  const douyinQualityNotices = douyinAvailable
-    ? [
-        `来源：${index.douyin.sourcePath}；${index.douyin.comparableCount} 条可比作品${douyinRangeLabel ? `，作品发布时间范围 ${douyinRangeLabel}` : ""}。`,
-        "图表按作品发布月份汇总当前累计播放，不代表账号每日新增播放。",
-        ...(index.douyin.qualityIssues ?? [])
-          .slice(0, 3)
-          .map((issue) => `${issue.issue}${issue.affectedWorks ? `（${issue.affectedWorks}）` : ""}`),
-      ]
-    : [
-        `抖音数据源不可用：${index.douyin.sourcePath} 未找到或无法解析。`,
-      ];
   const filmedTopics = index.topics.items
     .filter((topic) => topic.isFilmed)
     .sort((left, right) => String(right.updatedAt).localeCompare(String(left.updatedAt)))
@@ -662,13 +617,11 @@ function overviewPayload(index) {
     "my-thoughts": "个人想法",
     "personal-reviews": "读后思考",
     "diagnosis-cases": "诊断案例",
-    douyin: "抖音证据",
   };
 
   return {
     generatedAt: index.generatedAt,
     demoMode: index.demoMode === true,
-    capabilities: { douyin: showDouyin },
     metrics: {
       raw: index.stats.rawFiles,
       wiki: index.stats.formalWikiPages,
@@ -676,19 +629,6 @@ function overviewPayload(index) {
       candidates: candidateCount,
       filmed: index.stats.filmedTopics,
       runs: index.stats.runs,
-      ...(showDouyin ? {
-        publishedWorks: douyinAvailable ? index.stats.douyinWorks : null,
-        totalPlays: douyinAvailable
-          ? index.douyin.summary.totalViews ?? null
-          : null,
-        profileVisits: douyinAvailable
-          ? index.douyin.summary.totalProfileVisits ?? null
-          : null,
-        profileVisitsIsLowerBound:
-          douyinAvailable &&
-          index.douyin.summaryLowerBounds.totalProfileVisits === true,
-        knowledgeContribution: personalKnowledgeLine?.viewSharePct ?? null,
-      } : {}),
     },
     wikiStatus: {
       active: index.wiki.countsByStatus.active ?? 0,
@@ -712,24 +652,7 @@ function overviewPayload(index) {
       meta: `更新于 ${String(topic.updatedAt || "").slice(5, 16).replace("T", " ")}`,
       dateTime: topic.updatedAt,
     })),
-    douyinTrend,
-    douyinAvailable,
-    douyinQualityFlags: index.douyin.qualityFlags ?? [],
-    douyinTrendTitle: douyinAvailable
-      ? `作品播放汇总 · 按发布月份${douyinRange.to ? `（截至 ${String(douyinRange.to).slice(0, 10)}）` : ""}`
-      : "抖音作品数据不可用",
-    dataProvenance: douyinAvailable
-      ? {
-          sourcePath: index.douyin.sourcePath,
-          sourceUpdatedAt: index.douyin.updatedAt,
-          comparableWorks: index.douyin.comparableCount,
-          range: douyinRange,
-          trendGrain: "作品发布月份",
-          trendMetric: "各月发布作品的当前累计播放",
-          isRealtime: false,
-        }
-      : null,
-    qualityNotices: showDouyin ? douyinQualityNotices : [],
+    qualityNotices: [],
   };
 }
 
@@ -2081,93 +2004,6 @@ export function workbenchApiPlugin({
 
           if (req.method === "GET" && url.pathname === "/api/graph") {
             return json(res, 200, graphPayload(await currentIndex()));
-          }
-
-          if (req.method === "GET" && url.pathname === "/api/douyin/works") {
-            const current = await currentIndex();
-            return json(res, 200, {
-              generatedAt: current.generatedAt,
-              total: current.douyin.works.length,
-              items: current.douyin.works,
-              comparableCount: current.douyin.comparableCount,
-              summary: current.douyin.summary,
-              summaryLowerBounds: current.douyin.summaryLowerBounds,
-              contentLines: current.douyin.contentLines,
-              formats: current.douyin.formats,
-              roles: current.douyin.roles,
-              monthly: current.douyin.monthly,
-              reviewStatusCounts: current.douyin.reviewStatusCounts,
-              available: current.douyin.available === true,
-              sourcePath: current.douyin.sourcePath,
-              sourceUpdatedAt: current.douyin.updatedAt,
-              range: current.douyin.range,
-              qualityIssues: current.douyin.qualityIssues,
-              qualityFlags: current.douyin.qualityFlags,
-              analytics: current.douyin.analytics,
-              demoMode: current.douyin.demoMode === true,
-            });
-          }
-
-          if (req.method === "GET" && url.pathname === "/api/social-insights") {
-            return json(res, 200, listSocialInsights(await currentIndex()));
-          }
-
-          if (req.method === "GET" && url.pathname === "/api/social-trends") {
-            return json(res, 200, listSocialTrends(await currentIndex()));
-          }
-
-          const socialInsightMatch = url.pathname.match(
-            /^\/api\/social-insights\/([^/]+)$/,
-          );
-          if (req.method === "GET" && socialInsightMatch) {
-            let reportId;
-            try {
-              reportId = decodeURIComponent(socialInsightMatch[1]);
-            } catch {
-              return json(res, 400, {
-                error: {
-                  code: "INVALID_SOCIAL_INSIGHT_ID",
-                  message: "社媒洞察报告 ID 无法解析。",
-                },
-              });
-            }
-            const report = getSocialInsight(await currentIndex(), reportId);
-            if (!report) {
-              return json(res, 404, {
-                error: {
-                  code: "SOCIAL_INSIGHT_NOT_FOUND",
-                  message: "社媒洞察报告不存在或已被移动。",
-                },
-              });
-            }
-            return json(res, 200, report);
-          }
-
-          const socialTrendMatch = url.pathname.match(
-            /^\/api\/social-trends\/([^/]+)$/,
-          );
-          if (req.method === "GET" && socialTrendMatch) {
-            let reportId;
-            try {
-              reportId = decodeURIComponent(socialTrendMatch[1]);
-            } catch {
-              return json(res, 400, {
-                error: {
-                  code: "INVALID_SOCIAL_TREND_ID",
-                  message: "社媒风向报告 ID 无法解析。",
-                },
-              });
-            }
-            const report = getSocialTrend(await currentIndex(), reportId);
-            if (!report) {
-              return json(res, 404, {
-                error: {
-                  code: "SOCIAL_TREND_NOT_FOUND",
-                  message: "社媒风向报告不存在或已被移动。",
-                },
-              });
-            }
-            return json(res, 200, report);
           }
 
           if (req.method === "POST" && url.pathname === "/api/refresh") {

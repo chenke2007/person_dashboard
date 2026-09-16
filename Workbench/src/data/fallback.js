@@ -4,11 +4,7 @@ const unavailableMetrics = {
   topics: null,
   candidates: null,
   filmed: null,
-  publishedWorks: null,
   runs: null,
-  totalPlays: null,
-  profileVisits: null,
-  profileVisitsIsLowerBound: false,
   knowledgeContribution: null,
 };
 
@@ -22,11 +18,6 @@ export const fallbackOverview = {
   },
   recent: [],
   activity: [],
-  douyinAvailable: false,
-  douyinQualityFlags: ["data_service_unavailable"],
-  douyinTrend: [],
-  douyinTrendTitle: "抖音作品数据",
-  dataProvenance: null,
   qualityNotices: ["本地数据服务不可用，未展示任何统计数据。"],
 };
 
@@ -38,5 +29,3 @@ export const fallbackCollections = {
 };
 
 export const fallbackSearchResults = [];
-
-export const fallbackDouyinWorks = [];

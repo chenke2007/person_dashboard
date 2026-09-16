@@ -32,6 +32,7 @@ secrets.*.json
 
 # Vite cache and isolated browser-verification scratch (retained, never committed).
 .vite/
+.superpowers/
 
 Workbench/config/attention.local.json
 个人知识库/10_raw/my-thoughts/reading-notes/*

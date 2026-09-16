@@ -755,8 +755,10 @@ test("read-only and hosted builds reject mutations before touching GitHub or the
   await assert.rejects(access(path.join(hosted.stateRoot, "learning")), { code: "ENOENT" });
 });
 
-test("preview completes its response inside a single bound store context", async () => {
+test("preview resolves its bound store through the WorkspaceRuntime learning entry", async () => {
   let creations = 0;
+  let captures = 0;
+  let guards = 0;
   const repository = {
     async preview({ workspaceId }) {
       return {
@@ -780,8 +782,21 @@ test("preview completes its response inside a single bound store context", async
     },
   };
   const service = createLearningService({
-    getLearning: async () => { creations += 1; return repository; },
-    bound: async (_binding, operation) => operation(),
+    runtime: {
+      async capture() {
+        captures += 1;
+        return { fingerprint: "a".repeat(64), workspaceId: "synthetic-runtime-workspace" };
+      },
+      async runBound({ operation }) {
+        guards += 1;
+        return operation();
+      },
+      async learning({ mode }) {
+        assert.equal(mode, "write");
+        creations += 1;
+        return repository;
+      },
+    },
     resolveRepository: null,
     getHeadCommit: null,
   });
@@ -789,9 +804,11 @@ test("preview completes its response inside a single bound store context", async
   assert.equal(preview.token, "synthetic-preview-token");
   assert.equal(preview.repositoryId, 101);
   assert.equal(preview.fullName, "synthetic/repository-101");
-  // The preview token/page and its source complement come from ONE store
-  // resolution, so a rebinding can never splice a second binding's data in.
+  // The preview token/page and its source complement come from ONE runtime
+  // store resolution inside its expected-binding guard.
   assert.equal(creations, 1);
+  assert.equal(captures, 1);
+  assert.equal(guards, 1);
 });
 
 test("unbound reads never create registry, workspace or learning state", async (t) => {
@@ -816,6 +833,7 @@ test("unbound reads never create registry, workspace or learning state", async (
   // The whole app-data registry store, workspace roots and learning dirs
   // remain absent: reads never bind or create on a fresh vault.
   await assert.rejects(access(registryDirectory), { code: "ENOENT" });
+  await assert.rejects(access(path.join(registryDirectory, "workspaces")), { code: "ENOENT" });
 });
 
 test("after unbound read-only queries, a legitimate mutation initializes the binding and store", async (t) => {

@@ -68,6 +68,7 @@ import { WorkspaceRegistryError } from "./workspace-state/workspace-registry.mjs
 import { createWorkspaceBackup } from "./workspace-state/workspace-backup.mjs";
 import { createWorkspaceRegistry } from "./workspace-state/workspace-registry.mjs";
 import { createWorkspaceRoutes } from "./workspace-state/workspace-routes.mjs";
+import { createWorkspaceRegistryAdapter, createWorkspaceRuntime } from "./workspace-state/workspace-runtime.mjs";
 
 const workbenchRoot = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const defaultVaultRoot = path.resolve(
@@ -799,6 +800,7 @@ export function workbenchApiPlugin({
   const createCollector = radarOptions.createCollector ?? createRadarCollector;
   const createGitHubClient = radarOptions.createGitHubClient ?? createGitHubRadarClient;
   const radarNow = radarOptions.now ?? (() => new Date());
+  let workspaceRuntime = null;
   let workspacePromise = null;
   async function currentWorkspace({ create = !projectReadOnly } = {}) {
     if (projectDirectory) {
@@ -863,14 +865,9 @@ export function workbenchApiPlugin({
     })();
     return radarRepositoryPromise;
   }
-  let learningRepositoryPromise = null;
-  async function learningRepository({ create = true } = {}) {
-    // Cache only a concrete repository, never a null resolution: a read on a
-    // fresh unbound vault must stay side-effect free, and the next legitimate
-    // mutation must still be able to bind and write.
-    if (learningRepositoryPromise) return learningRepositoryPromise;
+  async function learningRepositoryForWorkspace({ workspace, mode }) {
+    const create = mode === "write";
     let resolvedDirectory = null;
-    const workspace = await currentWorkspace({ create });
     if (!workspace) return null;
     const stateRoot = workspace.storageLayout === "legacy"
       ? path.join(workspaceRegistryDirectory, workspace.workspaceId)
@@ -884,9 +881,14 @@ export function workbenchApiPlugin({
         throw error;
       }
     }
-    const repository = createLearningRepository({ directory: resolvedDirectory, now: () => new Date() });
-    learningRepositoryPromise = repository;
-    return repository;
+    return createLearningRepository({ directory: resolvedDirectory, now: () => new Date() });
+  }
+  async function learningRepository({ create = true } = {}) {
+    if (workspaceRuntime) return workspaceRuntime.learning({ mode: create ? "write" : "read" });
+    return learningRepositoryForWorkspace({
+      workspace: await currentWorkspace({ create }),
+      mode: create ? "write" : "read",
+    });
   }
   let summaryRepositoryPromise = null;
   async function summaryRepository({ create = true } = {}) {
@@ -1143,15 +1145,38 @@ export function workbenchApiPlugin({
       },
     },
   });
+  const directWorkspaceRegistry = Object.freeze({
+    async resolve({ mode }) {
+      return currentWorkspace({ create: mode === "write" });
+    },
+    async capture() {
+      const workspace = await currentWorkspace({ create: true });
+      return workspace ? { fingerprint: vaultFingerprint, workspaceId: workspace.workspaceId } : null;
+    },
+    async runBound({ binding, operation }) {
+      const workspace = await currentWorkspace({ create: true });
+      return operation(Object.freeze({ binding, workspace }));
+    },
+  });
+  workspaceRuntime = createWorkspaceRuntime({
+    registry: registry
+      ? createWorkspaceRegistryAdapter({ registry, fingerprint: vaultFingerprint, label: () => path.basename(vaultRoot) })
+      : directWorkspaceRegistry,
+    repositories: {
+      learning: learningRepositoryForWorkspace,
+      summary: async ({ mode }) => summaryRepository({ create: mode === "write" }),
+      ingestion: async ({ mode }) => (await workspaceRuntime.learning({ mode }))?.ingestion ?? null,
+      radar: async ({ mode }) => (await radarContext({ create: mode === "write" }))?.repository ?? null,
+    },
+    backup: async () => workspaceBackup(),
+  });
   // Learning service + routes over the S1 store. The service owns the parts of
   // the flow that cross an adapter seam (radar identity, GitHub head commit) so
-  // the HTTP layer stays a thin router. Mutations run through a single
-  // withBoundWorkspace binding guard (registry lock) then the learning store's
-  // own lock; slow GitHub work happens before either lock. Reads resolve the
-  // current bound workspace without creating it and never create the learning
-  // directory. The createDraft flow captures its expected binding before the
-  // slow remote work, so a rebind landing mid-request rejects the write
-  // instead of silently continuing against the new workspace.
+  // the HTTP layer stays a thin router. WorkspaceRuntime captures bindings,
+  // guards mutations, and resolves read/write repositories. The createDraft
+  // flow captures its expected binding before slow remote work, so a rebind
+  // landing mid-request rejects the write instead of silently continuing
+  // against the new workspace.
   // Shared workspace-binding guard for radar-family mutations (learning,
   // summaries): withBoundWorkspace verifies the current binding under the
   // registry lock, then the operation proceeds; a rebind landing mid-request
@@ -1183,9 +1208,7 @@ export function workbenchApiPlugin({
     }
   };
   const learningService = createLearningService({
-    getLearning: (options) => learningRepository(options),
-    captureBinding: captureWorkspaceBinding,
-    bound: (binding, operation) => boundWorkspace(binding, operation, LearningWorkspaceError),
+    runtime: workspaceRuntime,
     resolveRepository: async (repositoryId) => {
       const store = await radarApi.getStore();
       if (!store) return null;
@@ -1334,7 +1357,6 @@ export function workbenchApiPlugin({
       workspacePromise = null;
       projectRepositoryPromise = null;
       radarRepositoryPromise = null;
-      learningRepositoryPromise = null;
       summaryRepositoryPromise = null;
       radarContextPromise = null;
       radarLifecyclePromise = null;

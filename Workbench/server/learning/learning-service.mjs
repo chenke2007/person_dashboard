@@ -12,35 +12,37 @@ function fail(code, message, status = 400) {
 export class LearningServiceError extends LearningWorkspaceError {}
 
 export function createLearningService({
-  getLearning = null,
-  learning = null,
-  bound = (binding, operation) => operation(),
-  captureBinding = null,
+  runtime = null,
   resolveRepository = null,
   getHeadCommit = null,
   mutatable = true,
   readable = true,
   hosted = false,
 } = {}) {
-  if (!getLearning && !learning) throw new TypeError("learning repository is required");
-  if (learning && typeof learning !== "object") throw new TypeError("learning repository must be an object");
-  if (getLearning && typeof getLearning !== "function") throw new TypeError("getLearning must be a function");
-  if (typeof bound !== "function") throw new TypeError("learning service requires a bound wrapper");
-  if (captureBinding !== null && typeof captureBinding !== "function") throw new TypeError("captureBinding must be a function or null");
+  if (!runtime || typeof runtime.capture !== "function" || typeof runtime.runBound !== "function" || typeof runtime.learning !== "function") {
+    throw new TypeError("learning service requires a workspace runtime");
+  }
   if (resolveRepository !== null && typeof resolveRepository !== "function") throw new TypeError("resolveRepository must be a function or null");
   if (getHeadCommit !== null && typeof getHeadCommit !== "function") throw new TypeError("getHeadCommit must be a function or null");
 
-  // Resolve the store lazily so hosted/read-only reads never bind or create a
-  // workspace before the capability gate has rejected the request. Reads ask
-  // for a read-only resolution (never binds a fresh vault, never creates the
-  // learning directory); mutations ask for a writable one.
-  const store = ({ create = true } = {}) => (getLearning ? getLearning({ create }) : Promise.resolve(learning));
+  // Resolve the store lazily through the runtime so hosted/read-only reads
+  // never bind or create a workspace before the capability gate has rejected
+  // the request. Reads use the explicit read mode; mutations use write.
+  const store = ({ mode = "write" } = {}) => runtime.learning({ mode });
 
-  const mutation = (operation, binding = null) => {
+  const mutation = async (operation, binding = null) => {
     if (hosted || !mutatable) {
       fail("LEARNING_READ_ONLY", "当前工作区不允许修改学习项目。", 403);
     }
-    return bound(binding, operation);
+    const expected = binding ?? await runtime.capture();
+    try {
+      return await runtime.runBound({ binding: expected, operation });
+    } catch (error) {
+      if (error?.code === "WORKSPACE_BINDING_CHANGED") {
+        fail("WORKSPACE_BINDING_CHANGED", "工作区绑定已改变，请重新加载后重试。", 409);
+      }
+      throw error;
+    }
   };
 
   function capabilities() {
@@ -57,14 +59,14 @@ export function createLearningService({
 
   async function list({ includeArchived = false } = {}) {
     if (hosted) fail("LEARNING_UNAVAILABLE", "托管模式下学习数据不可用。", 404);
-    const repository = await store({ create: false });
+    const repository = await store({ mode: "read" });
     if (!repository) return { workspaces: [] };
     return repository.list({ includeArchived });
   }
 
   async function get(workspaceId) {
     if (hosted) fail("LEARNING_UNAVAILABLE", "托管模式下学习数据不可用。", 404);
-    const repository = await store({ create: false });
+    const repository = await store({ mode: "read" });
     if (!repository) fail("WORKSPACE_NOT_FOUND", "学习工作区不存在。", 404);
     return repository.get(workspaceId);
   }
@@ -79,12 +81,12 @@ export function createLearningService({
     // the fingerprint; a rebind landing during getHeadCommit must reject the
     // stale request instead of re-resolving the new workspace and writing the
     // old draft into it.
-    const expected = captureBinding ? await captureBinding() : null;
+    const expected = await runtime.capture();
     // Idempotent path: an existing workspace for this repository is returned
     // without touching GitHub, so transient GitHub unavailability never breaks
     // the "already joined" case. The read uses read-only resolution so it can
     // never create state on its own.
-    const read = await store({ create: false });
+    const read = await store({ mode: "read" });
     if (read) {
       const existing = (await read.list({ includeArchived: true })).workspaces.find((workspace) => workspace.repositoryId === repositoryId);
       if (existing) return { workspace: existing };
@@ -104,7 +106,7 @@ export function createLearningService({
     const sourceCommitSha = typeof head?.sha === "string" && /^[a-f0-9]{40}$/.test(head.sha) ? head.sha : null;
     if (!sourceCommitSha) fail("LEARNING_GITHUB_UNAVAILABLE", "无法读取仓库最新提交，请稍后重试。", 503);
 
-    const workspace = await mutation(async () => (await store({ create: true })).createDraft({
+    const workspace = await mutation(async () => (await store({ mode: "write" })).createDraft({
       repositoryId,
       fullName: repository.fullName,
       sourceUrl: `https://github.com/${repository.fullName}`,
@@ -116,7 +118,7 @@ export function createLearningService({
   }
 
   async function editDraft({ workspaceId, expectedRevision, mission }) {
-    const result = await mutation(async () => (await store()).editDraft({ workspaceId, expectedRevision, mission }));
+    const result = await mutation(async () => (await store({ mode: "write" })).editDraft({ workspaceId, expectedRevision, mission }));
     // The store's editDraft already returns { workspace }; do not re-wrap.
     return result;
   }
@@ -126,7 +128,7 @@ export function createLearningService({
     // binding guard: leaving the guard between preview and get would let a
     // rebinding splice a second store's data into the same response.
     const { page, workspace } = await mutation(async () => {
-      const repository = await store({ create: true });
+      const repository = await store({ mode: "write" });
       const page = await repository.preview({ workspaceId });
       const { workspace } = await repository.get(workspaceId);
       return { page, workspace };
@@ -141,17 +143,17 @@ export function createLearningService({
 
   async function confirm({ token }) {
     if (typeof token !== "string" || !token) fail("LEARNING_INVALID_INPUT", "确认凭证无效。");
-    const result = await mutation(async () => (await store()).confirm({ token }));
+    const result = await mutation(async () => (await store({ mode: "write" })).confirm({ token }));
     return { confirmed: result.confirmed, workspace: result.workspace };
   }
 
   async function activate({ workspaceId, expectedRevision }) {
-    const result = await mutation(async () => (await store()).activate({ workspaceId, expectedRevision }));
+    const result = await mutation(async () => (await store({ mode: "write" })).activate({ workspaceId, expectedRevision }));
     return { workspace: result.workspace, outcome: result.outcome };
   }
 
   async function archive({ workspaceId }) {
-    const result = await mutation(async () => (await store()).archive(workspaceId));
+    const result = await mutation(async () => (await store({ mode: "write" })).archive(workspaceId));
     // The store's archive already returns { workspace }; do not re-wrap.
     return result;
   }
@@ -167,7 +169,7 @@ export function createLearningService({
 
   async function readContent(workspaceId, operation) {
     if (hosted) fail("LEARNING_UNAVAILABLE", "托管模式下学习数据不可用。", 404);
-    const repository = await store({ create: false });
+    const repository = await store({ mode: "read" });
     if (!repository) fail("WORKSPACE_NOT_FOUND", "学习工作区不存在。", 404);
     await repository.get(workspaceId);
     return operation(repository);
@@ -175,7 +177,7 @@ export function createLearningService({
 
   async function mutateContent({ workspaceId, expectedRevision, payload, save }) {
     return mutation(async () => {
-      const repository = await store();
+      const repository = await store({ mode: "write" });
       const { workspace } = await repository.get(workspaceId);
       const binding = {
         repositoryId: workspace.repositoryId,

@@ -417,14 +417,22 @@ test("a request captured against the old binding is rejected and never writes ne
 
   let refused = false;
   const service = createLearningService({
-    learning: oldStore,
-    bound: async (_binding, operation) => {
-      // First call composes normally; the retried stale save hits a rebind
-      // window and the guard refuses it exactly like withBoundWorkspace does.
-      if (refused) {
-        throw new LearningWorkspaceError("WORKSPACE_BINDING_CHANGED", "工作区绑定已改变，请重新加载后重试。", 409);
-      }
-      return operation();
+    runtime: {
+      async capture() {
+        return { fingerprint: "a".repeat(64), workspaceId: "synthetic-runtime-workspace" };
+      },
+      async runBound({ operation }) {
+        // First call composes normally; the retried stale save hits a rebind
+        // window and the guard refuses it exactly like withBoundWorkspace does.
+        if (refused) {
+          throw new LearningWorkspaceError("WORKSPACE_BINDING_CHANGED", "工作区绑定已改变，请重新加载后重试。", 409);
+        }
+        return operation();
+      },
+      async learning({ mode }) {
+        assert.equal(mode, "write");
+        return oldStore;
+      },
     },
     readable: true,
     mutatable: true,

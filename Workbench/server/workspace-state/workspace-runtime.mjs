@@ -1,3 +1,5 @@
+import { AsyncLocalStorage } from "node:async_hooks";
+
 export class WorkspaceRuntimeError extends Error {
   constructor(code, message) {
     super(message);
@@ -27,6 +29,10 @@ function workspaceBinding(workspace, fingerprint) {
   return { fingerprint, workspaceId: workspace.workspaceId };
 }
 
+function matchesBinding(workspace, binding) {
+  return workspace?.workspaceId === binding?.workspaceId && workspace?.fingerprint === binding?.fingerprint;
+}
+
 // Adapts the concrete persistence registry without making WorkspaceRuntime
 // depend on its Vault-specific fingerprint and label inputs. Callers that
 // already expose resolve/capture/runBound can inject that compatible contract
@@ -39,6 +45,16 @@ export function createWorkspaceRegistryAdapter({ registry, fingerprint, label } 
   if (typeof label !== "string" && typeof label !== "function") throw new TypeError("workspace registry adapter requires a label");
 
   const resolveLabel = () => typeof label === "function" ? label() : label;
+  const capturedWorkspaces = new WeakMap();
+
+  async function workspaceFor(binding) {
+    const captured = typeof binding === "object" && binding !== null ? capturedWorkspaces.get(binding) : null;
+    if (matchesBinding(captured, binding)) return captured;
+    if (typeof binding?.fingerprint !== "string") return null;
+    const workspace = await registry.lookupVault({ fingerprint: binding.fingerprint });
+    return matchesBinding(workspace, binding) ? workspace : null;
+  }
+
   return Object.freeze({
     async resolve({ mode } = {}) {
       requireMode(mode);
@@ -47,13 +63,17 @@ export function createWorkspaceRegistryAdapter({ registry, fingerprint, label } 
         : registry.resolveVault({ fingerprint, label: resolveLabel() });
     },
     async capture() {
-      return workspaceBinding(
-        await registry.resolveVault({ fingerprint, label: resolveLabel() }),
+      const workspace = await registry.resolveVault({ fingerprint, label: resolveLabel() });
+      const binding = workspaceBinding(
+        workspace,
         fingerprint,
       );
+      if (binding) capturedWorkspaces.set(binding, workspace);
+      return binding;
     },
     async runBound({ binding, operation } = {}) {
-      return registry.withBoundWorkspace(binding, operation);
+      const workspace = await workspaceFor(binding);
+      return registry.withBoundWorkspace(binding, () => operation(Object.freeze({ binding, workspace })));
     },
   });
 }
@@ -73,6 +93,7 @@ export function createWorkspaceRuntime({ registry, repositories, backup } = {}) 
   });
   const cache = new Map();
   const inFlight = new Map();
+  const boundContext = new AsyncLocalStorage();
 
   async function resolve({ mode } = {}) {
     requireMode(mode);
@@ -85,7 +106,10 @@ export function createWorkspaceRuntime({ registry, repositories, backup } = {}) 
 
   async function runBound({ binding, operation } = {}) {
     if (typeof operation !== "function") throw new TypeError("workspace runtime requires a bound operation");
-    return registry.runBound({ binding, operation });
+    return registry.runBound({
+      binding,
+      operation: (context) => boundContext.run(context ?? null, () => operation(context)),
+    });
   }
 
   function cacheKey(name, workspace) {
@@ -95,7 +119,7 @@ export function createWorkspaceRuntime({ registry, repositories, backup } = {}) 
 
   async function repository(name, { mode } = {}) {
     requireMode(mode);
-    const workspace = await resolve({ mode });
+    const workspace = boundContext.getStore()?.workspace ?? await resolve({ mode });
     if (!workspace) return null;
 
     const key = cacheKey(name, workspace);

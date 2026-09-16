@@ -3,6 +3,7 @@ import { access, mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 
 import { createWorkspaceRegistry } from "../server/workspace-state/workspace-registry.mjs";
 import { createWorkspaceRegistryAdapter, createWorkspaceRuntime } from "../server/workspace-state/workspace-runtime.mjs";
@@ -43,7 +44,7 @@ function fixture({ readWorkspace = null, repositoryFactories = {}, events = null
         error.code = "WORKSPACE_BINDING_CHANGED";
         throw error;
       }
-      return operation();
+      return operation({ binding: expected, workspace: current });
     },
     rebind() {
       current = binding("workspace-b", "b".repeat(64));
@@ -100,6 +101,55 @@ test("registry adapter maps the concrete registry read, write, capture, and guar
   assert.equal(workspace.workspaceId, "workspace-a");
   assert.deepEqual(expected, binding());
   assert.equal(result, "guarded");
+});
+
+test("real registry guard reuses captured context for a write without deadlocking and rejects a later rebind", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "workbench-runtime-"));
+  const directory = path.join(root, "registry");
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const rawRegistry = createWorkspaceRegistry({ directory, makeId: (() => {
+    const ids = ["workspace-a", "workspace-b"];
+    return () => ids.shift();
+  })() });
+  const fingerprint = "a".repeat(64);
+  const events = [];
+  const runtime = createWorkspaceRuntime({
+    registry: createWorkspaceRegistryAdapter({ registry: rawRegistry, fingerprint, label: "Synthetic Vault" }),
+    repositories: {
+      learning: async () => ({ name: "learning" }),
+      summary: async () => ({ name: "summary" }),
+      ingestion: async () => ({ name: "ingestion" }),
+      radar: async ({ workspace }) => {
+        events.push(`factory:${workspace.workspaceId}`);
+        return { name: "radar", workspace };
+      },
+    },
+    backup: async () => ({ name: "backup" }),
+  });
+  const captured = await runtime.capture();
+  events.push("capture", "slow-operation");
+
+  const complete = runtime.runBound({
+    binding: captured,
+    operation: ({ workspace }) => {
+      events.push(`guarded:${workspace.workspaceId}`);
+      return runtime.radar({ mode: "write" });
+    },
+  });
+  const result = await Promise.race([complete, delay(300).then(() => "timed-out")]);
+
+  assert.notEqual(result, "timed-out");
+  assert.equal(result.workspace.workspaceId, "workspace-a");
+  assert.deepEqual(events, ["capture", "slow-operation", "guarded:workspace-a", "factory:workspace-a"]);
+
+  const replacement = await rawRegistry.resolveVault({ fingerprint: "b".repeat(64), label: "Replacement Vault" });
+  const preview = await rawRegistry.previewRebind({ currentFingerprint: fingerprint, workspaceId: replacement.workspaceId });
+  await rawRegistry.confirmRebind({ token: preview.token });
+  await assert.rejects(
+    () => runtime.runBound({ binding: captured, operation: () => runtime.radar({ mode: "write" }) }),
+    hasCode("WORKSPACE_BINDING_CHANGED"),
+  );
+  assert.equal(events.filter((event) => event.startsWith("factory:")).length, 1);
 });
 
 test("read resolution does not create a workspace", async () => {
@@ -224,7 +274,7 @@ test("backup is an explicit factory entry and caches its successful result", asy
   assert.equal(fx.calls.write, 1);
 });
 
-test("a write flow captures before slow work and guards the factory immediately before construction", async () => {
+test("a write flow captures before slow work and constructs from the guarded context without resolving again", async () => {
   const events = [];
   const fx = fixture({ events });
   const runtime = createWorkspaceRuntime(fx);
@@ -236,7 +286,7 @@ test("a write flow captures before slow work and guards the factory immediately 
     operation: () => runtime.radar({ mode: "write" }),
   });
 
-  assert.deepEqual(events, ["capture", "slow-operation", "runBound", "resolve:write", "radar"]);
+  assert.deepEqual(events, ["capture", "slow-operation", "runBound", "radar"]);
 });
 
 test("invalid modes are rejected as stable domain errors", async () => {

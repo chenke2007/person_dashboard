@@ -883,12 +883,24 @@ export function workbenchApiPlugin({
     }
     return createLearningRepository({ directory: resolvedDirectory, now: () => new Date() });
   }
-  async function learningRepository({ create = true } = {}) {
-    if (workspaceRuntime) return workspaceRuntime.learning({ mode: create ? "write" : "read" });
-    return learningRepositoryForWorkspace({
+  // Ingestion remains on the pre-runtime adapter until Task 3 migrates its
+  // binding guard. Its guard holds the registry lock, so re-entering
+  // WorkspaceRuntime from inside it would attempt a second registry resolve
+  // and deadlock. Cache only concrete repositories and reset on rebind, as
+  // the original adapter did.
+  let legacyLearningRepositoryPromise = null;
+  async function legacyLearningRepository({ create = true } = {}) {
+    if (legacyLearningRepositoryPromise) return legacyLearningRepositoryPromise;
+    const repository = await learningRepositoryForWorkspace({
       workspace: await currentWorkspace({ create }),
       mode: create ? "write" : "read",
     });
+    if (repository) legacyLearningRepositoryPromise = repository;
+    return repository;
+  }
+  async function learningRepository({ create = true } = {}) {
+    if (!workspaceRuntime) return legacyLearningRepository({ create });
+    return workspaceRuntime.learning({ mode: create ? "write" : "read" });
   }
   let summaryRepositoryPromise = null;
   async function summaryRepository({ create = true } = {}) {
@@ -1233,20 +1245,20 @@ export function workbenchApiPlugin({
   const learningIngestService = createLearningIngestionService({
     learning: {
       get: async (workspaceId, options = {}) => {
-        const repository = await learningRepository(options);
+        const repository = await legacyLearningRepository(options);
         if (!repository) throw new LearningWorkspaceError("WORKSPACE_NOT_FOUND", "学习工作区不存在。", 404);
         return repository.get(workspaceId);
       },
       content: {
         getContent: async (input, options = {}) => {
-          const repository = await learningRepository(options);
+          const repository = await legacyLearningRepository(options);
           if (!repository) throw new LearningWorkspaceError("WORKSPACE_NOT_FOUND", "学习工作区不存在。", 404);
           return repository.content.getContent(input);
         },
       },
     },
     store: async (options) => {
-      const repository = await learningRepository(options);
+      const repository = await legacyLearningRepository(options);
       return repository ? repository.ingestion : null;
     },
     catalog: learningVaultCatalog,
@@ -1357,6 +1369,7 @@ export function workbenchApiPlugin({
       workspacePromise = null;
       projectRepositoryPromise = null;
       radarRepositoryPromise = null;
+      legacyLearningRepositoryPromise = null;
       summaryRepositoryPromise = null;
       radarContextPromise = null;
       radarLifecyclePromise = null;

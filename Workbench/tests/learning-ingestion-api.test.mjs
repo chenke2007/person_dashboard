@@ -38,13 +38,24 @@ async function listenOnFetchSafePort(server) {
   }
 }
 
-async function request(origin, route, { method = "GET", body, headers } = {}) {
+async function request(origin, route, { method = "GET", body, headers, signal } = {}) {
   const response = await fetch(`${origin}${route}`, {
     method,
     headers: body === undefined ? headers : { "Content-Type": "application/json", ...headers },
     body: body === undefined ? undefined : JSON.stringify(body),
+    signal,
   });
   return { response, body: await response.json() };
+}
+
+async function requestWithin(origin, route, options, milliseconds = 1_000) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), milliseconds);
+  try {
+    return await request(origin, route, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 const defaultMission = { goal: "understand-architecture", notes: "Synthetic ingestion study task" };
@@ -296,6 +307,30 @@ test("a full multi-file confirm writes plan, notes and each artifact into the ta
   assert.match(await readFile(path.join(base, "学习计划.md"), "utf8"), /# 学习计划/);
   const artifactFiles = (await (await import("node:fs/promises")).readdir(base)).filter((name) => name.startsWith("学习产出-"));
   assert.equal(artifactFiles.length, 2);
+});
+
+test("real registry ingestion writes complete without re-entering its binding guard", async (t) => {
+  const fixture = await startFixture(t, { configVaults: [{ name: "第二知识库" }], seed: seedLearningWorkspace });
+  const { origin, workspaceId, configVaultId } = fixture;
+
+  const selected = await requestWithin(origin, `/api/learning/${workspaceId}/target`, {
+    method: "POST",
+    body: { vaultId: configVaultId },
+  });
+  assert.equal(selected.response.status, 200);
+
+  const preview = await requestWithin(origin, `/api/learning/${workspaceId}/ingestions/preview`, {
+    method: "POST",
+    body: { selectedContentTypes: ["plan", "notes"] },
+  });
+  assert.equal(preview.response.status, 200);
+
+  const confirmed = await requestWithin(origin, `/api/learning/${workspaceId}/ingestions/confirm`, {
+    method: "POST",
+    body: { token: preview.body.previewToken },
+  });
+  assert.equal(confirmed.response.status, 200);
+  assert.equal(confirmed.body.ingestion.status, "written");
 });
 
 test("the same preview token confirms idempotently without re-writing files", async (t) => {

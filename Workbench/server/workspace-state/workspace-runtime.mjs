@@ -22,6 +22,42 @@ function requireFactory(name, factory) {
   return factory;
 }
 
+function workspaceBinding(workspace, fingerprint) {
+  if (!workspace || typeof workspace.workspaceId !== "string" || !workspace.workspaceId) return null;
+  return { fingerprint, workspaceId: workspace.workspaceId };
+}
+
+// Adapts the concrete persistence registry without making WorkspaceRuntime
+// depend on its Vault-specific fingerprint and label inputs. Callers that
+// already expose resolve/capture/runBound can inject that compatible contract
+// directly instead.
+export function createWorkspaceRegistryAdapter({ registry, fingerprint, label } = {}) {
+  if (!registry || typeof registry.lookupVault !== "function" || typeof registry.resolveVault !== "function" || typeof registry.withBoundWorkspace !== "function") {
+    throw new TypeError("workspace registry adapter requires lookupVault, resolveVault, and withBoundWorkspace");
+  }
+  if (typeof fingerprint !== "string" || !fingerprint) throw new TypeError("workspace registry adapter requires a fingerprint");
+  if (typeof label !== "string" && typeof label !== "function") throw new TypeError("workspace registry adapter requires a label");
+
+  const resolveLabel = () => typeof label === "function" ? label() : label;
+  return Object.freeze({
+    async resolve({ mode } = {}) {
+      requireMode(mode);
+      return mode === "read"
+        ? registry.lookupVault({ fingerprint })
+        : registry.resolveVault({ fingerprint, label: resolveLabel() });
+    },
+    async capture() {
+      return workspaceBinding(
+        await registry.resolveVault({ fingerprint, label: resolveLabel() }),
+        fingerprint,
+      );
+    },
+    async runBound({ binding, operation } = {}) {
+      return registry.withBoundWorkspace(binding, operation);
+    },
+  });
+}
+
 export function createWorkspaceRuntime({ registry, repositories, backup } = {}) {
   if (!registry || typeof registry.resolve !== "function" || typeof registry.capture !== "function" || typeof registry.runBound !== "function") {
     throw new TypeError("workspace runtime requires a registry with resolve, capture, and runBound");
@@ -36,6 +72,7 @@ export function createWorkspaceRuntime({ registry, repositories, backup } = {}) 
     backup: requireFactory("backup", backup),
   });
   const cache = new Map();
+  const inFlight = new Map();
 
   async function resolve({ mode } = {}) {
     requireMode(mode);
@@ -51,16 +88,31 @@ export function createWorkspaceRuntime({ registry, repositories, backup } = {}) 
     return registry.runBound({ binding, operation });
   }
 
+  function cacheKey(name, workspace) {
+    if (typeof workspace?.workspaceId !== "string" || !workspace.workspaceId) return null;
+    return JSON.stringify([name, workspace.workspaceId, workspace.fingerprint ?? null]);
+  }
+
   async function repository(name, { mode } = {}) {
     requireMode(mode);
-    if (cache.has(name)) return cache.get(name);
-
     const workspace = await resolve({ mode });
     if (!workspace) return null;
 
-    const instance = await factories[name]({ workspace, mode });
-    if (instance !== null && instance !== undefined) cache.set(name, instance);
-    return instance ?? null;
+    const key = cacheKey(name, workspace);
+    if (key && cache.has(key)) return cache.get(key);
+    if (key && inFlight.has(key)) return inFlight.get(key);
+
+    const construction = Promise.resolve(factories[name]({ workspace, mode }))
+      .then((instance) => {
+        if (key && instance !== null && instance !== undefined) cache.set(key, instance);
+        return instance ?? null;
+      });
+    if (key) inFlight.set(key, construction);
+    try {
+      return await construction;
+    } finally {
+      if (key && inFlight.get(key) === construction) inFlight.delete(key);
+    }
   }
 
   return Object.freeze({

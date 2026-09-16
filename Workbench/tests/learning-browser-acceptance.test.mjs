@@ -644,6 +644,15 @@ test("real browser: desktop and narrow viewports keep controls visible, clickabl
   await detail.session.send("Page.navigate", { url: `${fixture.origin}/learning/${encodeURIComponent(workspaceTarget.workspaceId)}` });
   await waitFor(detail.session, "document.body.textContent.includes('synthetic/repo-102')", "narrow detail");
   await waitFor(detail.session, "[...document.querySelectorAll('button')].some((b) => b.textContent.trim() === '归档学习')", "detail archive button");
+  // The Obsidian panel resolves its target vault asynchronously; until
+  // loadTargets() returns, the 预览写入 button is disabled (no selected
+  // vault). Wait on the real DOM state before asserting every control is
+  // actionable — never relax the disabled check in viewportChecks.
+  await waitFor(detail.session, `(() => {
+    const target = document.querySelector("#learning-ingestion-target");
+    const preview = document.querySelector(".learning-ingestion__preview");
+    return Boolean(target && !target.disabled && preview && !preview.disabled);
+  })()`, "ingestion targets loaded and preview writable");
   await viewportChecks(detail.session, "narrow detail");
   await screenshot(detail.session, "09-narrow-detail.png");
 

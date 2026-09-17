@@ -5,10 +5,92 @@ import { RadarRepositoryError } from "../server/ai-radar/radar-repository.mjs";
 import { createRadarRoutes } from "../server/ai-radar/radar-routes.mjs";
 import { workbenchApiPlugin } from "../server/vite-plugin-workbench.mjs";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { access, mkdir, mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createWorkspaceRegistry } from "../server/workspace-state/workspace-registry.mjs";
+import { createRadarRepository } from "../server/ai-radar/radar-repository.mjs";
+
+async function runtimeRadarFixture(t, { prebind = true, readOnly = false, github } = {}) {
+  const root = await mkdtemp(path.join(os.tmpdir(), "workbench-radar-runtime-"));
+  const vaultRoot = path.join(root, "vault");
+  const appDataRoot = path.join(root, "app-data");
+  const directory = path.join(appDataRoot, "PersonalAIWorkbench");
+  await mkdir(vaultRoot);
+  const registry = createWorkspaceRegistry({ directory });
+  const fingerprint = createHash("sha256").update(path.resolve(vaultRoot).toLowerCase()).digest("hex");
+  const workspace = prebind ? await registry.resolveVault({ fingerprint, label: "Synthetic radar workspace" }) : null;
+  const plugin = workbenchApiPlugin({ vaultRoot, appDataRoot, readOnly, radarOptions: { github } });
+  let handle;
+  await plugin.configureServer({
+    watcher: { on() {}, off() {} },
+    httpServer: null,
+    middlewares: { use(handler) { handle = handler; } },
+    config: { logger: { error() {} } },
+  });
+  t.after(async () => {
+    await plugin.closeBundle();
+    await rm(root, { recursive: true, force: true });
+  });
+  return { plugin, directory, registry, workspace, routes: { handle: (req, res) => handle(req, res, () => {}) } };
+}
+
+test("radar GET routes do not create an unbound workspace in writable or read-only mode", async (t) => {
+  for (const readOnly of [false, true]) {
+    const fixture = await runtimeRadarFixture(t, { prebind: false, readOnly });
+    for (const [route, status] of [["", 404], ["/preferences", 404], ["/status", 200], ["/capabilities", 200]]) {
+      assert.equal((await request(fixture.routes, "GET", `/api/ai-radar${route}`)).status, status);
+    }
+    await assert.rejects(access(fixture.directory), { code: "ENOENT" });
+  }
+});
+
+test("radar mutations preserve binding-changed errors from the real registry", { timeout: 30000 }, async (t) => {
+  const fixture = await runtimeRadarFixture(t);
+  const repository = createRadarRepository({ directory: path.join(fixture.directory, "workspaces", fixture.workspace.workspaceId, "ai-radar") });
+  const before = await repository.exportState();
+  const preview = await fixture.registry.previewRebind({ currentFingerprint: "b".repeat(64), workspaceId: fixture.workspace.workspaceId });
+  await fixture.registry.confirmRebind({ token: preview.token });
+
+  for (const [method, route, body] of [
+    ["POST", "/preferences", { kind: "topic", value: "synthetic", direction: "more", repositoryId: null }],
+    ["PATCH", "/schedule", { time: "10:00" }],
+    ["POST", "/collect", undefined],
+  ]) {
+    const response = await request(fixture.routes, method, `/api/ai-radar${route}`, body);
+    assert.equal(response.status, 409, `${method} ${route}`);
+    assert.equal(response.body.error.code, "WORKSPACE_BINDING_CHANGED");
+  }
+  assert.deepEqual(await repository.exportState(), before);
+  assert.equal((await fixture.registry.listWorkspaces()).length, 1);
+});
+
+test("radar collection rejects a rebind during GitHub work without committing its result", { timeout: 30000 }, async (t) => {
+  let release;
+  let entered;
+  const ready = new Promise((resolve) => { entered = resolve; });
+  const gate = new Promise((resolve) => { release = resolve; });
+  const fixture = await runtimeRadarFixture(t, { github: {
+    async discoverCandidates() {
+      entered();
+      await gate;
+      return { repositories: [], errors: [], partial: false, retryAt: null, truncated: false };
+    },
+    async getRepositories() { return { repositories: [], errors: [], partial: false, retryAt: null, truncated: false }; },
+  } });
+  t.after(() => release());
+  const collecting = request(fixture.routes, "POST", "/api/ai-radar/collect");
+  await ready;
+  const repository = createRadarRepository({ directory: path.join(fixture.directory, "workspaces", fixture.workspace.workspaceId, "ai-radar") });
+  const before = await repository.exportState();
+  const preview = await fixture.registry.previewRebind({ currentFingerprint: "b".repeat(64), workspaceId: fixture.workspace.workspaceId });
+  await fixture.registry.confirmRebind({ token: preview.token });
+  release();
+  const result = await collecting;
+  assert.equal(result.status, 409);
+  assert.equal(result.body.error.code, "WORKSPACE_BINDING_CHANGED");
+  assert.deepEqual(await repository.exportState(), before);
+});
 
 function safeDashboard() {
   return {

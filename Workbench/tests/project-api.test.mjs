@@ -486,3 +486,37 @@ test("readonly backup of bound workspace does not create missing radar state", a
   assert.deepEqual(backup.body.providers["ai-radar"].data.repositories, []);
   await assert.rejects(access(radarDirectory), { code: "ENOENT" });
 });
+
+test("backup exports of an unbound workspace never initialize registry state", async (t) => {
+  for (const readOnly of [false, true]) {
+    const fixture = await startFixture(t, { readOnly, useWorkspaceRegistry: true });
+    const result = await request(fixture.origin, "/api/workspace/backup");
+    assert.equal(result.response.status, 404);
+    assert.equal(result.body.error.code, "WORKSPACE_NOT_FOUND");
+    await assert.rejects(access(path.join(fixture.appDataRoot, "PersonalAIWorkbench")), { code: "ENOENT" });
+  }
+});
+
+test("backup confirmation rejects a registry rebind after preview without restoring either workspace", { timeout: 60000 }, async (t) => {
+  const fixture = await startFixture(t, { useWorkspaceRegistry: true });
+  await request(fixture.origin, "/api/projects", { method: "POST", body: { key: "ONE", name: "Synthetic original project" } });
+  const exported = await request(fixture.origin, "/api/workspace/backup");
+  assert.equal(exported.response.status, 200);
+  const preview = await request(fixture.origin, "/api/workspace/restore/preview", { method: "POST", body: exported.body });
+  assert.equal(preview.response.status, 200);
+  await request(fixture.origin, "/api/projects", { method: "POST", body: { key: "TWO", name: "Synthetic retained project" } });
+  const directory = path.join(fixture.appDataRoot, "PersonalAIWorkbench");
+  const registry = createWorkspaceRegistry({ directory });
+  const moved = await registry.previewRebind({ currentFingerprint: "b".repeat(64), workspaceId: exported.body.workspaceId });
+  await registry.confirmRebind({ token: moved.token });
+  const before = await readFile(path.join(directory, "workspaces", exported.body.workspaceId, "projects", "projects.json"), "utf8");
+
+  const confirmed = await request(fixture.origin, "/api/workspace/restore/confirm", { method: "POST", body: { token: preview.body.token } });
+  assert.equal(confirmed.response.status, 409);
+  assert.equal(confirmed.body.error.code, "WORKSPACE_BINDING_CHANGED");
+  const changed = await request(fixture.origin, "/api/projects", { method: "POST", body: { key: "THREE", name: "Synthetic stale mutation" } });
+  assert.equal(changed.response.status, 409);
+  assert.equal(changed.body.error.code, "WORKSPACE_BINDING_CHANGED");
+  assert.equal(await readFile(path.join(directory, "workspaces", exported.body.workspaceId, "projects", "projects.json"), "utf8"), before);
+  assert.equal((await registry.listWorkspaces()).length, 1);
+});

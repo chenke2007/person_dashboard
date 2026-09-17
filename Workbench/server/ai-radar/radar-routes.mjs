@@ -1,5 +1,7 @@
 import { RadarRepositoryError } from "./radar-repository.mjs";
 import { RadarRoutesError } from "./radar-errors.mjs";
+import { WorkspaceRegistryError } from "../workspace-state/workspace-registry.mjs";
+import { WorkspaceRuntimeError } from "../workspace-state/workspace-runtime.mjs";
 
 const ROOT = "/api/ai-radar";
 const DECISION = /^\/repositories\/([1-9]\d*)\/decision$/;
@@ -37,6 +39,9 @@ async function bodyJson(req, maximum = MAX_BODY_BYTES) {
 }
 
 function publicError(error) {
+  if ((error instanceof WorkspaceRegistryError || error instanceof WorkspaceRuntimeError) && error.code === "WORKSPACE_BINDING_CHANGED") {
+    return { code: "WORKSPACE_BINDING_CHANGED", message: "工作区绑定已改变，请重新加载后重试。", status: 409 };
+  }
   if (error instanceof RadarRepositoryError || error instanceof RadarRoutesError) {
     const status = Number.isInteger(error.status) && error.status >= 400 && error.status <= 599 ? error.status : 500;
     return { code: error.code, message: error.message, status };

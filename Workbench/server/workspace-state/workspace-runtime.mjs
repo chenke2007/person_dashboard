@@ -62,8 +62,11 @@ export function createWorkspaceRegistryAdapter({ registry, fingerprint, label } 
         ? registry.lookupVault({ fingerprint })
         : registry.resolveVault({ fingerprint, label: resolveLabel() });
     },
-    async capture() {
-      const workspace = await registry.resolveVault({ fingerprint, label: resolveLabel() });
+    async capture({ mode = "write" } = {}) {
+      requireMode(mode);
+      const workspace = mode === "read"
+        ? await registry.lookupVault({ fingerprint })
+        : await registry.resolveVault({ fingerprint, label: resolveLabel() });
       const binding = workspaceBinding(
         workspace,
         fingerprint,
@@ -100,8 +103,9 @@ export function createWorkspaceRuntime({ registry, repositories, backup } = {}) 
     return registry.resolve({ mode });
   }
 
-  async function capture() {
-    return registry.capture();
+  async function capture({ mode = "write" } = {}) {
+    requireMode(mode);
+    return registry.capture({ mode });
   }
 
   async function runBound({ binding, operation } = {}) {

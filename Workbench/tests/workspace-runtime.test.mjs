@@ -103,6 +103,26 @@ test("registry adapter maps the concrete registry read, write, capture, and guar
   assert.equal(result, "guarded");
 });
 
+test("read capture never creates registry state and provides a non-reentrant bound repository context", { timeout: 5000 }, async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "workbench-runtime-read-capture-"));
+  const directory = path.join(root, "registry");
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const rawRegistry = createWorkspaceRegistry({ directory, makeId: () => "workspace-a" });
+  const runtime = createWorkspaceRuntime({
+    registry: createWorkspaceRegistryAdapter({ registry: rawRegistry, fingerprint: "a".repeat(64), label: "Synthetic Vault" }),
+    repositories: repositoryFactories(),
+    backup: async () => ({ radar: await runtime.radar({ mode: "read" }) }),
+  });
+
+  assert.equal(await runtime.capture({ mode: "read" }), null);
+  await assert.rejects(access(directory), { code: "ENOENT" });
+  await rawRegistry.resolveVault({ fingerprint: "a".repeat(64), label: "Synthetic Vault" });
+  const captured = await runtime.capture({ mode: "read" });
+  assert.deepEqual(captured, binding());
+  const backup = await runtime.runBound({ binding: captured, operation: () => runtime.backup({ mode: "read" }) });
+  assert.equal(backup.radar.name, "radar");
+});
+
 test("real registry guard reuses captured context for a write without deadlocking and rejects a later rebind", async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "workbench-runtime-"));
   const directory = path.join(root, "registry");

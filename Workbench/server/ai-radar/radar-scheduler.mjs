@@ -232,8 +232,9 @@ export function createRadarScheduler({
           await plan({ failureResult: result ?? {}, expectedGeneration });
         }
         return result;
-      } catch {
+      } catch (error) {
         lastError = SCHEDULER_ERROR;
+        if (error?.code === "WORKSPACE_BINDING_CHANGED") throw error;
         await plan({ failureResult: {}, expectedGeneration }).catch(() => {});
         return { persisted: false, retryAt: null, run: null, error: SCHEDULER_ERROR };
       } finally {

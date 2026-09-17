@@ -42,14 +42,18 @@ export function createRadarCollector({ github, repository, rank = rankRadar, now
     let run = { id: randomUUID(), trigger, startedAt, finishedAt: null, status: "running", localDate: radarLocalDate(startedAt, timeZone),
       timeZone, repositoryCount: 0, errors: [], sequence: 0, collection: null };
     let state;
-    try { state = await repository.getState(); } catch {
+    try { state = await repository.getState(); } catch (error) {
+      if (error?.code === "WORKSPACE_BINDING_CHANGED") throw error;
       return persistenceFailure(run);
     }
     let retryAt = [state.collection.retryAt, memoryRetryAt].filter((value) => value && value > startedAt).sort().at(-1) ?? null;
     if (retryAt) {
       return { run: { ...run, status: "skipped", finishedAt: startedAt, errors: [safeRadarError({ code: "RADAR_COOLDOWN" })] }, persisted: false, retryAt };
     }
-    try { run = await repository.beginCollection(run); } catch { return persistenceFailure(run); }
+    try { run = await repository.beginCollection(run); } catch (error) {
+      if (error?.code === "WORKSPACE_BINDING_CHANGED") throw error;
+      return persistenceFailure(run);
+    }
     const trackedIds = new Set(state.decisions.filter((decision) => ["saved", "summarized", "queued", "learning", "completed"].includes(decision.status)).map((decision) => decision.repositoryId));
     const tracked = state.repositories.filter((item) => item.preservedAt || trackedIds.has(item.id)).sort((a, b) => a.id - b.id);
     const observed = new Map();
@@ -136,7 +140,10 @@ export function createRadarCollector({ github, repository, rank = rankRadar, now
     memoryRetryAt = retryAt;
     try {
       run = await repository.commitCollection({ repositories: items, run, control: { retryAt, detailCursorId: cursor, detailsFirst: !state.collection.detailsFirst } });
-    } catch { return persistenceFailure(run, retryAt); }
+    } catch (error) {
+      if (error?.code === "WORKSPACE_BINDING_CHANGED") throw error;
+      return persistenceFailure(run, retryAt);
+    }
     // Ranking is a read-only projection, deliberately outside the commit lock.
     // A later query failure cannot turn a durable successful commit into failure.
     let dashboard = null;

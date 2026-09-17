@@ -1,4 +1,6 @@
 import { ProjectRepositoryError } from "./project-repository.mjs";
+import { WorkspaceRegistryError } from "../workspace-state/workspace-registry.mjs";
+import { WorkspaceRuntimeError } from "../workspace-state/workspace-runtime.mjs";
 
 const ROOT = "/api/projects";
 const PROJECT = /^\/([0-9a-f-]{36})$/i;
@@ -33,6 +35,9 @@ async function bodyJson(req, maximum = 256 * 1024) {
 }
 
 function publicError(error) {
+  if ((error instanceof WorkspaceRegistryError || error instanceof WorkspaceRuntimeError) && error.code === "WORKSPACE_BINDING_CHANGED") {
+    return { code: "WORKSPACE_BINDING_CHANGED", message: "工作区绑定已改变，请重新加载后重试。" };
+  }
   if (error instanceof ProjectRepositoryError) {
     return { code: error.code, message: error.message, ...(error.details ? { details: error.details } : {}) };
   }

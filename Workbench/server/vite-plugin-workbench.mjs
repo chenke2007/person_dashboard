@@ -799,111 +799,69 @@ export function workbenchApiPlugin({
   const createGitHubClient = radarOptions.createGitHubClient ?? createGitHubRadarClient;
   const radarNow = radarOptions.now ?? (() => new Date());
   let workspaceRuntime = null;
-  let workspacePromise = null;
-  async function currentWorkspace({ create = !projectReadOnly } = {}) {
-    if (projectDirectory) {
-      return {
-        workspaceId: `direct-${vaultFingerprint.slice(0, 24)}`,
-        projectDirectory,
-      };
-    }
-    if (!create) return registry.lookupVault({ fingerprint: vaultFingerprint });
-    workspacePromise ??= registry.resolveVault({
-      fingerprint: vaultFingerprint,
-      label: path.basename(vaultRoot),
-    });
-    return workspacePromise;
-  }
-
-  let projectRepositoryPromise = null;
-  function projectRepository() {
-    projectRepositoryPromise ??= (async () => {
-      let resolvedProjectDirectory = projectDirectory;
-      if (!resolvedProjectDirectory) {
-        const workspace = await currentWorkspace();
-        if (!workspace) return emptyReadOnlyProjectRepository;
-        const stateRoot = workspace.storageLayout === "legacy"
-          ? path.join(workspaceRegistryDirectory, workspace.workspaceId)
-          : path.join(workspaceRegistryDirectory, "workspaces", workspace.workspaceId);
-        resolvedProjectDirectory = path.join(stateRoot, "projects");
-      }
-      if (projectReadOnly) {
-        try {
-          await lstat(resolvedProjectDirectory);
-        } catch (error) {
-          if (error?.code === "ENOENT") return emptyReadOnlyProjectRepository;
-          throw error;
-        }
-      }
-      return createProjectRepository({
-        directory: resolvedProjectDirectory,
-        resolveDocument: async (documentId) => {
-          const document = getDocument(await currentIndex(), documentId);
-          return document ? { id: document.id, path: document.path, title: document.title, kind: document.collection || document.kind || "document" } : null;
-        },
+  let projectContextPromise = null;
+  function projectContext() {
+    projectContextPromise ??= (async () => {
+      const binding = await workspaceRuntime.capture({ mode: projectReadOnly ? "read" : "write" });
+      if (!binding) return { repository: emptyReadOnlyProjectRepository, binding: null };
+      return workspaceRuntime.runBound({
+        binding,
+        operation: async ({ workspace }) => ({ repository: await projectRepositoryForWorkspace({ workspace }), binding }),
       });
     })();
-    return projectRepositoryPromise;
+    return projectContextPromise;
   }
-  let radarRepositoryPromise = null;
-  function radarRepository() {
-    radarRepositoryPromise ??= (async () => {
-      let resolvedDirectory = radarDirectory;
-      if (!resolvedDirectory && projectDirectory) resolvedDirectory = path.join(path.dirname(projectDirectory), "ai-radar");
-      if (!resolvedDirectory) {
-        const workspace = await currentWorkspace();
-        // Backup requests check for a bound workspace before obtaining providers.
-        if (!workspace) throw new Error("Radar requires a bound workspace");
-        const stateRoot = workspace.storageLayout === "legacy"
-          ? path.join(workspaceRegistryDirectory, workspace.workspaceId)
-          : path.join(workspaceRegistryDirectory, "workspaces", workspace.workspaceId);
-        resolvedDirectory = path.join(stateRoot, "ai-radar");
+  async function projectRepositoryForWorkspace({ workspace }) {
+    let resolvedProjectDirectory = projectDirectory;
+    if (!resolvedProjectDirectory) {
+      if (!workspace) return emptyReadOnlyProjectRepository;
+      const stateRoot = workspace.storageLayout === "legacy"
+        ? path.join(workspaceRegistryDirectory, workspace.workspaceId)
+        : path.join(workspaceRegistryDirectory, "workspaces", workspace.workspaceId);
+      resolvedProjectDirectory = path.join(stateRoot, "projects");
+    }
+    if (projectReadOnly) {
+      try {
+        await lstat(resolvedProjectDirectory);
+      } catch (error) {
+        if (error?.code === "ENOENT") return emptyReadOnlyProjectRepository;
+        throw error;
       }
-      return createRadarRepository({ directory: resolvedDirectory });
-    })();
-    return radarRepositoryPromise;
+    }
+    return createProjectRepository({
+      directory: resolvedProjectDirectory,
+      resolveDocument: async (documentId) => {
+        const document = getDocument(await currentIndex(), documentId);
+        return document ? { id: document.id, path: document.path, title: document.title, kind: document.collection || document.kind || "document" } : null;
+      },
+    });
   }
-  async function learningRepositoryForWorkspace({ workspace, mode }) {
-    const create = mode === "write";
-    let resolvedDirectory = null;
+  function radarRepositoryForWorkspace({ workspace }) {
+    let resolvedDirectory = radarDirectory;
+    if (!resolvedDirectory && projectDirectory) resolvedDirectory = path.join(path.dirname(projectDirectory), "ai-radar");
+    if (!resolvedDirectory) {
+      const stateRoot = workspace.storageLayout === "legacy"
+        ? path.join(workspaceRegistryDirectory, workspace.workspaceId)
+        : path.join(workspaceRegistryDirectory, "workspaces", workspace.workspaceId);
+      resolvedDirectory = path.join(stateRoot, "ai-radar");
+    }
+    return createRadarRepository({ directory: resolvedDirectory });
+  }
+  function learningRepositoryForWorkspace({ workspace }) {
     if (!workspace) return null;
     const stateRoot = workspace.storageLayout === "legacy"
       ? path.join(workspaceRegistryDirectory, workspace.workspaceId)
       : path.join(workspaceRegistryDirectory, "workspaces", workspace.workspaceId);
-    resolvedDirectory = path.join(stateRoot, "learning");
-    if (!create) {
-      try {
-        await lstat(resolvedDirectory);
-      } catch (error) {
-        if (error?.code === "ENOENT") return null;
-        throw error;
-      }
-    }
+    const resolvedDirectory = path.join(stateRoot, "learning");
     return createLearningRepository({ directory: resolvedDirectory, now: () => new Date() });
   }
-  async function learningRepository({ create = true } = {}) {
-    return workspaceRuntime.learning({ mode: create ? "write" : "read" });
-  }
-  async function summaryRepositoryForWorkspace({ workspace, mode }) {
-    const create = mode === "write";
-    let resolvedDirectory = null;
+  function summaryRepositoryForWorkspace({ workspace }) {
     if (!workspace) return null;
     const stateRoot = workspace.storageLayout === "legacy"
       ? path.join(workspaceRegistryDirectory, workspace.workspaceId)
       : path.join(workspaceRegistryDirectory, "workspaces", workspace.workspaceId);
-    resolvedDirectory = path.join(stateRoot, "summaries");
-    if (!create) {
-      try {
-        await lstat(resolvedDirectory);
-      } catch (error) {
-        if (error?.code === "ENOENT") return null;
-        throw error;
-      }
-    }
+    const resolvedDirectory = path.join(stateRoot, "summaries");
     return createSummaryRepository({ directory: resolvedDirectory, now: () => new Date() });
-  }
-  async function summaryRepository({ create = true } = {}) {
-    return workspaceRuntime.summary({ mode: create ? "write" : "read" });
   }
   let radarContextPromise = null;
   async function radarContext({ create = false } = {}) {
@@ -912,19 +870,19 @@ export function workbenchApiPlugin({
       if (existing || !create) return existing;
     }
     const initializing = (async () => {
-      const workspace = await currentWorkspace({ create });
-      if (!workspace) return null;
-      const repository = await radarRepository();
-      const store = !registry ? repository : new Proxy({}, {
+      const mode = create ? "write" : "read";
+      const binding = await workspaceRuntime.capture({ mode });
+      if (!binding) return null;
+      const store = new Proxy({}, {
         get(_target, property) {
           if (property === "then") return undefined;
-          return async (...args) => registry.withBoundWorkspace(
-            { fingerprint: vaultFingerprint, workspaceId: workspace.workspaceId },
-            () => repository[property](...args),
-          );
+          return (...args) => workspaceRuntime.runBound({
+            binding,
+            operation: async () => (await workspaceRuntime.radar({ mode }))[property](...args),
+          });
         },
       });
-      return { repository, store, workspace };
+      return { store, binding };
     })();
     radarContextPromise = initializing;
     const context = await initializing;
@@ -1072,7 +1030,7 @@ export function workbenchApiPlugin({
         let summaryState = new Map();
         let summaryStatus = "ok";
         try {
-          const summariesStore = await summaryRepository({ create: false });
+          const summariesStore = await workspaceRuntime.summary({ mode: "read" });
           if (summariesStore) {
             const listed = await summariesStore.listLatest();
             summaryState = new Map(listed.summaries.map((summary) => [summary.repositoryId, summary]));
@@ -1135,17 +1093,20 @@ export function workbenchApiPlugin({
       },
     },
   });
+  const directWorkspace = Object.freeze({
+    workspaceId: `direct-${vaultFingerprint.slice(0, 24)}`,
+    fingerprint: vaultFingerprint,
+    projectDirectory,
+  });
   const directWorkspaceRegistry = Object.freeze({
-    async resolve({ mode }) {
-      return currentWorkspace({ create: mode === "write" });
+    async resolve() {
+      return directWorkspace;
     },
     async capture() {
-      const workspace = await currentWorkspace({ create: true });
-      return workspace ? { fingerprint: vaultFingerprint, workspaceId: workspace.workspaceId } : null;
+      return { fingerprint: vaultFingerprint, workspaceId: directWorkspace.workspaceId };
     },
     async runBound({ binding, operation }) {
-      const workspace = await currentWorkspace({ create: true });
-      return operation(Object.freeze({ binding, workspace }));
+      return operation(Object.freeze({ binding, workspace: directWorkspace }));
     },
   });
   workspaceRuntime = createWorkspaceRuntime({
@@ -1156,9 +1117,18 @@ export function workbenchApiPlugin({
       learning: learningRepositoryForWorkspace,
       summary: summaryRepositoryForWorkspace,
       ingestion: async (context) => (await learningRepositoryForWorkspace(context))?.ingestion ?? null,
-      radar: async ({ mode }) => (await radarContext({ create: mode === "write" }))?.repository ?? null,
+      radar: radarRepositoryForWorkspace,
     },
-    backup: async () => workspaceBackup(),
+    backup: async ({ workspace }) => createWorkspaceBackup({
+      providers: [
+        await projectRepositoryForWorkspace({ workspace }),
+        await workspaceRuntime.radar({ mode: "read" }),
+        (await workspaceRuntime.learning({ mode: "read" })).registerBackupProvider(),
+        (await workspaceRuntime.summary({ mode: "read" })).registerBackupProvider(),
+      ],
+      secret: backupSecret,
+      workspaceId: workspace.workspaceId,
+    }),
   });
   // Learning service + routes over the S1 store. The service owns the parts of
   // the flow that cross an adapter seam (radar identity, GitHub head commit) so
@@ -1245,45 +1215,42 @@ export function workbenchApiPlugin({
   const projects = new Proxy({}, {
     get(_target, property) {
       return async (...args) => {
-        const repository = await projectRepository();
+        const { repository, binding } = await projectContext();
         const operation = () => repository[property](...args);
         if (!registry || ["getWorkspace", "getProject"].includes(property)) return operation();
-        const workspace = await currentWorkspace();
-        return registry.withBoundWorkspace({ fingerprint: vaultFingerprint, workspaceId: workspace.workspaceId }, operation);
+        return workspaceRuntime.runBound({ binding, operation });
       };
     },
   });
   const projectRoutes = createProjectRoutes({ repository: projects, readOnly: projectReadOnly });
   const backupSecret = randomBytes(32);
-  let workspaceBackupPromise = null;
+  let backupContextPromise = null;
   function workspaceBackup() {
     // Backup export and restore previews are read paths: resolve the existing
     // binding and never auto-create a workspace. A failed resolution is not
     // memoized, so a later binding can still initialize the backup provider.
-    workspaceBackupPromise ??= (async () => {
-      const workspace = await currentWorkspace({ create: false });
-      if (!workspace) {
+    backupContextPromise ??= (async () => {
+      const binding = await workspaceRuntime.capture({ mode: "read" });
+      if (!binding) {
         const error = new Error("当前 Vault 尚未绑定工作区。");
         error.code = "WORKSPACE_NOT_FOUND";
         error.status = 404;
         throw error;
       }
-      const backup = createWorkspaceBackup({
-        providers: [await projectRepository(), await radarRepository(), (await learningRepository()).registerBackupProvider(), (await summaryRepository()).registerBackupProvider()],
-        secret: backupSecret,
-        workspaceId: workspace.workspaceId,
+      const operate = (method, ...args) => workspaceRuntime.runBound({
+        binding,
+        operation: async () => (await workspaceRuntime.backup({ mode: "read" }))[method](...args),
       });
       return Object.freeze({
-        ...backup,
-        confirmImport: (token) => registry
-          ? registry.withBoundWorkspace({ fingerprint: vaultFingerprint, workspaceId: workspace.workspaceId }, () => backup.confirmImport(token))
-          : backup.confirmImport(token),
+        exportBundle: () => operate("exportBundle"),
+        previewImport: (bundle) => operate("previewImport", bundle),
+        confirmImport: (token) => operate("confirmImport", token),
       });
     })().then((value) => value, (error) => {
-      workspaceBackupPromise = null;
+      backupContextPromise = null;
       throw error;
     });
-    return workspaceBackupPromise;
+    return backupContextPromise;
   }
   const workspaceRoutes = createWorkspaceRoutes({
     getBackup: workspaceBackup,
@@ -1293,12 +1260,10 @@ export function workbenchApiPlugin({
     hosted,
     readJson,
     async onRebind() {
-      workspacePromise = null;
-      projectRepositoryPromise = null;
-      radarRepositoryPromise = null;
+      projectContextPromise = null;
       radarContextPromise = null;
       radarLifecyclePromise = null;
-      workspaceBackupPromise = null;
+      backupContextPromise = null;
       await startRadarLifecycle();
     },
   });

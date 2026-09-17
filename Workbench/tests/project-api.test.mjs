@@ -520,3 +520,53 @@ test("backup confirmation rejects a registry rebind after preview without restor
   assert.equal(await readFile(path.join(directory, "workspaces", exported.body.workspaceId, "projects", "projects.json"), "utf8"), before);
   assert.equal((await registry.listWorkspaces()).length, 1);
 });
+
+test("restore confirm with a pre-rebind preview token is rejected after the app's own rebind", { timeout: 60000 }, async (t) => {
+  let targetWorkspaceId;
+  const fixture = await startFixture(t, {
+    useWorkspaceRegistry: true,
+    async beforeStart({ vaultRoot, appDataRoot }) {
+      const registryDirectory = path.join(appDataRoot, "PersonalAIWorkbench");
+      const registry = createWorkspaceRegistry({ directory: registryDirectory, makeId: () => "rebind-target" });
+      const target = await registry.resolveVault({ fingerprint: "a".repeat(64), label: "Synthetic Target Workspace" });
+      targetWorkspaceId = target.workspaceId;
+      // The vault binds to an empty workspace whose directory stays stateless,
+      // so the app's rebind preview is not blocked by the state guard.
+      await bindVault(registryDirectory, vaultRoot, () => "vault-workspace");
+    },
+  });
+  const directory = path.join(fixture.appDataRoot, "PersonalAIWorkbench");
+
+  const exported = await request(fixture.origin, "/api/workspace/backup");
+  assert.equal(exported.response.status, 200);
+  const preview = await request(fixture.origin, "/api/workspace/restore/preview", { method: "POST", body: exported.body });
+  assert.equal(preview.response.status, 200);
+  const token = preview.body.token;
+  assert.equal(typeof token, "string");
+
+  const candidates = await request(fixture.origin, "/api/workspace/rebind/candidates");
+  assert.equal(candidates.response.status, 200);
+  assert.equal(candidates.body.items.some((item) => item.workspaceId === targetWorkspaceId), true);
+  const rebind = await request(fixture.origin, "/api/workspace/rebind/preview", {
+    method: "POST",
+    body: { workspaceId: targetWorkspaceId },
+  });
+  assert.equal(rebind.response.status, 200);
+  const confirmed = await request(fixture.origin, "/api/workspace/rebind/confirm", {
+    method: "POST",
+    body: { token: rebind.body.token },
+  });
+  assert.equal(confirmed.response.status, 200);
+  assert.equal(confirmed.body.workspaceId, targetWorkspaceId);
+
+  const restore = await request(fixture.origin, "/api/workspace/restore/confirm", {
+    method: "POST",
+    body: { token },
+  });
+  assert.equal(restore.response.status, 409);
+  assert.equal(restore.body.error.code, "WORKSPACE_BINDING_CHANGED");
+  // The rejected restore must not have written into either workspace.
+  assert.deepEqual((await request(fixture.origin, "/api/projects")).body.projects, []);
+  await assert.rejects(access(path.join(directory, "workspaces", targetWorkspaceId, "projects")), { code: "ENOENT" });
+  await assert.rejects(access(path.join(directory, "workspaces", "vault-workspace", "projects")), { code: "ENOENT" });
+});

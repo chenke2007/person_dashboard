@@ -1225,6 +1225,20 @@ export function workbenchApiPlugin({
   const projectRoutes = createProjectRoutes({ repository: projects, readOnly: projectReadOnly });
   const backupSecret = randomBytes(32);
   let backupContextPromise = null;
+  // Restore preview tokens keep the binding they were issued under, so a
+  // confirm after an app rebind can tell a binding change (409) apart from
+  // an unknown token (400) instead of re-keying the token into the new
+  // workspace's backup instance. Records mirror the instance's pending
+  // preview TTL and are dropped once the nonce is consumed by a confirm.
+  const restoreTokenBindings = new Map();
+  function sameBinding(left, right) {
+    return left?.fingerprint === right?.fingerprint && left?.workspaceId === right?.workspaceId;
+  }
+  function sweepRestoreTokenBindings(nowMs = Date.now()) {
+    for (const [token, record] of restoreTokenBindings) {
+      if (!record?.expiresAt || Date.parse(record.expiresAt) <= nowMs) restoreTokenBindings.delete(token);
+    }
+  }
   function workspaceBackup() {
     // Backup export and restore previews are read paths: resolve the existing
     // binding and never auto-create a workspace. A failed resolution is not
@@ -1241,10 +1255,35 @@ export function workbenchApiPlugin({
         binding,
         operation: async () => (await workspaceRuntime.backup({ mode: "read" }))[method](...args),
       });
+      const confirmImport = async (token) => {
+        const origin = restoreTokenBindings.get(token);
+        if (origin && !sameBinding(origin, binding)) {
+          throw new WorkspaceRegistryError("WORKSPACE_BINDING_CHANGED", "工作区绑定已改变，请重新加载后重试。", 409);
+        }
+        try {
+          return await operate("confirmImport", token);
+        } finally {
+          // The backup instance consumes the preview nonce before any restore
+          // step, so a delegated confirm can never replay regardless of its
+          // outcome. Drop the origin record so the token degrades back to a
+          // plain invalid token on later attempts against the same binding.
+          if (origin) restoreTokenBindings.delete(token);
+        }
+      };
       return Object.freeze({
         exportBundle: () => operate("exportBundle"),
-        previewImport: (bundle) => operate("previewImport", bundle),
-        confirmImport: (token) => operate("confirmImport", token),
+        previewImport: (bundle) => operate("previewImport", bundle).then((result) => {
+          if (result?.token && result?.expiresAt) {
+            sweepRestoreTokenBindings();
+            restoreTokenBindings.set(result.token, Object.freeze({
+              fingerprint: binding.fingerprint,
+              workspaceId: binding.workspaceId,
+              expiresAt: result.expiresAt,
+            }));
+          }
+          return result;
+        }),
+        confirmImport,
       });
     })().then((value) => value, (error) => {
       backupContextPromise = null;

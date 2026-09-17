@@ -10,6 +10,9 @@ import test from "node:test";
 import { createServer as createViteServer } from "vite";
 import { createRadarRepository } from "../server/ai-radar/radar-repository.mjs";
 import { createSummaryRoutes } from "../server/summaries/summary-routes.mjs";
+import { createRepositorySummaryService } from "../server/summaries/summary-service.mjs";
+import { createSummaryRepository } from "../server/summaries/summary-repository.mjs";
+import { createWorkspaceRuntime } from "../server/workspace-state/workspace-runtime.mjs";
 import { createWorkspaceRegistry } from "../server/workspace-state/workspace-registry.mjs";
 import { workbenchApiPlugin } from "../server/vite-plugin-workbench.mjs";
 
@@ -145,13 +148,14 @@ async function request(origin, route, { method = "GET", body, headers } = {}) {
   return { response, body: await response.json() };
 }
 
-async function startFixture(t, { readOnly = false, projectReadOnly, hosted = false, github = syntheticGitHub, model = fakeModel, prebind = true, seed = async () => {} } = {}) {
+async function startFixture(t, { readOnly = false, projectReadOnly, hosted = false, github = syntheticGitHub, model = fakeModel, prebind = true, sharedRadar = false, seed = async () => {} } = {}) {
   const stableTempRoot = await realpath(os.tmpdir());
   const root = await mkdtemp(path.join(stableTempRoot, "workbench-summary-api-"));
   assert.equal(root, await realpath(root));
   const vaultRoot = path.join(root, "vault");
   const appDataRoot = path.join(root, "app-data");
   const registryDirectory = path.join(appDataRoot, "PersonalAIWorkbench");
+  const radarDirectory = sharedRadar ? path.join(root, "shared-radar") : null;
   await mkdir(path.join(vaultRoot, "wiki"), { recursive: true });
   await writeFile(path.join(vaultRoot, "wiki", "plan.md"), "# Project plan\n", "utf8");
   const client = github();
@@ -167,6 +171,7 @@ async function startFixture(t, { readOnly = false, projectReadOnly, hosted = fal
       projectReadOnly,
       hosted,
       projectDirectory: null,
+      radarDirectory,
       radarOptions: { github: client },
       summaryOptions: { model: modelAdapter },
     })],
@@ -182,7 +187,7 @@ async function startFixture(t, { readOnly = false, projectReadOnly, hosted = fal
       ? path.join(registryDirectory, workspace.workspaceId)
       : path.join(registryDirectory, "workspaces", workspace.workspaceId);
   }
-  await seed({ vaultRoot, appDataRoot, registryDirectory, stateRoot: boundStateRoot, workspaceId: boundWorkspaceId });
+  await seed({ vaultRoot, appDataRoot, registryDirectory, radarDirectory, stateRoot: boundStateRoot, workspaceId: boundWorkspaceId });
   const server = http.createServer(vite.middlewares);
   await listenOnFetchSafePort(server);
   const origin = `http://127.0.0.1:${server.address().port}`;
@@ -191,7 +196,7 @@ async function startFixture(t, { readOnly = false, projectReadOnly, hosted = fal
     await vite.close();
     await rm(root, { recursive: true, force: true });
   });
-  return { origin, root, stateRoot: boundStateRoot, github: client, model: modelAdapter };
+  return { origin, root, registryDirectory, stateRoot: boundStateRoot, github: client, model: modelAdapter };
 }
 
 function seedRadar(repos) {
@@ -204,6 +209,56 @@ function seedRadar(repos) {
 }
 
 const validContent = () => structuredClone(CONTENT_TEMPLATE);
+
+test("unbound summary capabilities and reads never create registry or workspace state", async (t) => {
+  const { origin, registryDirectory } = await startFixture(t, { prebind: false });
+  for (const route of ["/api/summaries/capabilities", "/api/summaries/repository/101", "/api/summaries?repositoryId=101"]) {
+    assert.equal((await request(origin, route)).response.status, 200);
+    await assert.rejects(access(registryDirectory), { code: "ENOENT" });
+  }
+});
+
+test("a rebind during summary model generation rejects the stale write in both workspaces", async (t) => {
+  let entered;
+  let release;
+  const modelEntered = new Promise((resolve) => { entered = resolve; });
+  const modelBarrier = new Promise((resolve) => { release = resolve; });
+  t.after(() => release());
+  let targetWorkspaceId;
+  const fixture = await startFixture(t, {
+    sharedRadar: true,
+    model: () => ({
+      async generate() {
+        entered();
+        await modelBarrier;
+        return { content: validContent(), providerId: "fake", modelId: "fake" };
+      },
+    }),
+    seed: async ({ radarDirectory, registryDirectory }) => {
+      await createRadarRepository({ directory: radarDirectory }).upsertRepositories([syntheticRepository(101)]);
+      const target = await createWorkspaceRegistry({ directory: registryDirectory }).resolveVault({
+        fingerprint: "b".repeat(64), label: "Synthetic Target",
+      });
+      targetWorkspaceId = target.workspaceId;
+    },
+  });
+  const pending = request(fixture.origin, "/api/summaries/generate", { method: "POST", body: { repositoryId: 101 } });
+  await modelEntered;
+  try {
+    const preview = await request(fixture.origin, "/api/workspace/rebind/preview", { method: "POST", body: { workspaceId: targetWorkspaceId } });
+    assert.equal(preview.response.status, 200);
+    const rebound = await request(fixture.origin, "/api/workspace/rebind/confirm", { method: "POST", body: { token: preview.body.token } });
+    assert.equal(rebound.response.status, 200);
+  } finally {
+    release();
+  }
+  const result = await pending;
+  assert.equal(result.response.status, 409);
+  assert.equal(result.body.error.code, "WORKSPACE_BINDING_CHANGED");
+  for (const stateRoot of [fixture.stateRoot, path.join(fixture.registryDirectory, "workspaces", targetWorkspaceId)]) {
+    await assert.rejects(access(path.join(stateRoot, "summaries")), { code: "ENOENT" });
+  }
+});
 
 test("summaryCapabilities reflect configuration gates locally and never call GitHub or a model", async (t) => {
   const withModel = await startFixture(t);
@@ -544,4 +599,45 @@ test("unknown routes under /api/summaries return a stable 404", async (t) => {
   const result = await request(origin, "/api/summaries/nope");
   assert.equal(result.response.status, 404);
   assert.equal(result.body.error.code, "SUMMARY_ROUTE_NOT_FOUND");
+});
+
+test("a rebind during README lookup rejects even when the new workspace has a cached summary", async (t) => {
+  const root = await mkdtemp(path.join(await realpath(os.tmpdir()), "workbench-summary-cache-rebind-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const cached = createSummaryRepository({ directory: path.join(root, "summaries") });
+  await cached.persistSummary({
+    repositoryId: 101, fullName: "synthetic/repository-101", sourceUrl: "https://github.com/synthetic/repository-101",
+    sourceCommitSha: commitSha("b"), readmeSha: blobSha("1"), readmeRef: commitSha("b"), readmePath: "README.md",
+    sections: validContent(), model: { providerId: "fake", modelId: "fake" }, workflowVersion: 1,
+  });
+  let current = { workspaceId: "old", fingerprint: "a".repeat(64) };
+  const runtime = createWorkspaceRuntime({
+    registry: {
+      async resolve() { return current; },
+      async capture() { return { ...current }; },
+      async runBound({ binding, operation }) {
+        if (binding.workspaceId !== current.workspaceId) {
+          const error = new Error("binding changed");
+          error.code = "WORKSPACE_BINDING_CHANGED";
+          throw error;
+        }
+        return operation({ workspace: current, binding });
+      },
+    },
+    repositories: { summary: () => cached, learning: () => null, ingestion: () => null, radar: () => null },
+    backup: () => null,
+  });
+  const service = createRepositorySummaryService({
+    runtime,
+    resolveRepository: async () => syntheticRepository(101),
+    getReadme: async (input) => {
+      current = { ...current, workspaceId: "new" };
+      return syntheticGitHub().getReadme(input);
+    },
+    model: fakeModel(),
+  });
+  await assert.rejects(
+    () => service.generateSummary({ repositoryId: 101, sourceCommitSha: commitSha("b") }),
+    (error) => error.code === "WORKSPACE_BINDING_CHANGED" && error.status === 409,
+  );
 });

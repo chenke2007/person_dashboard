@@ -18,10 +18,7 @@ const README_SHA = /^[a-f0-9]{40}$/;
 export class SummaryServiceError extends SummaryRepositoryError {}
 
 export function createRepositorySummaryService({
-  getSummaries = null,
-  summaries = null,
-  bound = (binding, operation) => operation(),
-  captureBinding = null,
+  runtime = null,
   resolveRepository = null,
   getHeadCommit = null,
   getReadme = null,
@@ -30,11 +27,9 @@ export function createRepositorySummaryService({
   readable = true,
   hosted = false,
 } = {}) {
-  if (!getSummaries && !summaries) throw new TypeError("summary repository is required");
-  if (summaries && typeof summaries !== "object") throw new TypeError("summary repository must be an object");
-  if (getSummaries && typeof getSummaries !== "function") throw new TypeError("getSummaries must be a function");
-  if (typeof bound !== "function") throw new TypeError("summary service requires a bound wrapper");
-  if (captureBinding !== null && typeof captureBinding !== "function") throw new TypeError("captureBinding must be a function or null");
+  if (!runtime || typeof runtime.capture !== "function" || typeof runtime.runBound !== "function" || typeof runtime.summary !== "function") {
+    throw new TypeError("summary service requires a workspace runtime");
+  }
   if (resolveRepository !== null && typeof resolveRepository !== "function") throw new TypeError("resolveRepository must be a function or null");
   if (getHeadCommit !== null && typeof getHeadCommit !== "function") throw new TypeError("getHeadCommit must be a function or null");
   if (getReadme !== null && typeof getReadme !== "function") throw new TypeError("getReadme must be a function or null");
@@ -44,14 +39,21 @@ export function createRepositorySummaryService({
   // workspace before the capability gate has rejected the request. Reads use a
   // read-only resolution (never creates the summaries directory); mutations ask
   // for a writable one.
-  const store = ({ create = false } = {}) => (getSummaries ? getSummaries({ create }) : Promise.resolve(summaries));
+  const store = ({ mode = "read" } = {}) => runtime.summary({ mode });
 
   const modelConfigured = () => Boolean(model && (typeof model.capabilities !== "function" || Boolean(model.capabilities().configured)));
 
-  const mutation = (operation, binding = null) => {
+  const mutation = async (operation, binding) => {
     if (hosted) fail("SUMMARY_UNAVAILABLE", "托管模式下仓库摘要不可用。", 404);
     if (!mutatable) fail("SUMMARY_READ_ONLY", "当前工作区不允许生成仓库摘要。", 403);
-    return bound(binding, operation);
+    try {
+      return await runtime.runBound({ binding, operation });
+    } catch (error) {
+      if (error?.code === "WORKSPACE_BINDING_CHANGED") {
+        fail("WORKSPACE_BINDING_CHANGED", "工作区绑定已改变，请重新加载后重试。", 409);
+      }
+      throw error;
+    }
   };
 
   function summaryCapabilities() {
@@ -93,7 +95,7 @@ export function createRepositorySummaryService({
     // Capture the expected binding BEFORE any slow remote work, so a rebind
     // landing during GitHub/model calls rejects the stale write instead of
     // writing the old summary into the new workspace.
-    const expected = captureBinding ? await captureBinding() : null;
+    const expected = await runtime.capture();
 
     const repository = await readRepository(repositoryId);
     const fullName = repository.fullName;
@@ -138,11 +140,11 @@ export function createRepositorySummaryService({
     // Idempotent fast path: an existing valid summary for this generation key
     // (repositoryId + fixed commit + readme version) returns without re-running
     // the model and without writing a duplicate.
-    const read = await store({ create: false });
+    const read = await store({ mode: "read" });
     if (read) {
       const cached = await read.getSummaryByCommit({ repositoryId, sourceCommitSha: sha });
       if (cached.summary && cached.summary.readmeSha === readmeSha) {
-        return { status: "ok", summary: cached.summary };
+        return mutation(() => ({ status: "ok", summary: cached.summary }), expected);
       }
     }
 
@@ -183,7 +185,7 @@ export function createRepositorySummaryService({
     const modelId = typeof generated?.modelId === "string" && generated.modelId ? generated.modelId : "unknown";
 
     const record = await mutation(async () => {
-      const repository = await store({ create: true });
+      const repository = await store({ mode: "write" });
       const result = await repository.persistSummary({
         repositoryId,
         fullName,
@@ -205,7 +207,7 @@ export function createRepositorySummaryService({
   async function getSummary({ repositoryId } = {}) {
     if (hosted) fail("SUMMARY_UNAVAILABLE", "托管模式下仓库摘要不可用。", 404);
     requireRepositoryId(repositoryId);
-    const repository = await store({ create: false });
+    const repository = await store({ mode: "read" });
     if (!repository) return { summary: null };
     return repository.getSummary({ repositoryId });
   }
@@ -214,7 +216,7 @@ export function createRepositorySummaryService({
     if (hosted) fail("SUMMARY_UNAVAILABLE", "托管模式下仓库摘要不可用。", 404);
     requireRepositoryId(repositoryId);
     if (typeof sourceCommitSha !== "string" || !README_SHA.test(sourceCommitSha)) fail("SUMMARY_INVALID_INPUT", "仓库摘要输入格式无效。");
-    const repository = await store({ create: false });
+    const repository = await store({ mode: "read" });
     if (!repository) return { summary: null };
     return repository.getSummaryByCommit({ repositoryId, sourceCommitSha });
   }
@@ -222,7 +224,7 @@ export function createRepositorySummaryService({
   async function listSummaries({ repositoryId } = {}) {
     if (hosted) fail("SUMMARY_UNAVAILABLE", "托管模式下仓库摘要不可用。", 404);
     requireRepositoryId(repositoryId);
-    const repository = await store({ create: false });
+    const repository = await store({ mode: "read" });
     if (!repository) return { summaries: [] };
     return repository.listSummaries({ repositoryId });
   }

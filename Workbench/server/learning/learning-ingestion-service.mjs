@@ -65,28 +65,44 @@ function publicFile(file, markdown) {
 // write). The HTTP layer stays a thin router; every mutation runs under the
 // same workspace-binding guard as the other learning mutations.
 export function createLearningIngestionService({
-  learning,
-  store,
+  runtime,
   catalog,
-  bound,
-  captureBinding,
-  lookupBoundWorkspace,
+  lookupBoundWorkspace = null,
   readOnly = false,
   hosted = false,
 } = {}) {
-  if (!learning || typeof learning.get !== "function") throw new TypeError("learning repository is required");
-  if (!store || typeof catalog !== "object") throw new TypeError("ingestion store and vault catalog are required");
-  if (typeof bound !== "function" || typeof captureBinding !== "function") throw new TypeError("ingestion service requires a bound wrapper");
+  if (!runtime || typeof runtime.learning !== "function" || typeof runtime.ingestion !== "function" || typeof runtime.capture !== "function" || typeof runtime.runBound !== "function") {
+    throw new TypeError("ingestion service requires a workspace runtime");
+  }
+  if (!catalog || typeof catalog !== "object") throw new TypeError("vault catalog is required");
   if (lookupBoundWorkspace !== null && typeof lookupBoundWorkspace !== "function") throw new TypeError("lookupBoundWorkspace must be a function or null");
 
-  const mutation = (operation) => {
+  const requireMutable = () => {
     if (hosted) fail("INGESTION_UNAVAILABLE", "托管模式下学习摄取不可用。", 404);
     if (readOnly) fail("INGESTION_READ_ONLY", "当前工作区不允许摄取出写。", 403);
-    return bound(null, operation);
   };
 
-  const storeFor = async ({ create = false } = {}) => {
-    const repository = typeof store === "function" ? await store({ create }) : await store;
+  const mutation = async (binding, operation) => {
+    requireMutable();
+    if (!binding) fail("WORKSPACE_NOT_FOUND", "当前 Vault 尚未绑定工作区。", 404);
+    try {
+      return await runtime.runBound({ binding, operation });
+    } catch (error) {
+      if (error?.code === "WORKSPACE_BINDING_CHANGED") {
+        fail("WORKSPACE_BINDING_CHANGED", "工作区绑定已改变，请重新加载后重试。", 409);
+      }
+      throw error;
+    }
+  };
+
+  const storeFor = async ({ mode = "read" } = {}) => {
+    const repository = await runtime.ingestion({ mode });
+    if (!repository) fail("WORKSPACE_NOT_FOUND", "学习工作区不存在。", 404);
+    return repository;
+  };
+
+  const learningFor = async ({ mode = "read" } = {}) => {
+    const repository = await runtime.learning({ mode });
     if (!repository) fail("WORKSPACE_NOT_FOUND", "学习工作区不存在。", 404);
     return repository;
   };
@@ -102,7 +118,7 @@ export function createLearningIngestionService({
 
   async function listTargets({ workspaceId }) {
     if (hosted) fail("INGESTION_UNAVAILABLE", "托管模式下学习摄取不可用。", 404);
-    await learning.get(workspaceId);
+    await (await learningFor()).get(workspaceId);
     const { candidates, warnings } = await catalog.listCandidates();
     const selection = await (await storeFor()).getSelection(workspaceId);
     const selectedId = selection.selection?.targetVaultId ?? null;
@@ -132,14 +148,17 @@ export function createLearningIngestionService({
   }
 
   async function setTarget({ workspaceId, vaultId }) {
-    return mutation(async () => {
-      await learning.get(workspaceId, { create: true });
-      if (typeof vaultId !== "string" || !FINGERPRINT_PATTERN.test(vaultId)) {
-        fail("INGESTION_INVALID_INPUT", "目标 Vault 指纹无效。", 400);
-      }
-      const target = await catalog.resolveTarget(vaultId);
-      if (!target) fail("VAULT_TARGET_NOT_FOUND", "目标 Vault 不存在或未被允许。", 404);
-      const repository = await storeFor({ create: true });
+    requireMutable();
+    if (typeof vaultId !== "string" || !FINGERPRINT_PATTERN.test(vaultId)) {
+      fail("INGESTION_INVALID_INPUT", "目标 Vault 指纹无效。", 400);
+    }
+    const binding = await runtime.capture();
+    await (await learningFor()).get(workspaceId);
+    const target = await catalog.resolveTarget(vaultId);
+    if (!target) fail("VAULT_TARGET_NOT_FOUND", "目标 Vault 不存在或未被允许。", 404);
+    return mutation(binding, async () => {
+      await (await learningFor()).get(workspaceId);
+      const repository = await storeFor({ mode: "write" });
       const { selection } = await repository.setSelection({
         workspaceId,
         targetVaultId: target.vaultId,
@@ -165,6 +184,9 @@ export function createLearningIngestionService({
     if (readOnly && (typeof targetVaultId !== "string" || !FINGERPRINT_PATTERN.test(targetVaultId))) {
       fail("INGESTION_TARGET_UNSELECTED", "请先选择目标仓库。", 409);
     }
+    // Capture before any external Vault reads; read-only previews never bind.
+    const binding = readOnly ? null : await runtime.capture();
+    const learning = await learningFor();
     const { workspace } = await learning.get(workspaceId);
     const { content } = await learning.content.getContent({ workspaceId });
     const repository = await storeFor();
@@ -218,18 +240,26 @@ export function createLearningIngestionService({
       };
     }
 
-    const binding = await captureBinding();
-    if (!binding) fail("WORKSPACE_NOT_FOUND", "当前 Vault 尚未绑定工作区。", 404);
-    const issued = await bound(binding, () => repository.issuePreview({
-      workspaceId,
-      binding,
-      target: { vaultId: target.vaultId, displayName: target.displayName, maskedPath: target.maskedPath },
-      sourceCommitSha: workspace.sourceCommitSha,
-      contentRevision,
-      selectedContentTypes: types,
-      files: existence,
-      filePlanHash,
-    }));
+    const issued = await mutation(binding, async () => {
+      const currentLearning = await learningFor();
+      const current = await currentLearning.get(workspaceId);
+      const latest = await currentLearning.content.getContent({ workspaceId });
+      const writable = await storeFor({ mode: "write" });
+      const selection = await writable.getSelection(workspaceId);
+      if (selection.selection?.targetVaultId !== target.vaultId) fail("INGESTION_TARGET_CHANGED", "目标 Vault 已改变，请重新预览。", 409);
+      if (current.workspace.sourceCommitSha !== workspace.sourceCommitSha) fail("INGESTION_SOURCE_CHANGED", "学习来源已改变，请重新预览。", 409);
+      if ((latest.content?.revision ?? 0) !== contentRevision) fail("INGESTION_CONTENT_CHANGED", "学习内容已更新，请重新预览。", 409);
+      return writable.issuePreview({
+        workspaceId,
+        binding,
+        target: { vaultId: target.vaultId, displayName: target.displayName, maskedPath: target.maskedPath },
+        sourceCommitSha: workspace.sourceCommitSha,
+        contentRevision,
+        selectedContentTypes: types,
+        files: existence,
+        filePlanHash,
+      });
+    });
     return {
       previewRevision: issued.previewRevision,
       confirmAvailable: true,
@@ -245,39 +275,60 @@ export function createLearningIngestionService({
   }
 
   async function confirm({ token, conflictResolution }) {
-    // The whole confirm is one binding-guarded unit: the registry lock is
-    // taken exactly once, so the token's stored binding, the current content,
-    // the selection and the target-vault state cannot be spliced from two
-    // different bindings. The store serializes begin/finish itself.
+    // Capture first, then resolve the external Vault and conflict plan without
+    // holding registry/store locks. Re-read local state under the guard before
+    // beginning the write, so slow probes cannot authorize stale content.
     if (hosted) fail("INGESTION_UNAVAILABLE", "托管模式下学习摄取不可用。", 404);
     if (readOnly) fail("INGESTION_READ_ONLY", "当前工作区不允许写入选定的 Obsidian 仓库。", 403);
     if (typeof token !== "string" || !token) fail("INGESTION_INVALID_INPUT", "确认凭证无效。", 409);
     if (conflictResolution !== undefined && !["skip", "new-version"].includes(conflictResolution)) {
       fail("INGESTION_INVALID_RESOLUTION", "冲突处理方式无效。", 400);
     }
-    const binding = await captureBinding();
+    const binding = await runtime.capture();
     if (!binding) fail("WORKSPACE_NOT_FOUND", "当前 Vault 尚未绑定工作区。", 404);
-    return bound(binding, async () => {
-        // All reads inside the binding guard use create:true so they resolve off
-        // the cached workspace promise captured outside the registry lock;
-        // create:false would re-enter the registry queue and deadlock.
-        const repository = await storeFor({ create: true });
-        const tokenRecord = await repository.ownerOf({ token });
-        if (!tokenRecord) fail("INGESTION_TOKEN_INVALID", "确认凭证无效或已失效。", 409);
-        const { workspace } = await learning.get(tokenRecord.workspaceId, { create: true });
-        const { content } = await learning.content.getContent({ workspaceId: tokenRecord.workspaceId }, { create: true });
-        const selection = await repository.getSelection(tokenRecord.workspaceId);
-        if (!selection.selection) fail("INGESTION_TARGET_UNSELECTED", "目标仓库选择已失效。", 409);
-        const target = await catalog.resolveTarget(selection.selection.targetVaultId);
-        if (!target) fail("VAULT_TARGET_NOT_FOUND", "目标 Vault 已不存在，请重新选择。", 404);
-        if (!target.writable) fail("VAULT_TARGET_UNWRITABLE", "目标 Vault 当前为只读，无法写入。", 403);
-
+    const read = await storeFor();
+    const tokenRecord = await read.ownerOf({ token });
+    if (!tokenRecord) fail("INGESTION_TOKEN_INVALID", "确认凭证无效或已失效。", 409);
+    const learning = await learningFor();
+    const snapshot = await learning.get(tokenRecord.workspaceId);
+    const { content } = await learning.content.getContent({ workspaceId: tokenRecord.workspaceId });
+    const selection = await read.getSelection(tokenRecord.workspaceId);
+    if (!selection.selection) fail("INGESTION_TARGET_UNSELECTED", "目标仓库选择已失效。", 409);
+    const target = await catalog.resolveTarget(selection.selection.targetVaultId);
+    if (!target) fail("VAULT_TARGET_NOT_FOUND", "目标 Vault 已不存在，请重新选择。", 404);
+    if (!target.writable) fail("VAULT_TARGET_UNWRITABLE", "目标 Vault 当前为只读，无法写入。", 403);
+    let plan;
+    let planError;
+    try {
+      const files = buildTargetFiles({
+        repoFullName: snapshot.workspace.fullName,
+        selectedContentTypes: tokenRecord.selectedContentTypes,
+        content: content ?? {},
+      });
+      plan = await planConflictResolution({
+        targetRoot: target.root,
+        files: files.files,
+        previewExistence: tokenRecord.files.map((file) => ({ relativePath: file.relativePath, existed: file.existed })),
+        resolution: conflictResolution,
+      });
+    } catch (error) {
+      // Preserve consumed-token replay and persisted failure/retry semantics:
+      // the store validates the token before acting on a planning error.
+      planError = error;
+    }
+    return mutation(binding, async () => {
+        const repository = await storeFor({ mode: "write" });
+        const currentLearning = await learningFor();
+        const { workspace } = await currentLearning.get(tokenRecord.workspaceId);
+        const latest = await currentLearning.content.getContent({ workspaceId: tokenRecord.workspaceId });
+        const selected = await repository.getSelection(tokenRecord.workspaceId);
+        if (!selected.selection) fail("INGESTION_TARGET_UNSELECTED", "目标仓库选择已失效。", 409);
         try {
           const started = await repository.beginConfirm({
             token,
             sourceCommitSha: workspace.sourceCommitSha,
-            contentRevision: content?.revision ?? 0,
-            targetVaultId: target.vaultId,
+            contentRevision: latest.content?.revision ?? 0,
+            targetVaultId: selected.selection.targetVaultId,
             selectedContentTypes: tokenRecord.selectedContentTypes,
             filePlanHash: filePlanHashOf(tokenRecord.files),
             binding,
@@ -285,17 +336,10 @@ export function createLearningIngestionService({
           if (started.receipt) {
             return { replayed: true, ingestion: started.record, receipt: started.receipt };
           }
-          const files = buildTargetFiles({
-            repoFullName: workspace.fullName,
-            selectedContentTypes: tokenRecord.selectedContentTypes,
-            content: content ?? {},
-          });
-          const plan = await planConflictResolution({
-            targetRoot: target.root,
-            files: files.files,
-            previewExistence: tokenRecord.files.map((file) => ({ relativePath: file.relativePath, existed: file.existed })),
-            resolution: conflictResolution,
-          });
+          if (selected.selection.targetVaultId !== target.vaultId) {
+            fail("INGESTION_TARGET_CHANGED", "目标 Vault 已改变，请重新预览。", 409);
+          }
+          if (planError) throw planError;
           const { written } = await writeVaultFiles({ targetRoot: target.root, plan });
           const done = await repository.finishConfirm({
             token,
@@ -318,7 +362,7 @@ export function createLearningIngestionService({
 
   async function listIngestions({ workspaceId }) {
     if (hosted) fail("INGESTION_UNAVAILABLE", "托管模式下学习摄取不可用。", 404);
-    await learning.get(workspaceId);
+    await (await learningFor()).get(workspaceId);
     const repository = await storeFor();
     const { records } = await repository.listRecords(workspaceId);
     return { ingestions: records };

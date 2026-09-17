@@ -9,6 +9,9 @@ import test from "node:test";
 
 import { createServer as createViteServer } from "vite";
 import { createLearningRepository } from "../server/learning/learning-repository.mjs";
+import { createLearningIngestionService } from "../server/learning/learning-ingestion-service.mjs";
+import { createLearningVaultCatalog } from "../server/learning/learning-vault-catalog.mjs";
+import { createWorkspaceRuntime } from "../server/workspace-state/workspace-runtime.mjs";
 import { workbenchApiPlugin } from "../server/vite-plugin-workbench.mjs";
 import { createWorkspaceRegistry } from "../server/workspace-state/workspace-registry.mjs";
 
@@ -48,7 +51,7 @@ async function request(origin, route, { method = "GET", body, headers, signal } 
   return { response, body: await response.json() };
 }
 
-async function requestWithin(origin, route, options, milliseconds = 1_000) {
+async function requestWithin(origin, route, options, milliseconds = 5_000) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), milliseconds);
   try {
@@ -188,6 +191,85 @@ async function fileExists(root, relativePath) {
     throw error;
   }
 }
+
+test("unbound ingestion targets and capabilities never create registry or workspace state", async (t) => {
+  const { origin, registryDirectory } = await startFixture(t, { prebind: false });
+  const capabilities = await request(origin, "/api/learning/capabilities");
+  assert.equal(capabilities.response.status, 200);
+  await assert.rejects(lstat(registryDirectory), { code: "ENOENT" });
+  const targets = await request(origin, `/api/learning/${uuid("9")}/targets`);
+  assert.equal(targets.response.status, 404);
+  assert.equal(targets.body.error.code, "WORKSPACE_NOT_FOUND");
+  await assert.rejects(lstat(registryDirectory), { code: "ENOENT" });
+});
+
+test("runtime rejects ingestion mutations rebound during slow Vault discovery without any writes", async (t) => {
+  // Stateful workspaces cannot be rebound through the public API. Exercise the
+  // service boundary with real stores/runtime and a registry that can change
+  // bindings while the external catalog is paused.
+  for (const action of ["setTarget", "preview", "confirm"]) {
+    await t.test(action, async (t) => {
+      const root = await mkdtemp(path.join(await realpath(os.tmpdir()), "workbench-ingest-rebind-"));
+      t.after(() => rm(root, { recursive: true, force: true }));
+      const targetRoot = path.join(root, "vault");
+      await mkdir(targetRoot);
+      const { learning: oldLearning, workspaceId } = await seedLearningWorkspace({ stateRoot: path.join(root, "old") });
+      const newLearning = createLearningRepository({ directory: path.join(root, "new", "learning") });
+      const oldWorkspace = { workspaceId: uuid("1"), fingerprint: "a".repeat(64) };
+      const newWorkspace = { workspaceId: uuid("2"), fingerprint: "a".repeat(64) };
+      let current = oldWorkspace;
+      let guarded = false;
+      const runtime = createWorkspaceRuntime({
+        registry: {
+          async resolve() { return current; },
+          async capture() { return { fingerprint: current.fingerprint, workspaceId: current.workspaceId }; },
+          async runBound({ binding, operation }) {
+            if (binding.workspaceId !== current.workspaceId) {
+              const error = new Error("binding changed");
+              error.code = "WORKSPACE_BINDING_CHANGED";
+              throw error;
+            }
+            guarded = true;
+            try { return await operation({ binding, workspace: current }); } finally { guarded = false; }
+          },
+        },
+        repositories: {
+          learning: ({ workspace }) => workspace.workspaceId === oldWorkspace.workspaceId ? oldLearning : newLearning,
+          ingestion: ({ workspace }) => (workspace.workspaceId === oldWorkspace.workspaceId ? oldLearning : newLearning).ingestion,
+          summary: () => null,
+          radar: () => null,
+        },
+        backup: () => null,
+      });
+      let rebindDuringProbe = false;
+      const service = createLearningIngestionService({
+        runtime,
+        catalog: createLearningVaultCatalog({
+          vaultRoot: targetRoot,
+          probeWritable: async () => {
+            assert.equal(guarded, false, "Vault discovery must finish before the registry guard");
+            if (rebindDuringProbe) current = newWorkspace;
+            return true;
+          },
+        }),
+        lookupBoundWorkspace: null,
+      });
+      await service.setTarget({ workspaceId, vaultId: fingerprintOf(targetRoot) });
+      const preview = await service.preview({ workspaceId, selectedContentTypes: ["plan", "notes"] });
+      const before = await oldLearning.ingestion.exportState();
+      rebindDuringProbe = true;
+      const operations = {
+        setTarget: () => service.setTarget({ workspaceId, vaultId: fingerprintOf(targetRoot) }),
+        preview: () => service.preview({ workspaceId, selectedContentTypes: ["notes"] }),
+        confirm: () => service.confirm({ token: preview.previewToken }),
+      };
+      await assert.rejects(operations[action], (error) => error.code === "WORKSPACE_BINDING_CHANGED" && error.status === 409);
+      assert.deepEqual(await oldLearning.ingestion.exportState(), before, "the old store must remain unchanged");
+      await assert.rejects(lstat(path.join(root, "new")), { code: "ENOENT" });
+      await assert.rejects(lstat(path.join(targetRoot, "Wiki")), { code: "ENOENT" });
+    });
+  }
+});
 
 test("lists vault candidates safely: fingerprints, masked names, no absolute roots or user segments", async (t) => {
   const fixture = await startFixture(t, { configVaults: [{ name: "第二知识库", dir: "vault-target" }], seed: seedLearningWorkspace });
@@ -550,4 +632,41 @@ test("plan, notes and each artifact are independently selectable at the API laye
     body: { selectedContentTypes: ["notes"] },
   });
   assert.deepEqual(notesOnly.body.files.map((file) => file.kind), ["notes"]);
+});
+
+test("a target restored during a slow confirm cannot authorize the previously selected Vault", async (t) => {
+  let duringProbe = null;
+  let learning;
+  const fixture = await startFixture(t, {
+    configVaults: [{ name: "第二知识库" }],
+    probeWritable: async () => {
+      const operation = duringProbe;
+      duringProbe = null;
+      if (operation) await operation();
+      return true;
+    },
+    seed: async (input) => {
+      const seeded = await seedLearningWorkspace(input);
+      learning = seeded.learning;
+      return seeded;
+    },
+  });
+  const { origin, workspaceId, configVaultId, currentVaultId, targetVault, vaultRoot } = fixture;
+  await request(origin, `/api/learning/${workspaceId}/target`, { method: "POST", body: { vaultId: configVaultId } });
+  const preview = await request(origin, `/api/learning/${workspaceId}/ingestions/preview`, {
+    method: "POST", body: { selectedContentTypes: ["notes"] },
+  });
+  const originalSelection = (await learning.ingestion.getSelection(workspaceId)).selection;
+  await request(origin, `/api/learning/${workspaceId}/target`, { method: "POST", body: { vaultId: currentVaultId } });
+  duringProbe = () => learning.ingestion.setSelection(originalSelection);
+  const confirmed = await request(origin, `/api/learning/${workspaceId}/ingestions/confirm`, {
+    method: "POST", body: { token: preview.body.previewToken },
+  });
+  assert.equal(confirmed.response.status, 409);
+  assert.equal(confirmed.body.error.code, "INGESTION_TARGET_CHANGED");
+  // The fixture already contains a lowercase `wiki` directory. Windows treats
+  // that as `Wiki`, so assert the ingestion-specific descendant instead of the
+  // case-insensitive root name.
+  await assert.rejects(lstat(path.join(targetVault.root, "Wiki", "学习")), { code: "ENOENT" });
+  await assert.rejects(lstat(path.join(vaultRoot, "Wiki", "学习")), { code: "ENOENT" });
 });

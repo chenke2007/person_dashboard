@@ -53,14 +53,12 @@ import { createRadarRepository } from "./ai-radar/radar-repository.mjs";
 import { createRadarScheduler } from "./ai-radar/radar-scheduler.mjs";
 import { createRadarRoutes } from "./ai-radar/radar-routes.mjs";
 import { RadarRoutesError } from "./ai-radar/radar-errors.mjs";
-import { LearningWorkspaceError } from "./learning/learning-repository.mjs";
-import { LearningIngestionError } from "./learning/learning-ingestion-repository.mjs";
 import { createLearningRepository } from "./learning/learning-repository.mjs";
 import { createLearningService } from "./learning/learning-service.mjs";
 import { createLearningRoutes } from "./learning/learning-routes.mjs";
 import { createLearningIngestionService } from "./learning/learning-ingestion-service.mjs";
 import { createLearningVaultCatalog } from "./learning/learning-vault-catalog.mjs";
-import { createSummaryRepository, SummaryRepositoryError } from "./summaries/summary-repository.mjs";
+import { createSummaryRepository } from "./summaries/summary-repository.mjs";
 import { createRepositorySummaryService } from "./summaries/summary-service.mjs";
 import { createSummaryRoutes } from "./summaries/summary-routes.mjs";
 import { createSummaryModelAdapter } from "./summaries/summary-model-adapter.mjs";
@@ -883,33 +881,12 @@ export function workbenchApiPlugin({
     }
     return createLearningRepository({ directory: resolvedDirectory, now: () => new Date() });
   }
-  // Ingestion remains on the pre-runtime adapter until Task 3 migrates its
-  // binding guard. Its guard holds the registry lock, so re-entering
-  // WorkspaceRuntime from inside it would attempt a second registry resolve
-  // and deadlock. Cache only concrete repositories and reset on rebind, as
-  // the original adapter did.
-  let legacyLearningRepositoryPromise = null;
-  async function legacyLearningRepository({ create = true } = {}) {
-    if (legacyLearningRepositoryPromise) return legacyLearningRepositoryPromise;
-    const repository = await learningRepositoryForWorkspace({
-      workspace: await currentWorkspace({ create }),
-      mode: create ? "write" : "read",
-    });
-    if (repository) legacyLearningRepositoryPromise = repository;
-    return repository;
-  }
   async function learningRepository({ create = true } = {}) {
-    if (!workspaceRuntime) return legacyLearningRepository({ create });
     return workspaceRuntime.learning({ mode: create ? "write" : "read" });
   }
-  let summaryRepositoryPromise = null;
-  async function summaryRepository({ create = true } = {}) {
-    // Cache only a concrete repository, never a null resolution: a read on a
-    // fresh unbound vault must stay side-effect free, and the next legitimate
-    // mutation must still be able to bind and write.
-    if (summaryRepositoryPromise) return summaryRepositoryPromise;
+  async function summaryRepositoryForWorkspace({ workspace, mode }) {
+    const create = mode === "write";
     let resolvedDirectory = null;
-    const workspace = await currentWorkspace({ create });
     if (!workspace) return null;
     const stateRoot = workspace.storageLayout === "legacy"
       ? path.join(workspaceRegistryDirectory, workspace.workspaceId)
@@ -923,9 +900,10 @@ export function workbenchApiPlugin({
         throw error;
       }
     }
-    const repository = createSummaryRepository({ directory: resolvedDirectory, now: () => new Date() });
-    summaryRepositoryPromise = repository;
-    return repository;
+    return createSummaryRepository({ directory: resolvedDirectory, now: () => new Date() });
+  }
+  async function summaryRepository({ create = true } = {}) {
+    return workspaceRuntime.summary({ mode: create ? "write" : "read" });
   }
   let radarContextPromise = null;
   async function radarContext({ create = false } = {}) {
@@ -1176,8 +1154,8 @@ export function workbenchApiPlugin({
       : directWorkspaceRegistry,
     repositories: {
       learning: learningRepositoryForWorkspace,
-      summary: async ({ mode }) => summaryRepository({ create: mode === "write" }),
-      ingestion: async ({ mode }) => (await workspaceRuntime.learning({ mode }))?.ingestion ?? null,
+      summary: summaryRepositoryForWorkspace,
+      ingestion: async (context) => (await learningRepositoryForWorkspace(context))?.ingestion ?? null,
       radar: async ({ mode }) => (await radarContext({ create: mode === "write" }))?.repository ?? null,
     },
     backup: async () => workspaceBackup(),
@@ -1189,36 +1167,6 @@ export function workbenchApiPlugin({
   // flow captures its expected binding before slow remote work, so a rebind
   // landing mid-request rejects the write instead of silently continuing
   // against the new workspace.
-  // Shared workspace-binding guard for radar-family mutations (learning,
-  // summaries): withBoundWorkspace verifies the current binding under the
-  // registry lock, then the operation proceeds; a rebind landing mid-request
-  // rejects with WORKSPACE_BINDING_CHANGED before any write. Slow remote work
-  // (GitHub/model) always runs before this guard.
-  const captureWorkspaceBinding = async () => {
-    if (!registry) return null;
-    const workspace = await currentWorkspace({ create: true });
-    if (!workspace) return null;
-    return { fingerprint: vaultFingerprint, workspaceId: workspace.workspaceId };
-  };
-  const boundWorkspace = async (binding, operation, ErrorClass = LearningWorkspaceError) => {
-    if (!registry) return operation();
-    let expected = binding;
-    if (!expected) {
-      const workspace = await currentWorkspace({ create: true });
-      if (workspace) expected = { fingerprint: vaultFingerprint, workspaceId: workspace.workspaceId };
-    }
-    if (!expected) {
-      throw new ErrorClass("WORKSPACE_NOT_FOUND", "当前 Vault 尚未绑定工作区。", 404);
-    }
-    try {
-      return await registry.withBoundWorkspace(expected, operation);
-    } catch (error) {
-      if (error instanceof WorkspaceRegistryError && error.code === "WORKSPACE_BINDING_CHANGED") {
-        throw new ErrorClass(error.code, "工作区绑定已改变，请重新加载后重试。", 409);
-      }
-      throw error;
-    }
-  };
   const learningService = createLearningService({
     runtime: workspaceRuntime,
     resolveRepository: async (repositoryId) => {
@@ -1243,27 +1191,8 @@ export function workbenchApiPlugin({
     probeWritable: learningIngestOptions.probeWritable,
   });
   const learningIngestService = createLearningIngestionService({
-    learning: {
-      get: async (workspaceId, options = {}) => {
-        const repository = await legacyLearningRepository(options);
-        if (!repository) throw new LearningWorkspaceError("WORKSPACE_NOT_FOUND", "学习工作区不存在。", 404);
-        return repository.get(workspaceId);
-      },
-      content: {
-        getContent: async (input, options = {}) => {
-          const repository = await legacyLearningRepository(options);
-          if (!repository) throw new LearningWorkspaceError("WORKSPACE_NOT_FOUND", "学习工作区不存在。", 404);
-          return repository.content.getContent(input);
-        },
-      },
-    },
-    store: async (options) => {
-      const repository = await legacyLearningRepository(options);
-      return repository ? repository.ingestion : null;
-    },
+    runtime: workspaceRuntime,
     catalog: learningVaultCatalog,
-    bound: (binding, operation) => boundWorkspace(binding, operation, LearningIngestionError),
-    captureBinding: captureWorkspaceBinding,
     lookupBoundWorkspace: registry ? async (fingerprint) => registry.lookupVault({ fingerprint }) : null,
     readOnly: projectReadOnly,
     hosted,
@@ -1280,9 +1209,7 @@ export function workbenchApiPlugin({
   // structured output and persists idempotently by generation key. The model
   // adapter stays provider-neutral and is never imported by this module.
   const summaryService = createRepositorySummaryService({
-    getSummaries: (options) => summaryRepository(options),
-    captureBinding: captureWorkspaceBinding,
-    bound: (binding, operation) => boundWorkspace(binding, operation, SummaryRepositoryError),
+    runtime: workspaceRuntime,
     resolveRepository: async (repositoryId) => {
       const store = await radarApi.getStore();
       if (!store) return null;
@@ -1369,8 +1296,6 @@ export function workbenchApiPlugin({
       workspacePromise = null;
       projectRepositoryPromise = null;
       radarRepositoryPromise = null;
-      legacyLearningRepositoryPromise = null;
-      summaryRepositoryPromise = null;
       radarContextPromise = null;
       radarLifecyclePromise = null;
       workspaceBackupPromise = null;

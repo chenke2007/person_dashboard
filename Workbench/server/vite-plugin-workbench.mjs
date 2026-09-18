@@ -1030,12 +1030,22 @@ export function workbenchApiPlugin({
         let summaryState = new Map();
         let summaryStatus = "ok";
         try {
-          const summariesStore = await workspaceRuntime.summary({ mode: "read" });
-          if (summariesStore) {
-            const listed = await summariesStore.listLatest();
-            summaryState = new Map(listed.summaries.map((summary) => [summary.repositoryId, summary]));
-          }
+          // The summary overlay must read through the same captured binding as
+          // the guarded radar read: resolving outside a bound context would ask
+          // the registry for the *current* binding and could stitch a summary
+          // from a workspace the user switched to after the base read. runBound
+          // re-verifies the captured binding, so a mid-request rebind surfaces
+          // as WORKSPACE_BINDING_CHANGED instead of a silently mixed overview.
+          const listed = await workspaceRuntime.runBound({
+            binding: context.binding,
+            operation: async () => {
+              const summariesStore = await workspaceRuntime.summary({ mode: "read" });
+              return summariesStore ? (await summariesStore.listLatest()).summaries : [];
+            },
+          });
+          summaryState = new Map(listed.map((summary) => [summary.repositoryId, summary]));
         } catch (error) {
+          if (error?.code === "WORKSPACE_BINDING_CHANGED") throw error;
           summaryStatus = "unavailable";
         }
         const withSummary = (entry) => {

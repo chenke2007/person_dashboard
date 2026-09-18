@@ -5,11 +5,14 @@ import { RadarRepositoryError } from "../server/ai-radar/radar-repository.mjs";
 import { createRadarRoutes } from "../server/ai-radar/radar-routes.mjs";
 import { workbenchApiPlugin } from "../server/vite-plugin-workbench.mjs";
 import { createHash } from "node:crypto";
-import { access, mkdir, mkdtemp, rm } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readdir, realpath, rm } from "node:fs/promises";
 import os from "node:os";
+import { setTimeout as delay } from "node:timers/promises";
 import path from "node:path";
 import { createWorkspaceRegistry } from "../server/workspace-state/workspace-registry.mjs";
+import { createTicketLock } from "../server/workspace-state/ticket-lock.mjs";
 import { createRadarRepository } from "../server/ai-radar/radar-repository.mjs";
+import { createSummaryRepository } from "../server/summaries/summary-repository.mjs";
 
 async function runtimeRadarFixture(t, { prebind = true, readOnly = false, github } = {}) {
   const root = await mkdtemp(path.join(os.tmpdir(), "workbench-radar-runtime-"));
@@ -90,6 +93,192 @@ test("radar collection rejects a rebind during GitHub work without committing it
   assert.equal(result.status, 409);
   assert.equal(result.body.error.code, "WORKSPACE_BINDING_CHANGED");
   assert.deepEqual(await repository.exportState(), before);
+});
+
+// A synthetic radar repository record that is decision-eligible and matches an
+// AI focus topic, so it lands on the dashboard lists ("relevant") and carries
+// the summary overlay metadata used by the binding-context test below.
+function radarRepository(id = 101) {
+  return {
+    id,
+    fullName: `synthetic/repository-${id}`,
+    htmlUrl: `https://github.com/synthetic/repository-${id}`,
+    description: "Synthetic demo repository",
+    language: "JavaScript",
+    topics: ["agents"],
+    focusAreas: ["agent"],
+    stars: 100,
+    forks: 2,
+    openIssues: null,
+    archived: false,
+    fork: false,
+    license: "MIT",
+    defaultBranch: "main",
+    createdAt: "2025-01-01T00:00:00.000Z",
+    updatedAt: "2026-09-02T06:00:00.000Z",
+    pushedAt: null,
+    observedAt: "2026-09-02T06:00:00.000Z",
+  };
+}
+
+function radarSummarySections() {
+  return {
+    problemSolved: "Solves synthesis of local AI dashboards",
+    coreCapabilities: "Radar, learning workspaces, repositories",
+    techStack: "Node, React, Vite",
+    keyModules: "server/ai-radar, server/learning",
+    suitableUseCases: "Single-user local knowledge work",
+    unsuitableUseCases: "Multi-tenant production hosting",
+    learningGoalCandidates: "Understand architecture; adopt the loop",
+    risksAndBoundaries: "Loopback-only; no cloud persistence",
+  };
+}
+
+// The registry ticket lock lives in a shared directory, so the test can poll
+// for its own held ticket plus the guarded radar read's waiting ticket. Seeing
+// the second ticket proves the dashboard read is blocked in the plugin's
+// serialized queue: anything enqueued after it (the rebind confirm) is
+// guaranteed to land strictly between the radar read and the summary overlay.
+async function waitForLockTickets(lockDirectory, count) {
+  let present = 0;
+  for (let attempt = 0; attempt < 300; attempt += 1) {
+    try {
+      const entries = await readdir(lockDirectory);
+      present = entries.filter((name) => /^[a-f0-9]{64}\.ticket$/.test(name)).length;
+      if (present >= count) return;
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+    await delay(10);
+  }
+  throw new Error(`registry lock tickets did not reach ${count} (saw ${present})`);
+}
+
+test("radar dashboard summary overlay shares the radar binding and rejects a mid-request rebind with 409", { timeout: 60000 }, async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "workbench-radar-summary-bound-"));
+  const vaultRoot = path.join(root, "vault");
+  const appDataRoot = path.join(root, "app-data");
+  const registryDirectory = path.join(appDataRoot, "PersonalAIWorkbench");
+  const radarDirectory = path.join(root, "shared-radar");
+  await mkdir(vaultRoot);
+  await mkdir(radarDirectory, { recursive: true });
+  const registry = createWorkspaceRegistry({ directory: registryDirectory });
+  const fingerprint = createHash("sha256").update(path.resolve(vaultRoot).toLowerCase()).digest("hex");
+  // Workspace A owns the current binding but keeps its radar store outside the
+  // workspace state root (shared radar), so A stays stateless and the registry
+  // rebind to B is legal — the same setup the summary race fixture uses.
+  const workspaceA = await registry.resolveVault({ fingerprint, label: "Synthetic radar summary vault" });
+  const stateRootOf = (workspaceId) => path.join(registryDirectory, "workspaces", workspaceId);
+  const workspaceB = await registry.resolveVault({ fingerprint: "b".repeat(64), label: "Synthetic radar target" });
+  const radar = createRadarRepository({ directory: radarDirectory, timeZone: "UTC" });
+  await radar.updateSchedule({ time: "11:30" });
+  await radar.upsertRepositories([radarRepository(101)]);
+  // Warm BOTH summary stores before the race: B already owns a summary for
+  // repository 101 whose sourceCommitSha marks it as B-owned; A stays stateless
+  // and empty (its summary repository instance is warmed by the read below).
+  const summariesB = createSummaryRepository({ directory: path.join(stateRootOf(workspaceB.workspaceId), "summaries") });
+  await summariesB.persistSummary({
+    repositoryId: 101,
+    fullName: "synthetic/repository-101",
+    sourceUrl: "https://github.com/synthetic/repository-101",
+    sourceCommitSha: "b".repeat(40),
+    readmeSha: null,
+    readmeRef: null,
+    readmePath: "README.md",
+    sections: radarSummarySections(),
+    model: { providerId: "fake", modelId: "fake" },
+    workflowVersion: 1,
+  });
+  // No-op GitHub adapter: the dashboard read never touches GitHub.
+  const github = {
+    async discoverCandidates() { return { repositories: [], errors: [], partial: false, retryAt: null, truncated: false }; },
+    async getRepositories() { return { repositories: [], errors: [], partial: false, retryAt: null, truncated: false }; },
+  };
+  const plugin = workbenchApiPlugin({
+    vaultRoot,
+    appDataRoot,
+    projectDirectory: null,
+    radarDirectory,
+    radarOptions: { github },
+  });
+  let handle;
+  await plugin.configureServer({
+    watcher: { on() {}, off() {} },
+    httpServer: null,
+    middlewares: { use(handler) { handle = handler; } },
+    config: { logger: { error() {} } },
+  });
+  t.after(async () => {
+    if (releaseLock) releaseLock();
+    if (hold) await hold;
+    await plugin.closeBundle();
+    await rm(root, { recursive: true, force: true });
+  });
+  const routes = { handle: (req, res) => handle(req, res, () => {}) };
+
+  // Pre-create the rebind preview before any request: A is stateless so the
+  // preview is legal, and the confirm token can then be fired mid-request with
+  // no dependency on a concurrent preview response.
+  const preview = await registry.previewRebind({ currentFingerprint: fingerprint, workspaceId: workspaceB.workspaceId });
+  assert.equal(preview.requiresConfirmation, true);
+  const confirmToken = preview.token;
+
+  // Warm the radar context + A's summary repository instance, and prove the
+  // overlay reads A's (empty) summary store while A is still bound.
+  const warm = await request(routes, "GET", "/api/ai-radar?period=day");
+  assert.equal(warm.status, 200);
+  assert.equal(warm.body.summaryStatus, "ok");
+  const warmCard = Object.values(warm.body.lists).flat().find((entry) => entry.repositoryId === 101);
+  assert.ok(warmCard, "radar dashboard must list repository 101");
+  assert.equal(warmCard.summary, null);
+
+  // Hold the registry ticket lock so the guarded radar read blocks in the
+  // plugin's serialized queue; the confirm (enqueued next, on the same lock)
+  // then lands strictly between the radar read and the summary overlay's
+  // resolution. The confirm goes through the test's registry instance directly
+  // so it has no scheduler/plugin wrapper that would block on the same lock.
+  const lockDirectory = path.join(registryDirectory, "workspace-registry.lock");
+  const ensureDirectory = async () => {
+    await mkdir(registryDirectory, { recursive: true, mode: 0o700 });
+    return path.resolve(await realpath(registryDirectory));
+  };
+  const fail = (code, message, status = 500) => {
+    const error = new Error(message);
+    error.code = code;
+    error.status = status;
+    throw error;
+  };
+  let acquiredNotice;
+  let releaseLock;
+  let hold = null;
+  const lockAcquired = new Promise((resolve) => { acquiredNotice = resolve; });
+  const lockReleased = new Promise((resolve) => { releaseLock = resolve; });
+  const holdLock = createTicketLock({
+    directory: lockDirectory,
+    ensureDirectory,
+    fail,
+    lockTimeoutMs: 30_000,
+    lockLifecycle: { acquired: () => acquiredNotice() },
+  });
+  hold = holdLock(async () => { await lockReleased; });
+  await lockAcquired;
+
+  const pending = request(routes, "GET", "/api/ai-radar?period=day");
+  await waitForLockTickets(lockDirectory, 2);
+  // Direct registry confirm: its ticket waits on the same held lock, so the
+  // rebind commits only after the guarded radar read has run and before the
+  // summary overlay finishes — the controlled interleaving from the review.
+  const rebind = registry.confirmRebind({ token: confirmToken });
+  await waitForLockTickets(lockDirectory, 3);
+  releaseLock();
+  const confirmed = await rebind;
+  assert.equal(confirmed.workspaceId, workspaceB.workspaceId);
+  const result = await pending;
+  // One dashboard request must never stitch B's summaries onto A's guarded
+  // radar cards: a binding change between the base read and the overlay is a
+  // failure, not a degraded or mixed response.
+  assert.equal(result.status, 409, `mid-request rebind must fail closed; got ${JSON.stringify(result.body)}`);
+  assert.equal(result.body.error.code, "WORKSPACE_BINDING_CHANGED");
 });
 
 function safeDashboard() {
